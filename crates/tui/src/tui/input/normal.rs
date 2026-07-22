@@ -283,7 +283,7 @@ pub(in crate::tui) fn handle_session_affinity_operator_key(
     snapshot: &Snapshot,
     code: KeyCode,
 ) -> bool {
-    if ui.page != Page::Sessions || code != KeyCode::Char('A') {
+    if ui.page != Page::Sessions || !matches!(code, KeyCode::Char('A') | KeyCode::Char('p')) {
         return false;
     }
     if !ui.can_mutate_session_affinity() {
@@ -313,32 +313,6 @@ pub(in crate::tui) fn handle_session_affinity_operator_key(
         ));
         return true;
     }
-    let Some(affinity) = row.route_affinity.as_ref() else {
-        ui.toast = Some((
-            match ui.language {
-                Language::Zh => "会话尚无 affinity；下一次请求会自动选择路由".to_string(),
-                Language::En => {
-                    "the session has no affinity; its next request will be routed automatically"
-                        .to_string()
-                }
-            },
-            Instant::now(),
-        ));
-        return true;
-    };
-    if affinity.revision.trim().is_empty() {
-        ui.toast = Some((
-            match ui.language {
-                Language::Zh => "daemon 未提供可写 affinity 控制元数据；已降级为只读".to_string(),
-                Language::En => {
-                    "the daemon did not provide mutable affinity control metadata; read-only mode"
-                        .to_string()
-                }
-            },
-            Instant::now(),
-        ));
-        return true;
-    }
     let Some(routing) = snapshot.routing.as_ref() else {
         ui.toast = Some((
             match ui.language {
@@ -349,20 +323,62 @@ pub(in crate::tui) fn handle_session_affinity_operator_key(
         ));
         return true;
     };
-    ui.session_affinity_action_selected_idx =
-        if routing.entry_strategy == crate::config::RouteStrategy::Conditional {
+    ui.session_affinity_action_selected_idx = match row.route_affinity.as_ref() {
+        Some(affinity) => {
+            if affinity.revision.trim().is_empty() {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "daemon 未提供可写 affinity 控制元数据；已降级为只读".to_string(),
+                        Language::En => {
+                            "the daemon did not provide mutable affinity control metadata; read-only mode"
+                                .to_string()
+                        }
+                    },
+                    Instant::now(),
+                ));
+                return true;
+            }
+            if routing.entry_strategy == crate::config::RouteStrategy::Conditional {
+                0
+            } else {
+                routing
+                    .candidates
+                    .iter()
+                    .position(|candidate| {
+                        candidate.provider_id == affinity.provider_id
+                            && candidate.endpoint_id == affinity.endpoint_id
+                    })
+                    .map(|index| index + 1)
+                    .unwrap_or_else(|| usize::from(!routing.candidates.is_empty()))
+            }
+        }
+        None => {
+            if routing.entry_strategy == crate::config::RouteStrategy::Conditional {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "条件路由需要请求上下文，无法预先绑定会话 affinity".to_string(),
+                        Language::En => {
+                            "conditional routes require request context and cannot pre-bind session affinity"
+                                .to_string()
+                        }
+                    },
+                    Instant::now(),
+                ));
+                return true;
+            }
+            if routing.candidates.is_empty() {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "当前没有可绑定的路由候选".to_string(),
+                        Language::En => "there is no route candidate available to bind".to_string(),
+                    },
+                    Instant::now(),
+                ));
+                return true;
+            }
             0
-        } else {
-            routing
-                .candidates
-                .iter()
-                .position(|candidate| {
-                    candidate.provider_id == affinity.provider_id
-                        && candidate.endpoint_id == affinity.endpoint_id
-                })
-                .map(|index| index + 1)
-                .unwrap_or_else(|| usize::from(!routing.candidates.is_empty()))
-        };
+        }
+    };
     ui.overlay = Overlay::SessionAffinityActions;
     true
 }

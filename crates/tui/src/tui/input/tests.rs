@@ -856,13 +856,12 @@ async fn remote_routing_rejects_every_mutating_and_refresh_shortcut() {
 }
 
 #[tokio::test]
-async fn session_affinity_actions_require_an_idle_bound_session_with_revision() {
+async fn session_affinity_actions_require_an_idle_bound_session_with_revision_for_rebind() {
     let cases = vec![
         (
             affinity_snapshot(1, Some("affinity:v1:current")),
             "active request",
         ),
-        (affinity_snapshot(0, None), "no affinity"),
         (affinity_snapshot(0, Some("")), "read-only mode"),
     ];
 
@@ -883,6 +882,41 @@ async fn session_affinity_actions_require_an_idle_bound_session_with_revision() 
             ui.toast
         );
     }
+}
+
+#[tokio::test]
+async fn session_affinity_bind_initializes_an_idle_unbound_session_without_a_revision() {
+    let snapshot = affinity_snapshot(0, None);
+    let mut ui = UiState {
+        page: Page::Sessions,
+        ..UiState::default()
+    };
+
+    assert!(press(&mut ui, &snapshot, KeyCode::Char('p')).await);
+    assert_eq!(ui.overlay, Overlay::SessionAffinityActions);
+    assert_eq!(ui.session_affinity_action_selected_idx, 0);
+    assert!(press(&mut ui, &snapshot, KeyCode::Enter).await);
+    assert_eq!(ui.overlay, Overlay::SessionAffinityConfirmation);
+    let confirmation = ui
+        .session_affinity_confirmation
+        .as_ref()
+        .expect("session affinity bind confirmation")
+        .clone();
+    assert_eq!(confirmation.session_key, "session:sha256:test");
+    assert!(confirmation.expected_affinity_revision.is_none());
+    assert_eq!(
+        confirmation.command,
+        OperatorSessionAffinityCommand::Bind {
+            provider_id: "input".to_string(),
+            endpoint_id: "primary".to_string(),
+        }
+    );
+    assert!(press(&mut ui, &snapshot, KeyCode::Char('y')).await);
+    assert!(matches!(
+        ui.pending_operator_action,
+        Some(PendingOperatorAction::MutateSessionAffinity(ref request))
+            if request == &confirmation
+    ));
 }
 
 #[tokio::test]
@@ -1686,7 +1720,7 @@ async fn removed_routing_and_session_mutation_keys_are_inert() {
     let snapshot = Snapshot::default();
     let cases = [
         (Page::Routing, vec!['r', 'h', 'H', 'c', 'C', 'o', 'O']),
-        (Page::Sessions, vec!['p', 'P']),
+        (Page::Sessions, vec!['P']),
     ];
 
     for (page, keys) in cases {

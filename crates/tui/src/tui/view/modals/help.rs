@@ -161,7 +161,7 @@ pub(super) fn current_page_help_lines(ui: &UiState, p: Palette) -> Vec<Line<'sta
                 "  a/e/v      活跃、错误、手动控制筛选；r 重置筛选",
             ];
             if ui.can_mutate_session_affinity() {
-                entries.push("  A          打开空闲会话的 affinity 高级操作");
+                entries.push("  p/A        为空闲会话绑定或调整路由");
             }
             if ui.can_mutate_session_binding() {
                 entries.extend([
@@ -296,7 +296,7 @@ pub(super) fn current_page_help_lines(ui: &UiState, p: Palette) -> Vec<Line<'sta
                 "  a/e/v      active, error, and manual-control filters; r resets",
             ];
             if ui.can_mutate_session_affinity() {
-                entries.push("  A          open advanced affinity actions for an idle session");
+                entries.push("  p/A        bind or adjust an idle session route");
             }
             if ui.can_mutate_session_binding() {
                 entries.extend([

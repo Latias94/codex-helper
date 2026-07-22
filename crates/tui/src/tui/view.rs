@@ -1106,7 +1106,7 @@ mod tests {
 
         assert!(compact_text.contains("atoggleactive-only"), "{text}");
         assert!(compact_text.contains("Entereffortmenu"), "{text}");
-        assert!(compact_text.contains("Aadvancedsessionaffinity"), "{text}");
+        assert!(compact_text.contains("p/Asessionrouteactions"), "{text}");
         assert!(
             !compact_text.contains("Enteradvancedaffinityactions"),
             "{text}"

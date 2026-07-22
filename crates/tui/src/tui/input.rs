@@ -221,17 +221,25 @@ pub(in crate::tui) fn handle_session_affinity_actions_key(
     snapshot: &Snapshot,
     key: KeyEvent,
 ) -> bool {
+    let has_affinity = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .is_some_and(|row| row.route_affinity.is_some());
     let action_count = snapshot
         .routing
         .as_ref()
         .map(|routing| {
             if routing.entry_strategy == crate::config::RouteStrategy::Conditional {
-                1
+                usize::from(has_affinity)
             } else {
-                routing.candidates.len().saturating_add(1)
+                routing
+                    .candidates
+                    .len()
+                    .saturating_add(usize::from(has_affinity))
             }
         })
-        .unwrap_or(1);
+        .unwrap_or(usize::from(has_affinity))
+        .max(1);
     match key.code {
         KeyCode::Esc => {
             ui.overlay = Overlay::None;
@@ -270,36 +278,57 @@ pub(in crate::tui) fn handle_session_affinity_actions_key(
                 ui.overlay = Overlay::None;
                 return true;
             };
-            let Some(affinity) = row.route_affinity.as_ref() else {
-                ui.overlay = Overlay::None;
-                return true;
-            };
             let Some(routing) = snapshot.routing.as_ref() else {
                 ui.overlay = Overlay::None;
                 return true;
             };
-            let command = if ui.session_affinity_action_selected_idx == 0 {
-                OperatorSessionAffinityCommand::Clear
-            } else {
-                if routing.entry_strategy == crate::config::RouteStrategy::Conditional {
-                    ui.overlay = Overlay::None;
-                    return true;
+            let (expected_affinity_revision, command) = match row.route_affinity.as_ref() {
+                Some(affinity) => {
+                    let command = if ui.session_affinity_action_selected_idx == 0 {
+                        OperatorSessionAffinityCommand::Clear
+                    } else {
+                        if routing.entry_strategy == crate::config::RouteStrategy::Conditional {
+                            ui.overlay = Overlay::None;
+                            return true;
+                        }
+                        let Some(candidate) = routing
+                            .candidates
+                            .get(ui.session_affinity_action_selected_idx - 1)
+                        else {
+                            ui.overlay = Overlay::None;
+                            return true;
+                        };
+                        OperatorSessionAffinityCommand::Rebind {
+                            provider_id: candidate.provider_id.clone(),
+                            endpoint_id: candidate.endpoint_id.clone(),
+                        }
+                    };
+                    (Some(affinity.revision.clone()), command)
                 }
-                let Some(candidate) = routing
-                    .candidates
-                    .get(ui.session_affinity_action_selected_idx - 1)
-                else {
-                    ui.overlay = Overlay::None;
-                    return true;
-                };
-                OperatorSessionAffinityCommand::Rebind {
-                    provider_id: candidate.provider_id.clone(),
-                    endpoint_id: candidate.endpoint_id.clone(),
+                None => {
+                    if routing.entry_strategy == crate::config::RouteStrategy::Conditional {
+                        ui.overlay = Overlay::None;
+                        return true;
+                    }
+                    let Some(candidate) = routing
+                        .candidates
+                        .get(ui.session_affinity_action_selected_idx)
+                    else {
+                        ui.overlay = Overlay::None;
+                        return true;
+                    };
+                    (
+                        None,
+                        OperatorSessionAffinityCommand::Bind {
+                            provider_id: candidate.provider_id.clone(),
+                            endpoint_id: candidate.endpoint_id.clone(),
+                        },
+                    )
                 }
             };
             ui.session_affinity_confirmation = Some(OperatorSessionAffinityMutationRequest {
                 session_key: session_key.clone(),
-                expected_affinity_revision: Some(affinity.revision.clone()),
+                expected_affinity_revision,
                 command,
             });
             ui.overlay = Overlay::SessionAffinityConfirmation;

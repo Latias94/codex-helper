@@ -238,7 +238,7 @@ fn sessions_footer_help_text(ui: &UiState) -> String {
         crate::tui::Language::En => "Pg details",
     });
     if ui.can_mutate_session_affinity() {
-        parts.push("A affinity");
+        parts.push("p/A affinity");
     }
     parts.push("a/e/v filters");
     if ui.can_mutate_session_binding() {

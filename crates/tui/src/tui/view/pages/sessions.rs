@@ -499,10 +499,10 @@ pub(super) fn render_sessions_page(
         }));
         lines.push(Line::from(match (lang, ui.can_mutate_session_affinity()) {
             (crate::tui::Language::Zh, true) => {
-                "  Enter effort 菜单  A 会话 affinity 高级操作（仅空闲会话）"
+                "  Enter effort 菜单  p/A 会话路由操作（仅空闲会话）"
             }
             (crate::tui::Language::En, true) => {
-                "  Enter effort menu  A advanced session affinity actions (idle sessions only)"
+                "  Enter effort menu  p/A session route actions (idle sessions only)"
             }
             (crate::tui::Language::Zh, false) if ui.runtime_connection.is_remote_observer() => {
                 "  affinity 操作：远程只读"

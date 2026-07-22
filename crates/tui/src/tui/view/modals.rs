@@ -679,10 +679,14 @@ pub(super) fn render_session_affinity_actions_modal(
         .and_then(|row| row.session_id.as_deref())
         .map(|value| shorten_middle(value, 42))
         .unwrap_or_else(|| "-".to_string());
-    let current_target = selected_session
+    let bound_target = selected_session
         .and_then(|row| row.route_affinity.as_ref())
-        .map(|affinity| format!("{}.{}", affinity.provider_id, affinity.endpoint_id))
-        .unwrap_or_else(|| "-".to_string());
+        .map(|affinity| format!("{}.{}", affinity.provider_id, affinity.endpoint_id));
+    let has_affinity = bound_target.is_some();
+    let current_target = bound_target.clone().unwrap_or_else(|| match ui.language {
+        Language::Zh => "<自动>".to_string(),
+        Language::En => "<automatic>".to_string(),
+    });
     let mut lines = vec![
         Line::from(match ui.language {
             Language::Zh => format!("会话：{session_key}"),
@@ -695,9 +699,16 @@ pub(super) fn render_session_affinity_actions_modal(
         Line::from(""),
         Line::from(Span::styled(
             match ui.language {
-                Language::Zh => "仅用于故障恢复：只允许空闲会话；服务端会再次校验。",
+                Language::Zh if has_affinity => {
+                    "仅用于故障恢复：只允许空闲会话；服务端会再次校验。"
+                }
+                Language::Zh => "为尚未绑定的空闲会话选择首个路由；服务端会再次校验。",
                 Language::En => {
-                    "Recovery only: the session must be idle; the daemon validates again."
+                    if has_affinity {
+                        "Recovery only: the session must be idle; the daemon validates again."
+                    } else {
+                        "Choose the first route for an idle unbound session; the daemon validates again."
+                    }
                 }
             },
             Style::default().fg(p.muted),
@@ -705,26 +716,29 @@ pub(super) fn render_session_affinity_actions_modal(
         Line::from(""),
     ];
 
-    let clear_selected = ui.session_affinity_action_selected_idx == 0;
-    lines.push(Line::from(Span::styled(
-        match ui.language {
-            Language::Zh => format!(
-                "{} 清除 affinity（有状态请求可能被拒绝）",
-                if clear_selected { ">" } else { " " }
-            ),
-            Language::En => format!(
-                "{} Clear affinity (state-bound requests may be rejected)",
-                if clear_selected { ">" } else { " " }
-            ),
-        },
-        Style::default()
-            .fg(if clear_selected { p.warn } else { p.text })
-            .add_modifier(if clear_selected {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
-    )));
+    let candidate_action_offset = usize::from(has_affinity);
+    if has_affinity {
+        let clear_selected = ui.session_affinity_action_selected_idx == 0;
+        lines.push(Line::from(Span::styled(
+            match ui.language {
+                Language::Zh => format!(
+                    "{} 清除 affinity（有状态请求可能被拒绝）",
+                    if clear_selected { ">" } else { " " }
+                ),
+                Language::En => format!(
+                    "{} Clear affinity (state-bound requests may be rejected)",
+                    if clear_selected { ">" } else { " " }
+                ),
+            },
+            Style::default()
+                .fg(if clear_selected { p.warn } else { p.text })
+                .add_modifier(if clear_selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )));
+    }
 
     if let Some(routing) = snapshot.routing.as_ref()
         && routing.entry_strategy != crate::config::RouteStrategy::Conditional
@@ -737,27 +751,38 @@ pub(super) fn render_session_affinity_actions_modal(
         let (start, end) = session_affinity_candidate_window(
             routing.candidates.len(),
             ui.session_affinity_action_selected_idx,
+            candidate_action_offset,
             candidate_rows,
         );
         for (index, candidate) in routing.candidates.iter().enumerate().take(end).skip(start) {
-            let selected = ui.session_affinity_action_selected_idx == index + 1;
+            let selected =
+                ui.session_affinity_action_selected_idx == index + candidate_action_offset;
             let target = format!("{}.{}", candidate.provider_id, candidate.endpoint_id);
-            let current = (target == current_target).then_some(match ui.language {
-                Language::Zh => "（当前）",
-                Language::En => " (current)",
-            });
+            let current = bound_target
+                .as_deref()
+                .is_some_and(|bound_target| target == bound_target)
+                .then_some(match ui.language {
+                    Language::Zh => "（当前）",
+                    Language::En => " (current)",
+                });
             lines.push(Line::from(Span::styled(
                 match ui.language {
-                    Language::Zh => format!(
+                    Language::Zh if has_affinity => format!(
                         "{} 重新绑定到 {target}{}",
                         if selected { ">" } else { " " },
                         current.unwrap_or_default()
                     ),
-                    Language::En => format!(
+                    Language::Zh => {
+                        format!("{} 绑定到 {target}", if selected { ">" } else { " " },)
+                    }
+                    Language::En if has_affinity => format!(
                         "{} Rebind to {target}{}",
                         if selected { ">" } else { " " },
                         current.unwrap_or_default()
                     ),
+                    Language::En => {
+                        format!("{} Bind to {target}", if selected { ">" } else { " " },)
+                    }
                 },
                 Style::default()
                     .fg(if selected { p.accent } else { p.text })
@@ -794,9 +819,16 @@ pub(super) fn render_session_affinity_actions_modal(
     {
         lines.push(Line::from(Span::styled(
             match ui.language {
-                Language::Zh => "条件路由只能清除 affinity；重新绑定需要具体请求上下文。",
+                Language::Zh if has_affinity => {
+                    "条件路由只能清除 affinity；重新绑定需要具体请求上下文。"
+                }
+                Language::Zh => "条件路由需要具体请求上下文，不能预先绑定会话 affinity。",
                 Language::En => {
-                    "Conditional routes only allow Clear; rebind requires request context."
+                    if has_affinity {
+                        "Conditional routes only allow Clear; rebind requires request context."
+                    } else {
+                        "Conditional routes require request context and cannot pre-bind session affinity."
+                    }
                 }
             },
             Style::default().fg(p.muted),
@@ -807,11 +839,16 @@ pub(super) fn render_session_affinity_actions_modal(
         Line::from(""),
         Line::from(Span::styled(
             match ui.language {
-                Language::Zh => {
+                Language::Zh if has_affinity => {
                     "跨端点 Rebind 仅限相同的显式 continuity domain，且目标当前必须可用。"
                 }
+                Language::Zh => "Bind 会建立此会话的首个粘性路由；目标必须当前可用。",
                 Language::En => {
-                    "Cross-endpoint rebind requires the same explicit continuity domain and an available target."
+                    if has_affinity {
+                        "Cross-endpoint rebind requires the same explicit continuity domain and an available target."
+                    } else {
+                        "Bind creates this session's first sticky route; the target must be currently available."
+                    }
                 }
             },
             Style::default().fg(p.muted),
@@ -830,6 +867,7 @@ pub(super) fn render_session_affinity_actions_modal(
 fn session_affinity_candidate_window(
     total: usize,
     selected_action_index: usize,
+    candidate_action_offset: usize,
     max_rows: usize,
 ) -> (usize, usize) {
     if total == 0 {
@@ -837,7 +875,7 @@ fn session_affinity_candidate_window(
     }
     let rows = max_rows.max(1).min(total);
     let selected_candidate = selected_action_index
-        .saturating_sub(1)
+        .saturating_sub(candidate_action_offset)
         .min(total.saturating_sub(1));
     let start = selected_candidate
         .saturating_sub(rows / 2)
@@ -906,6 +944,32 @@ pub(super) fn render_session_affinity_confirmation_modal(
                     }
                     Language::En => {
                         "If an existing WebSocket selects another endpoint, it requires reconnect before any old-upstream write."
+                    }
+                }));
+            }
+            OperatorSessionAffinityCommand::Bind {
+                provider_id,
+                endpoint_id,
+            } => {
+                let target = format!("{provider_id}.{endpoint_id}");
+                lines.push(Line::from(Span::styled(
+                    match ui.language {
+                        Language::Zh => format!("为会话绑定首个路由 {target}"),
+                        Language::En => format!("Bind the session's first route to {target}"),
+                    },
+                    Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(match ui.language {
+                    Language::Zh => "仅空闲且尚无 affinity 的会话可执行；若状态已变化，daemon 会拒绝操作。",
+                    Language::En => {
+                        "The session must be idle and unbound; the daemon rejects the action if state changed."
+                    }
+                }));
+                lines.push(Line::from(match ui.language {
+                    Language::Zh => "目标必须存在且当前可用；后续请求会优先复用此粘性路由。",
+                    Language::En => {
+                        "The target must exist and be currently available; later requests reuse this sticky route first."
                     }
                 }));
             }

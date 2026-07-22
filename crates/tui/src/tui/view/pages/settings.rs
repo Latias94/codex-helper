@@ -1057,6 +1057,7 @@ mod tests {
         let status = codex_helper_core::codex_switch::CodexSwitchStatus {
             phase: codex_helper_core::codex_switch::CodexSwitchPhase::Applied,
             enabled: true,
+            model_provider: Some("codex_proxy".to_string()),
             managed: true,
             base_url: Some("http://127.0.0.1:3211/v1".to_string()),
             client_patch: Some(crate::config::CodexClientPatchConfig {

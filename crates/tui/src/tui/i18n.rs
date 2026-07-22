@@ -83,7 +83,7 @@ define_messages! {
     FOOTER_DASHBOARD => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  O/H 或 o/h 关联页  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  O/H or o/h related pages  ? help" },
     FOOTER_ROUTING => { zh: "1-9/0 页面  q 退出  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助", en: "1-9/0 pages  q quit  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  g refresh  i details  ? help" },
     FOOTER_REQUESTS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  e/c/s 筛选  x 清焦点  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  e/c/s filters  x clear focus  o/h navigate  ? help" },
-    FOOTER_SESSIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  a/e 筛选  r 重置  t 记录  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  a/e filters  r reset  t transcript  ? help" },
+    FOOTER_SESSIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  p/A 路由  a/e 筛选  r 重置  t 记录  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  p/A route  a/e filters  r reset  t transcript  ? help" },
     FOOTER_STATS => { zh: "1-9/0 页面  q 退出  L 语言  Tab 池/项目/提供商/端点  ↑/↓ 选择  g 刷新  y 报告  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab pool/project/provider/endpoint  ↑/↓ select  g refresh  y report  ? help" },
     FOOTER_SETTINGS_CODEX => { zh: "1-9/0 页面  q 退出  L 语言  n/o 本地 Codex switch  ? 帮助", en: "1-9/0 pages  q quit  L language  n/o local Codex switch  ? help" },
     FOOTER_SETTINGS_OTHER => { zh: "1-9/0 页面  q 退出  L 语言  ? 帮助", en: "1-9/0 pages  q quit  L language  ? help" },

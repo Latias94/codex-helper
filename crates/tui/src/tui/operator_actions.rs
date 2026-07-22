@@ -535,7 +535,16 @@ pub(super) fn apply_operator_action_outcome(ui: &mut UiState, outcome: OperatorA
             }
         }
         OperatorActionOutcome::MutateRouting { command, result } => {
-            routing_mutation_message(ui.language, &command, result)
+            let refresh_balances = matches!(
+                &result,
+                Ok(response) if response.status == OperatorRoutingMutationStatus::Applied
+            );
+            let message = routing_mutation_message(ui.language, &command, result);
+            if refresh_balances {
+                // A route change can make a previously fresh balance misleading.
+                let _ = queue_balance_refresh_with_cooldown(ui, true, false, false);
+            }
+            message
         }
         OperatorActionOutcome::MutateSessionAffinity { command, result } => {
             session_affinity_mutation_message(ui.language, &command, result)
@@ -884,6 +893,20 @@ fn session_affinity_mutation_message(
             ) => format!("会话已重新绑定到 {provider_id}.{endpoint_id}"),
             (
                 Language::En,
+                OperatorSessionAffinityCommand::Bind {
+                    provider_id,
+                    endpoint_id,
+                },
+            ) => format!("session bound to {provider_id}.{endpoint_id}"),
+            (
+                Language::Zh,
+                OperatorSessionAffinityCommand::Bind {
+                    provider_id,
+                    endpoint_id,
+                },
+            ) => format!("会话已绑定到 {provider_id}.{endpoint_id}"),
+            (
+                Language::En,
                 OperatorSessionAffinityCommand::Rebind {
                     provider_id,
                     endpoint_id,
@@ -994,6 +1017,26 @@ mod tests {
         }
     }
 
+    fn routing_response(status: OperatorRoutingMutationStatus) -> OperatorRoutingMutationResponse {
+        OperatorRoutingMutationResponse {
+            status,
+            routing: crate::dashboard_core::OperatorRoutingSummary {
+                route_graph_key: "routing:sha256:test".to_string(),
+                control_revision: 1,
+                provider_policy_revision: 1,
+                entry: "main".to_string(),
+                entry_strategy: crate::config::RouteStrategy::RoundRobin,
+                entry_target: None,
+                new_session_preference: None,
+                affinity_policy: crate::config::RouteAffinityPolicy::FallbackSticky,
+                scheduling_preset: crate::config::SchedulingPreset::Balanced,
+                fallback_ttl_ms: None,
+                reprobe_preferred_after_ms: None,
+                candidates: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn auto_balance_refresh_has_a_short_ui_cooldown() {
         let mut ui = UiState::default();
@@ -1020,6 +1063,48 @@ mod tests {
             ui.pending_operator_action,
             Some(PendingOperatorAction::RefreshBalances { force: true })
         ));
+    }
+
+    #[test]
+    fn applied_routing_mutation_queues_a_forced_balance_refresh_without_ui_cooldown() {
+        let mut ui = UiState {
+            last_balance_refresh_requested_at: Some(Instant::now()),
+            ..UiState::default()
+        };
+
+        apply_operator_action_outcome(
+            &mut ui,
+            OperatorActionOutcome::MutateRouting {
+                command: OperatorRoutingCommand::SetNewSessionPreference {
+                    provider_id: "input".to_string(),
+                    endpoint_id: "default".to_string(),
+                },
+                result: Ok(routing_response(OperatorRoutingMutationStatus::Applied)),
+            },
+        );
+
+        assert!(matches!(
+            ui.pending_operator_action,
+            Some(PendingOperatorAction::RefreshBalances { force: true })
+        ));
+    }
+
+    #[test]
+    fn unchanged_or_conflicted_routing_mutation_does_not_refresh_balances() {
+        for status in [
+            OperatorRoutingMutationStatus::Unchanged,
+            OperatorRoutingMutationStatus::Conflict,
+        ] {
+            let mut ui = UiState::default();
+            apply_operator_action_outcome(
+                &mut ui,
+                OperatorActionOutcome::MutateRouting {
+                    command: OperatorRoutingCommand::ClearNewSessionPreference,
+                    result: Ok(routing_response(status)),
+                },
+            );
+            assert!(ui.pending_operator_action.is_none(), "status={status:?}");
+        }
     }
 
     #[test]
