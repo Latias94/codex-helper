@@ -91,6 +91,7 @@ pub(crate) struct ServiceStatus {
     service_name: String,
     state: ServiceRuntimeState,
     installed: bool,
+    legacy_installation: bool,
     autostart: bool,
     service_definition: Option<PathBuf>,
     log_directory: PathBuf,
@@ -135,31 +136,58 @@ pub(crate) async fn handle_service_command(command: ServiceCommand) -> CliResult
                 client_home: service_client_home(service_name),
                 install_generation,
             };
+            let candidate_receipt = service_receipt(&options)?;
+            preflight_service_install_identity(
+                read_service_receipt(&options.helper_home),
+                status(),
+                &candidate_receipt,
+            )?;
             preflight_service_credentials(service_kind(service_name)?, &options.helper_home)
                 .await?;
             ensure_service_operator_token()?;
-            install(options)?;
+            let started_readiness = install(options).await?;
             if no_start {
                 println!(
                     "Credential readiness is valid in the installer context but remains unverified in the installed service context until start."
                 );
             } else {
-                verify_started_service_runtime().await?;
+                let readiness = started_readiness.ok_or_else(|| {
+                    CliError::Other(
+                        "service installation started the runtime without returning its verified credential readiness"
+                            .to_string(),
+                    )
+                })?;
+                ensure_started_service_credential_readiness(readiness)?;
             }
             print_status(&service_status().await?, false)?;
         }
-        ServiceCommand::Uninstall { keep_running } => uninstall_with_receipt(!keep_running)?,
+        ServiceCommand::Uninstall { keep_running } => {
+            uninstall_with_receipt(!keep_running)?;
+            if keep_running {
+                println!(
+                    "Service registration and receipt were removed; the existing runtime was intentionally left running. No Codex client switch was restored because its target remains alive. Run `codex-helper switch off` before stopping the detached runtime, and run `codex-helper service install` before managing a future runtime; use `codex-helper daemon status` for best-effort observation."
+                );
+            }
+        }
         ServiceCommand::Start => {
             preflight_installed_service_credentials().await?;
             ensure_service_operator_token()?;
             start()?;
             verify_started_service_runtime().await?;
         }
-        ServiceCommand::Stop => stop()?,
+        ServiceCommand::Stop => run_service_stop_with_switch_policy(
+            ServiceStopSwitchPolicy::RestoreMatchingCodexSwitch,
+            reconcile_installed_service_switch_before_stop,
+            stop,
+        )?,
         ServiceCommand::Restart => {
             preflight_installed_service_credentials().await?;
             ensure_service_operator_token()?;
-            stop()?;
+            run_service_stop_with_switch_policy(
+                ServiceStopSwitchPolicy::PreserveForRestart,
+                reconcile_installed_service_switch_before_stop,
+                stop,
+            )?;
             start()?;
             verify_started_service_runtime().await?;
         }
@@ -433,9 +461,28 @@ fn windows_task_name_for_sid(user_sid: &str) -> CliResult<String> {
 struct WindowsTaskRecord {
     task_name: String,
     task_path: String,
+    version: String,
+    description: String,
     owner_sid: String,
+    principal_count: usize,
+    principal_id: String,
+    actions_context: String,
     state: u8,
     enabled: bool,
+    multiple_instances: String,
+    disallow_start_if_on_batteries: bool,
+    stop_if_going_on_batteries: bool,
+    allow_hard_terminate: bool,
+    start_when_available: bool,
+    run_only_if_network_available: bool,
+    allow_start_on_demand: bool,
+    hidden: bool,
+    run_only_if_idle: bool,
+    wake_to_run: bool,
+    execution_time_limit: String,
+    priority: u8,
+    restart_interval: String,
+    restart_count: u32,
     action_count: usize,
     execute: String,
     arguments: String,
@@ -498,6 +545,255 @@ fn windows_paths_equal(left: &str, right: &str) -> bool {
 }
 
 #[cfg(any(windows, test))]
+fn parse_canonical_windows_command_line(value: &str) -> CliResult<Vec<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CliError::Other(
+            "the Windows command line is empty".to_string(),
+        ));
+    }
+
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut arguments = Vec::new();
+    let mut index = 0_usize;
+    while index < characters.len() {
+        while index < characters.len() && characters[index].is_whitespace() {
+            index += 1;
+        }
+        if index == characters.len() {
+            break;
+        }
+
+        let mut argument = String::new();
+        let mut quoted = false;
+        loop {
+            let mut backslashes = 0_usize;
+            while index < characters.len() && characters[index] == '\\' {
+                backslashes += 1;
+                index += 1;
+            }
+            if index < characters.len() && characters[index] == '"' {
+                argument.extend(std::iter::repeat_n('\\', backslashes / 2));
+                if backslashes.is_multiple_of(2) {
+                    quoted = !quoted;
+                } else {
+                    argument.push('"');
+                }
+                index += 1;
+                continue;
+            }
+            argument.extend(std::iter::repeat_n('\\', backslashes));
+            if index == characters.len() || (!quoted && characters[index].is_whitespace()) {
+                break;
+            }
+            argument.push(characters[index]);
+            index += 1;
+        }
+        if quoted {
+            return Err(CliError::Other(
+                "the Windows command line contains an unterminated quoted argument".to_string(),
+            ));
+        }
+        arguments.push(argument);
+    }
+
+    let canonical = arguments
+        .iter()
+        .map(|argument| quote_windows_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if canonical != value {
+        return Err(CliError::Other(
+            "the Windows command line is not in the canonical codex-helper argument form"
+                .to_string(),
+        ));
+    }
+    Ok(arguments)
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyWindowsServiceInvocation {
+    service_name: String,
+    host: IpAddr,
+    port: u16,
+    helper_home: String,
+    client_home: Option<String>,
+}
+
+#[cfg(any(windows, test))]
+impl LegacyWindowsServiceInvocation {
+    fn matches_install(&self, options: &ServiceInstallOptions) -> bool {
+        self.service_name == options.service_name
+            && self.host == options.host
+            && self.port == options.port
+            && windows_paths_equal(
+                &self.helper_home,
+                options.helper_home.to_string_lossy().as_ref(),
+            )
+            && self.client_home.as_deref().is_none_or(|client_home| {
+                windows_paths_equal(client_home, options.client_home.to_string_lossy().as_ref())
+            })
+    }
+
+    fn conflicts_with_install(&self, options: &ServiceInstallOptions) -> bool {
+        self.port == options.port
+    }
+}
+
+#[cfg(any(windows, test))]
+fn parse_legacy_service_arguments(
+    arguments: &[String],
+    entrypoint: &str,
+) -> CliResult<LegacyWindowsServiceInvocation> {
+    let expected_len = match entrypoint {
+        "run" => 10,
+        "task-run" if arguments.len() == 12 || arguments.len() == 14 => arguments.len(),
+        _ => 0,
+    };
+    let service_name = arguments
+        .get(3)
+        .filter(|value| matches!(value.as_str(), "codex" | "claude"));
+    let host = arguments
+        .get(5)
+        .and_then(|value| value.parse::<IpAddr>().ok());
+    let port = arguments.get(7).and_then(|value| value.parse::<u16>().ok());
+    let paths_valid = arguments.get(9).is_some_and(|value| !value.is_empty())
+        && (entrypoint == "run" || arguments.get(11).is_some_and(|value| !value.is_empty()));
+    let generation_valid = arguments.len() != 14
+        || arguments.get(13).is_some_and(|value| {
+            codex_helper_core::service_target::ServiceInstallGeneration::parse(value).is_ok()
+        });
+    let exact_shape = arguments.len() == expected_len
+        && arguments.first().is_some_and(|value| value == "service")
+        && arguments.get(1).is_some_and(|value| value == entrypoint)
+        && arguments
+            .get(2)
+            .is_some_and(|value| value == "--service-name")
+        && arguments.get(4).is_some_and(|value| value == "--host")
+        && arguments.get(6).is_some_and(|value| value == "--port")
+        && arguments
+            .get(8)
+            .is_some_and(|value| value == "--helper-home")
+        && (entrypoint == "run"
+            || (arguments
+                .get(10)
+                .is_some_and(|value| value == "--client-home")
+                && (arguments.len() != 14
+                    || arguments
+                        .get(12)
+                        .is_some_and(|value| value == "--install-generation"))));
+    let invalid = || {
+        CliError::Other(format!(
+            "the legacy Windows service invocation did not match the supported `service {entrypoint}` argument contract"
+        ))
+    };
+    if !exact_shape || !paths_valid || !generation_valid {
+        return Err(invalid());
+    }
+    Ok(LegacyWindowsServiceInvocation {
+        service_name: service_name.cloned().ok_or_else(&invalid)?,
+        host: host.ok_or_else(&invalid)?,
+        port: port.ok_or_else(invalid)?,
+        helper_home: arguments[9].clone(),
+        client_home: (entrypoint == "task-run").then(|| arguments[11].clone()),
+    })
+}
+
+#[cfg(any(windows, test))]
+fn verify_legacy_fixed_windows_task_record(
+    record: &WindowsTaskRecord,
+    user_sid: &str,
+    executable: &Path,
+) -> CliResult<LegacyWindowsServiceInvocation> {
+    let executable = windows_path_text(executable, "the codex-helper executable path")?;
+    let working_directory = windows_path_text(
+        Path::new(executable)
+            .parent()
+            .unwrap_or_else(|| Path::new(".")),
+        "the codex-helper working directory",
+    )?;
+    let arguments = parse_canonical_windows_command_line(&record.arguments)?;
+    let invocation = parse_legacy_service_arguments(&arguments, "task-run")?;
+    let valid = record.task_name == WINDOWS_TASK_BASENAME
+        && record.task_path == "\\"
+        && windows_task_owner_matches(record, user_sid)
+        && matches!(record.state, 1..=4)
+        && record.enabled
+        && record.action_count == 1
+        && windows_paths_equal(&record.execute, executable)
+        && windows_paths_equal(&record.working_directory, working_directory)
+        && (record.logon_type.eq_ignore_ascii_case("interactive")
+            || record.logon_type.eq_ignore_ascii_case("interactivetoken"))
+        && (record.run_level.eq_ignore_ascii_case("limited")
+            || record.run_level.eq_ignore_ascii_case("leastprivilege"))
+        && record.trigger_count == 1
+        && record.trigger_enabled
+        && record
+            .trigger_type
+            .eq_ignore_ascii_case("MSFT_TaskLogonTrigger")
+        && record.trigger_user_sid.eq_ignore_ascii_case(user_sid);
+    if valid {
+        Ok(invocation)
+    } else {
+        Err(CliError::Other(format!(
+            "refusing to migrate Windows task '{}': it does not match the verified legacy codex-helper action, trigger, SID, or least-privilege definition",
+            record.task_name
+        )))
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyWindowsScmDefinition {
+    own_process: bool,
+    start_type: u32,
+    error_control: u32,
+    dependencies: Vec<String>,
+    account_name: Option<String>,
+    display_name: String,
+    load_order_group: Option<String>,
+    command_line: String,
+}
+
+#[cfg(any(windows, test))]
+fn verify_legacy_windows_scm_definition(
+    definition: &LegacyWindowsScmDefinition,
+    executable: &Path,
+) -> CliResult<LegacyWindowsServiceInvocation> {
+    const SERVICE_AUTO_START: u32 = 2;
+    const SERVICE_ERROR_NORMAL: u32 = 1;
+    let account_is_local_system = definition.account_name.as_deref().is_none_or(|account| {
+        let account = account.trim();
+        account.is_empty()
+            || account.eq_ignore_ascii_case("LocalSystem")
+            || account.eq_ignore_ascii_case("NT AUTHORITY\\SYSTEM")
+            || account.eq_ignore_ascii_case(".\\LocalSystem")
+    });
+    let arguments = parse_canonical_windows_command_line(&definition.command_line)?;
+    let executable_matches = arguments
+        .first()
+        .is_some_and(|configured| windows_paths_equal(configured, &executable.to_string_lossy()));
+    let invocation = parse_legacy_service_arguments(arguments.get(1..).unwrap_or_default(), "run")?;
+    if definition.own_process
+        && definition.start_type == SERVICE_AUTO_START
+        && definition.error_control == SERVICE_ERROR_NORMAL
+        && definition.dependencies.is_empty()
+        && account_is_local_system
+        && definition.display_name == "codex-helper relay"
+        && definition.load_order_group.is_none()
+        && executable_matches
+    {
+        Ok(invocation)
+    } else {
+        Err(CliError::Other(
+            "refusing to migrate the same-name Windows SCM service because its startup, account, dependencies, display name, service type, or executable is not the verified legacy codex-helper definition"
+                .to_string(),
+        ))
+    }
+}
+
+#[cfg(any(windows, test))]
 fn verify_windows_task_record(
     record: &WindowsTaskRecord,
     task_name: &str,
@@ -523,9 +819,29 @@ fn verify_windows_task_record(
         || record.logon_type.eq_ignore_ascii_case("interactivetoken");
     let valid = record.task_name == task_name
         && record.task_path == "\\"
+        && record.version == "1.2"
+        && record.description == "Resident codex-helper relay for the current user."
         && windows_task_owner_matches(record, user_sid)
+        && record.principal_count == 1
+        && record.principal_id == "Author"
+        && record.actions_context == "Author"
         && matches!(record.state, 2..=4)
         && record.enabled
+        && (record.multiple_instances.eq_ignore_ascii_case("IgnoreNew")
+            || record.multiple_instances == "2")
+        && !record.disallow_start_if_on_batteries
+        && !record.stop_if_going_on_batteries
+        && record.allow_hard_terminate
+        && record.start_when_available
+        && !record.run_only_if_network_available
+        && record.allow_start_on_demand
+        && !record.hidden
+        && !record.run_only_if_idle
+        && !record.wake_to_run
+        && record.execution_time_limit.eq_ignore_ascii_case("PT0S")
+        && record.priority == 7
+        && record.restart_interval.eq_ignore_ascii_case("PT10S")
+        && record.restart_count == 10
         && record.action_count == 1
         && windows_paths_equal(&record.execute, executable)
         && record.arguments == expected_arguments
@@ -542,15 +858,33 @@ fn verify_windows_task_record(
         Ok(())
     } else {
         Err(CliError::Other(format!(
-            "the registered Windows task '{task_name}' did not match the verified SID, action, trigger, or least-privilege definition"
+            "the registered Windows task '{task_name}' did not match the complete canonical SID, registration, settings, action, trigger, or least-privilege definition"
         )))
     }
+}
+
+#[cfg(any(windows, test))]
+fn verify_existing_windows_task_for_replacement(
+    record: &WindowsTaskRecord,
+    task_name: &str,
+    user_sid: &str,
+    executable: &Path,
+    installed_options: Option<&ServiceInstallOptions>,
+) -> CliResult<()> {
+    let installed_options = installed_options.ok_or_else(|| {
+        CliError::Other(
+            "refusing to replace an existing SID-scoped Windows task without a current receipt proving its complete canonical definition"
+                .to_string(),
+        )
+    })?;
+    verify_windows_task_record(record, task_name, user_sid, executable, installed_options)
 }
 
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowsServiceProbeClassification {
     Missing,
+    MarkedForDelete,
     Error,
 }
 
@@ -559,16 +893,19 @@ fn classify_windows_service_probe_error(
     raw_os_error: Option<i32>,
 ) -> WindowsServiceProbeClassification {
     const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
-    if raw_os_error == Some(ERROR_SERVICE_DOES_NOT_EXIST) {
-        WindowsServiceProbeClassification::Missing
-    } else {
-        WindowsServiceProbeClassification::Error
+    const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
+    match raw_os_error {
+        Some(ERROR_SERVICE_DOES_NOT_EXIST) => WindowsServiceProbeClassification::Missing,
+        Some(ERROR_SERVICE_MARKED_FOR_DELETE) => WindowsServiceProbeClassification::MarkedForDelete,
+        _ => WindowsServiceProbeClassification::Error,
     }
 }
 
 #[cfg(any(windows, test))]
 trait WindowsInstallTransactionBackend {
     fn preflight(&mut self) -> CliResult<()>;
+    fn stop_existing_scoped_task(&mut self) -> CliResult<()>;
+    fn stop_legacy_runtimes(&mut self) -> CliResult<()>;
     fn register_scoped_task(&mut self) -> CliResult<()>;
     fn verify_scoped_task(&mut self) -> CliResult<()>;
     fn publish_receipt(&mut self) -> CliResult<()>;
@@ -576,36 +913,65 @@ trait WindowsInstallTransactionBackend {
     fn retire_legacy_scm(&mut self) -> CliResult<()>;
     fn rollback_receipt(&mut self) -> CliResult<()>;
     fn rollback(&mut self) -> CliResult<()>;
+    fn rollback_preserved_replacement(&self) -> bool;
     fn start_scoped_task(&mut self) -> CliResult<()>;
+    async fn verify_started_runtime_identity(
+        &mut self,
+    ) -> CliResult<codex_helper_core::credentials::CredentialAggregateReadiness>;
 }
 
 #[cfg(any(windows, test))]
-fn run_windows_install_transaction(
+async fn run_windows_install_transaction(
     backend: &mut impl WindowsInstallTransactionBackend,
     start: bool,
-) -> CliResult<()> {
+) -> CliResult<Option<codex_helper_core::credentials::CredentialAggregateReadiness>> {
     backend.preflight()?;
     let mut new_task_verified = false;
-    let migration = (|| {
+    let mut started_readiness = None;
+    let migration: CliResult<()> = async {
+        backend.stop_existing_scoped_task()?;
+        // A verified legacy runtime can listen on the same proxy address as the replacement.
+        // Keep its registration for rollback, but stop it before the new task is started.
+        backend.stop_legacy_runtimes()?;
         backend.register_scoped_task()?;
         backend.verify_scoped_task()?;
         new_task_verified = true;
         backend.publish_receipt()?;
+        if start {
+            backend.start_scoped_task()?;
+            started_readiness = Some(backend.verify_started_runtime_identity().await?);
+        }
         backend.retire_owned_fixed_task()?;
         backend.retire_legacy_scm()
-    })();
+    }
+    .await;
     if let Err(primary) = migration {
-        let receipt_rollback = backend.rollback_receipt();
-        let platform_rollback = backend.rollback();
+        let platform_rollback = if backend.rollback_preserved_replacement() {
+            Err(CliError::Other(
+                "the verified replacement task was preserved because legacy retirement may have committed"
+                    .to_string(),
+            ))
+        } else {
+            backend.rollback()
+        };
+        let replacement_preserved = backend.rollback_preserved_replacement();
+        let receipt_rollback = if replacement_preserved {
+            Err(CliError::Other(
+                "kept the current service receipt because the verified replacement task was preserved"
+                    .to_string(),
+            ))
+        } else {
+            backend.rollback_receipt()
+        };
         return match (receipt_rollback, platform_rollback) {
             (Ok(()), Ok(())) => Err(CliError::Other(format!(
                 "Windows service migration failed and the previous runnable installation was restored: {primary}"
             ))),
             (receipt_rollback, platform_rollback) => {
-                let fallback = if new_task_verified {
+                let fallback = if replacement_preserved && new_task_verified {
                     "The verified SID-scoped task was left installed when required to avoid removing the last runnable installation"
                 } else {
-                    "The legacy installations were not retired; inspect and remove any partially registered SID-scoped task only after verifying its Principal SID"
+                    "The replacement task was not preserved as a verified fallback; inspect the reported platform recovery failures before starting or removing any task"
                 };
                 let failures = [receipt_rollback.err(), platform_rollback.err()]
                     .into_iter()
@@ -619,14 +985,462 @@ fn run_windows_install_transaction(
             }
         };
     }
-    if start {
-        backend.start_scoped_task().map_err(|error| {
-            CliError::Other(format!(
-                "the SID-scoped Windows task was installed and the legacy installation was retired, but starting the new task failed: {error}"
-            ))
-        })?;
+    Ok(started_readiness)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+trait UnixInstallTransactionBackend {
+    fn prepare_replacement(&mut self) -> CliResult<()>;
+    fn start_replacement(&mut self) -> CliResult<()>;
+    async fn verify_started_runtime_identity(
+        &mut self,
+    ) -> CliResult<codex_helper_core::credentials::CredentialAggregateReadiness>;
+    fn rollback(&mut self) -> CliResult<()>;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+async fn run_unix_install_transaction(
+    backend: &mut impl UnixInstallTransactionBackend,
+    start: bool,
+) -> CliResult<Option<codex_helper_core::credentials::CredentialAggregateReadiness>> {
+    let mutation: CliResult<_> = async {
+        backend.prepare_replacement()?;
+        if start {
+            backend.start_replacement()?;
+            backend.verify_started_runtime_identity().await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+    .await;
+    match mutation {
+        Ok(readiness) => Ok(readiness),
+        Err(primary) => {
+            let failures = backend
+                .rollback()
+                .err()
+                .map(|error| vec![error.to_string()])
+                .unwrap_or_default();
+            Err(rollback_error(primary, failures))
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+trait WindowsUninstallTransactionBackend {
+    fn stop_and_verify(&mut self) -> CliResult<()>;
+    fn remove_scoped_task(&mut self) -> CliResult<()>;
+    fn remove_fixed_task(&mut self) -> CliResult<()>;
+    fn remove_definition(&mut self) -> CliResult<()>;
+    fn remove_receipt(&mut self) -> CliResult<()>;
+    fn retire_legacy_scm(&mut self) -> CliResult<()>;
+    // Ok means every mutated resource, including an attempted legacy SCM retirement, was
+    // independently observed in its original registration and runtime state.
+    fn rollback(&mut self) -> CliResult<()>;
+}
+
+#[cfg(any(windows, test))]
+fn run_windows_uninstall_transaction(
+    backend: &mut impl WindowsUninstallTransactionBackend,
+    stop_first: bool,
+) -> CliResult<()> {
+    let mutation = (|| {
+        if stop_first {
+            backend.stop_and_verify()?;
+        }
+        backend.remove_scoped_task()?;
+        backend.remove_fixed_task()?;
+        backend.remove_definition()?;
+        backend.remove_receipt()?;
+        // SCM service definitions cannot be reconstructed from the public Windows API. Retire
+        // the legacy service only after every reversible resource has committed successfully.
+        backend.retire_legacy_scm()
+    })();
+    if let Err(primary) = mutation {
+        return match backend.rollback() {
+            Ok(()) => {
+                let restored = if stop_first {
+                    "the previous task registrations, definition, receipt, and runtime state were restored"
+                } else {
+                    "the previous task registrations, definition, and receipt were restored; detached runtime instances were intentionally never stopped"
+                };
+                Err(CliError::Other(format!(
+                    "Windows service uninstall failed before completion and {restored}: {primary}"
+                )))
+            }
+            Err(rollback) => Err(CliError::Other(format!(
+                "Windows service uninstall failed: {primary}; restoring the previous task registrations, definition, receipt, or runtime state also failed: {rollback}. The Windows service installation is partial; inspect Task Scheduler and SCM, then run `codex-helper service install` to repair it"
+            ))),
+        };
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+trait ServiceUninstallTransactionBackend {
+    fn stop_and_verify(&mut self) -> CliResult<()>;
+    fn disable_and_verify(&mut self) -> CliResult<()>;
+    fn remove_definition(&mut self) -> CliResult<()>;
+    fn remove_receipt(&mut self) -> CliResult<()>;
+    fn rollback(&mut self) -> CliResult<()>;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn run_service_uninstall_transaction(
+    backend: &mut impl ServiceUninstallTransactionBackend,
+    stop_first: bool,
+) -> CliResult<()> {
+    let mutation = (|| {
+        if stop_first {
+            backend.stop_and_verify()?;
+        }
+        backend.disable_and_verify()?;
+        backend.remove_definition()?;
+        backend.remove_receipt()
+    })();
+    if let Err(primary) = mutation {
+        return match backend.rollback() {
+            Ok(()) => Err(CliError::Other(format!(
+                "service uninstall failed before completion and the previous definition and receipt were restored: {primary}"
+            ))),
+            Err(rollback) => Err(CliError::Other(format!(
+                "service uninstall failed: {primary}; restoring the previous definition, receipt, or runtime state also failed: {rollback}"
+            ))),
+        };
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceSwitchUninstallPreparation {
+    NotApplicable,
+    Restored,
+    Unchanged,
+    Warning(String),
+}
+
+fn local_proxy_target_from_service_receipt(
+    receipt: &ServiceReceipt,
+) -> CliResult<codex_helper_core::codex_switch::ValidatedCodexBaseUrl> {
+    let admin_url = reqwest::Url::parse(receipt.admin_base_url()).map_err(|error| {
+        CliError::Other(format!(
+            "cannot derive the installed proxy target from service receipt admin URL {:?}: {error}",
+            receipt.admin_base_url()
+        ))
+    })?;
+    if admin_url.scheme() != "http" || admin_url.host_str() != Some("127.0.0.1") {
+        return Err(CliError::Other(format!(
+            "service receipt admin URL {:?} is not the canonical local service authority",
+            receipt.admin_base_url()
+        )));
+    }
+    let admin_port = admin_url.port().ok_or_else(|| {
+        CliError::Other(format!(
+            "service receipt admin URL {:?} does not contain an explicit local admin port",
+            receipt.admin_base_url()
+        ))
+    })?;
+    let offset = codex_helper_core::proxy::ADMIN_PORT_OFFSET;
+    let ambiguous_start = u16::MAX - (offset * 2) + 1;
+    let ambiguous_end = u16::MAX - offset;
+    if (ambiguous_start..=ambiguous_end).contains(&admin_port) {
+        return Err(CliError::Other(format!(
+            "service receipt admin port {admin_port} is ambiguous and cannot identify one proxy port"
+        )));
+    }
+    let proxy_port = admin_port.checked_sub(offset).ok_or_else(|| {
+        CliError::Other(format!(
+            "service receipt admin port {admin_port} is outside the reversible local proxy range"
+        ))
+    })?;
+    let round_trip = codex_helper_core::proxy::local_admin_base_url_for_proxy_port(proxy_port);
+    if round_trip != receipt.admin_base_url() {
+        return Err(CliError::Other(format!(
+            "service receipt admin URL {:?} does not round-trip to one canonical local proxy target",
+            receipt.admin_base_url()
+        )));
+    }
+    Ok(codex_helper_core::codex_switch::ValidatedCodexBaseUrl::local(proxy_port))
+}
+
+fn switch_target_may_point_to_service(
+    active_target: Option<&str>,
+    expected_target: &codex_helper_core::codex_switch::ValidatedCodexBaseUrl,
+) -> bool {
+    let Some(active_target) = active_target else {
+        return true;
+    };
+    if active_target == expected_target.as_str() {
+        return true;
+    }
+    let (Ok(active), Ok(expected)) = (
+        reqwest::Url::parse(active_target),
+        reqwest::Url::parse(expected_target.as_str()),
+    ) else {
+        return true;
+    };
+    let Some(host) = active.host_str() else {
+        return true;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    active.scheme() == "http"
+        && active.port_or_known_default() == expected.port_or_known_default()
+        && loopback
+}
+
+#[cfg(test)]
+fn reconcile_service_switch_before_uninstall<F>(
+    receipt: &ServiceReceipt,
+    stop_first: bool,
+    restore: F,
+) -> CliResult<ServiceSwitchUninstallPreparation>
+where
+    F: FnOnce(
+        &Path,
+        &codex_helper_core::codex_switch::ValidatedCodexBaseUrl,
+    ) -> Result<
+        codex_helper_core::codex_switch::CodexSwitchTargetRestoreOutcome,
+        codex_helper_core::codex_switch::CodexSwitchError,
+    >,
+{
+    reconcile_service_switch_before_runtime_stop(
+        receipt,
+        stop_first,
+        "stop and uninstall the Codex service",
+        "Service uninstall",
+        restore,
+    )
+}
+
+fn reconcile_service_switch_before_runtime_stop<F>(
+    receipt: &ServiceReceipt,
+    runtime_will_stop: bool,
+    operation: &str,
+    continuation: &str,
+    restore: F,
+) -> CliResult<ServiceSwitchUninstallPreparation>
+where
+    F: FnOnce(
+        &Path,
+        &codex_helper_core::codex_switch::ValidatedCodexBaseUrl,
+    ) -> Result<
+        codex_helper_core::codex_switch::CodexSwitchTargetRestoreOutcome,
+        codex_helper_core::codex_switch::CodexSwitchError,
+    >,
+{
+    if !runtime_will_stop || receipt.service() != codex_helper_core::config::ServiceKind::Codex {
+        return Ok(ServiceSwitchUninstallPreparation::NotApplicable);
+    }
+
+    let expected_target = local_proxy_target_from_service_receipt(receipt).map_err(|error| {
+        CliError::Other(format!(
+            "refusing to {operation} because its receipt cannot prove the matching client switch target: {error}. Run `codex-helper switch off` first, then retry"
+        ))
+    })?;
+    let outcome = restore(receipt.client_home(), &expected_target).map_err(|error| {
+        CliError::Other(format!(
+            "refusing to {operation} because its matching client switch could not be restored safely: {error}. The service registration, receipt, and runtime were left in place; repair or run `codex-helper switch off`, then retry"
+        ))
+    })?;
+    match outcome {
+        codex_helper_core::codex_switch::CodexSwitchTargetRestoreOutcome::Restored(_) => {
+            Ok(ServiceSwitchUninstallPreparation::Restored)
+        }
+        codex_helper_core::codex_switch::CodexSwitchTargetRestoreOutcome::Unchanged(status) => {
+            let active_target = status.base_url.as_deref();
+            if status.enabled && switch_target_may_point_to_service(active_target, &expected_target)
+            {
+                return Err(CliError::Other(format!(
+                    "refusing to {operation} because Codex client config {} still selects the service target {} but is not a clean helper-managed Applied switch (phase={}, managed={}). No client or service files were changed; run `codex-helper switch off` or reconcile the reported switch state before retrying",
+                    status.config_path.display(),
+                    expected_target.as_str(),
+                    status.phase.as_str(),
+                    status.managed,
+                )));
+            }
+            if status.phase == codex_helper_core::codex_switch::CodexSwitchPhase::Off
+                && !status.enabled
+            {
+                return Ok(ServiceSwitchUninstallPreparation::Unchanged);
+            }
+            Ok(ServiceSwitchUninstallPreparation::Warning(format!(
+                "Codex client switch at {} was not modified because it does not actively select the service target {} (phase={}, target={}). {continuation} will continue without changing client files",
+                status.config_path.display(),
+                expected_target.as_str(),
+                status.phase.as_str(),
+                status.base_url.as_deref().unwrap_or("<unknown>"),
+            )))
+        }
+    }
+}
+
+fn reconcile_service_switch_before_no_start_install<F>(
+    start_after_install: bool,
+    platform_state: ServiceRuntimeState,
+    installed_receipt: Option<&ServiceReceipt>,
+    restore: F,
+) -> CliResult<ServiceSwitchUninstallPreparation>
+where
+    F: FnOnce(
+        &Path,
+        &codex_helper_core::codex_switch::ValidatedCodexBaseUrl,
+    ) -> Result<
+        codex_helper_core::codex_switch::CodexSwitchTargetRestoreOutcome,
+        codex_helper_core::codex_switch::CodexSwitchError,
+    >,
+{
+    let runtime_will_stop = !start_after_install
+        && matches!(
+            platform_state,
+            ServiceRuntimeState::Running
+                | ServiceRuntimeState::Starting
+                | ServiceRuntimeState::Stopping
+        );
+    let Some(receipt) = installed_receipt else {
+        return Ok(ServiceSwitchUninstallPreparation::NotApplicable);
+    };
+    reconcile_service_switch_before_runtime_stop(
+        receipt,
+        runtime_will_stop,
+        "replace the running Codex service with a stopped installation",
+        "Service installation",
+        restore,
+    )
+}
+
+fn prepare_service_switch_for_install(
+    options: &ServiceInstallOptions,
+    preflight: &ServiceInstallPreflight,
+) -> CliResult<()> {
+    let preparation = reconcile_service_switch_before_no_start_install(
+        options.start,
+        preflight.platform_state,
+        preflight.installed_receipt.as_ref(),
+        codex_helper_core::codex_switch::restore_managed_applied_for_target,
+    )?;
+    report_service_switch_preparation(
+        preparation,
+        "Restored the helper-managed Codex client switch before replacing the running service with a stopped installation.",
+    );
+    Ok(())
+}
+
+fn report_service_switch_preparation(
+    preparation: ServiceSwitchUninstallPreparation,
+    restored_message: &str,
+) {
+    match preparation {
+        ServiceSwitchUninstallPreparation::Restored => println!("{restored_message}"),
+        ServiceSwitchUninstallPreparation::Warning(warning) => eprintln!("Warning: {warning}"),
+        ServiceSwitchUninstallPreparation::NotApplicable
+        | ServiceSwitchUninstallPreparation::Unchanged => {}
+    }
+}
+
+fn reconcile_installed_service_switch_for_operation(
+    operation: &'static str,
+    continuation: &'static str,
+    restored_message: &'static str,
+) -> CliResult<()> {
+    let receipt = read_service_receipt(proxy_home_dir()).map_err(|error| {
+        CliError::Other(format!(
+            "refusing to {operation} without a current install receipt: {error}. Run `codex-helper switch off` first if Codex points at this service, then repair the receipt with the codex-helper version that created the service"
+        ))
+    })?;
+    let preparation = reconcile_service_switch_before_runtime_stop(
+        &receipt,
+        true,
+        operation,
+        continuation,
+        codex_helper_core::codex_switch::restore_managed_applied_for_target,
+    )?;
+    report_service_switch_preparation(preparation, restored_message);
+    Ok(())
+}
+
+fn reconcile_installed_service_switch() -> CliResult<()> {
+    reconcile_installed_service_switch_for_operation(
+        "stop and uninstall the service",
+        "Service uninstall",
+        "Restored the helper-managed Codex client switch before stopping the local service.",
+    )
+}
+
+fn reconcile_installed_service_switch_before_stop() -> CliResult<()> {
+    reconcile_installed_service_switch_for_operation(
+        "stop the service",
+        "Service stop",
+        "Restored the helper-managed Codex client switch before stopping the local service.",
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceStopSwitchPolicy {
+    RestoreMatchingCodexSwitch,
+    PreserveForRestart,
+}
+
+fn run_service_stop_with_switch_policy<R, S>(
+    policy: ServiceStopSwitchPolicy,
+    reconcile: R,
+    stop_platform: S,
+) -> CliResult<()>
+where
+    R: FnOnce() -> CliResult<()>,
+    S: FnOnce() -> CliResult<()>,
+{
+    if policy == ServiceStopSwitchPolicy::RestoreMatchingCodexSwitch {
+        reconcile()?;
+    }
+    stop_platform()
+}
+
+fn run_service_uninstall_with_switch_preflight<R, U>(
+    stop_first: bool,
+    reconcile: R,
+    uninstall_platform: U,
+) -> CliResult<()>
+where
+    R: FnOnce() -> CliResult<()>,
+    U: FnOnce(bool) -> CliResult<()>,
+{
+    if stop_first {
+        // A successful restore is intentionally one-way: platform rollback leaves the client Off,
+        // which is safe, while reapplying could overwrite a concurrent client edit.
+        reconcile()?;
+    }
+    uninstall_platform(stop_first)
+}
+
+fn validate_service_receipt_for_uninstall(
+    receipt: Result<ServiceReceipt, ServiceReceiptError>,
+    current_backend: Option<ServicePlatformBackend>,
+) -> CliResult<ServiceReceipt> {
+    let receipt = receipt.map_err(|error| {
+        CliError::Other(format!(
+            "refusing to uninstall without a current, valid service receipt: {error}. No service registration, receipt, runtime, or client files were changed; repair or migrate the installation before retrying"
+        ))
+    })?;
+    let current_backend = current_backend.ok_or_else(|| {
+        CliError::Other("system service management is unsupported on this platform".to_string())
+    })?;
+    if receipt.platform_backend() != current_backend {
+        return Err(CliError::Other(format!(
+            "refusing to uninstall a service receipt for {:?} with the current {:?} backend. No service registration, receipt, runtime, or client files were changed",
+            receipt.platform_backend(),
+            current_backend,
+        )));
+    }
+    CanonicalServiceInstallIdentity::from_receipt(&receipt).map_err(|error| {
+        CliError::Other(format!(
+            "refusing to uninstall because the service receipt identity is invalid: {error}. No service registration, receipt, runtime, or client files were changed"
+        ))
+    })?;
+    Ok(receipt)
 }
 
 fn service_name_from_flags(codex: bool, claude: bool) -> CliResult<&'static str> {
@@ -664,9 +1478,166 @@ fn service_receipt(options: &ServiceInstallOptions) -> CliResult<ServiceReceipt>
     .map_err(|error| CliError::Other(format!("build service install receipt: {error}")))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalServiceInstallIdentity {
+    service: codex_helper_core::config::ServiceKind,
+    proxy_target: codex_helper_core::codex_switch::ValidatedCodexBaseUrl,
+    client_home: PathBuf,
+    platform_backend: ServicePlatformBackend,
+}
+
+impl CanonicalServiceInstallIdentity {
+    fn from_receipt(receipt: &ServiceReceipt) -> CliResult<Self> {
+        Ok(Self {
+            service: receipt.service(),
+            proxy_target: local_proxy_target_from_service_receipt(receipt)?,
+            client_home: receipt.client_home().to_path_buf(),
+            platform_backend: receipt.platform_backend(),
+        })
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "service={}, proxy_target={}, client_home={}, platform={:?}",
+            codex_helper_core::runtime_host::service_name_for_kind(self.service),
+            self.proxy_target.as_str(),
+            self.client_home.display(),
+            self.platform_backend,
+        )
+    }
+}
+
+#[cfg(windows)]
+fn service_install_options_from_receipt(
+    receipt: &ServiceReceipt,
+    start: bool,
+) -> CliResult<ServiceInstallOptions> {
+    let proxy_target = local_proxy_target_from_service_receipt(receipt)?;
+    let target = reqwest::Url::parse(proxy_target.as_str()).map_err(|error| {
+        CliError::Other(format!(
+            "cannot parse the canonical proxy target from the service receipt: {error}"
+        ))
+    })?;
+    let host = target
+        .host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .ok_or_else(|| {
+            CliError::Other(
+                "the service receipt proxy target does not contain a numeric local address"
+                    .to_string(),
+            )
+        })?;
+    let port = target.port().ok_or_else(|| {
+        CliError::Other(
+            "the service receipt proxy target does not contain an explicit proxy port".to_string(),
+        )
+    })?;
+    Ok(ServiceInstallOptions {
+        service_name: codex_helper_core::runtime_host::service_name_for_kind(receipt.service()),
+        host,
+        port,
+        start,
+        helper_home: receipt.helper_home().to_path_buf(),
+        client_home: receipt.client_home().to_path_buf(),
+        install_generation: receipt.install_generation().clone(),
+    })
+}
+
+#[derive(Debug)]
+struct ServiceInstallPreflight {
+    installed_receipt: Option<ServiceReceipt>,
+    platform_state: ServiceRuntimeState,
+}
+
+fn preflight_service_install_identity(
+    installed_receipt: Result<ServiceReceipt, ServiceReceiptError>,
+    platform_status: CliResult<ServiceStatus>,
+    candidate_receipt: &ServiceReceipt,
+) -> CliResult<ServiceInstallPreflight> {
+    let installed_receipt = match installed_receipt {
+        Ok(receipt) => receipt,
+        Err(ServiceReceiptError::Missing) => {
+            let platform_status = platform_status.map_err(|error| {
+                CliError::Other(format!(
+                    "cannot verify that the platform service registration is absent while the install receipt is missing: {error}. No service files were changed; inspect the platform service manager and repair or remove the stale registration before retrying"
+                ))
+            })?;
+            let migratable_windows_legacy = platform_status.platform == ServicePlatform::Windows
+                && platform_status.legacy_installation
+                && candidate_receipt.platform_backend()
+                    == ServicePlatformBackend::WindowsScheduledTask;
+            if migratable_windows_legacy {
+                return Ok(ServiceInstallPreflight {
+                    installed_receipt: None,
+                    platform_state: platform_status.state,
+                });
+            }
+            if platform_status.installed
+                || platform_status.state != ServiceRuntimeState::NotInstalled
+            {
+                return Err(CliError::Other(format!(
+                    "refusing to install without a current receipt because the platform service registration is not proven absent (installed={}, state={:?}). No service files were changed; use the codex-helper version that created the registration to uninstall it, or repair the matching receipt before retrying",
+                    platform_status.installed, platform_status.state,
+                )));
+            }
+            return Ok(ServiceInstallPreflight {
+                installed_receipt: None,
+                platform_state: platform_status.state,
+            });
+        }
+        Err(ServiceReceiptError::LegacySchema { schema_version }) => {
+            return Err(CliError::Other(format!(
+                "refusing to replace a service receipt with an unsupported legacy schema version {schema_version:?}. No service files were changed; use a compatible codex-helper version to uninstall or migrate that service before retrying"
+            )));
+        }
+        Err(error) => {
+            return Err(CliError::Other(format!(
+                "cannot verify the existing service identity before installation: {error}. No service files were changed; repair the receipt or use a compatible codex-helper version before retrying"
+            )));
+        }
+    };
+    let platform_status = platform_status.map_err(|error| {
+        CliError::Other(format!(
+            "cannot verify the existing platform service registration before installation: {error}. No service files were changed; inspect the platform service manager before retrying"
+        ))
+    })?;
+    let installed = CanonicalServiceInstallIdentity::from_receipt(&installed_receipt)?;
+    let candidate = CanonicalServiceInstallIdentity::from_receipt(candidate_receipt)?;
+    if installed == candidate {
+        return Ok(ServiceInstallPreflight {
+            installed_receipt: Some(installed_receipt),
+            platform_state: platform_status.state,
+        });
+    }
+
+    Err(CliError::Other(format!(
+        "refusing to change the installed service identity during `service install` (installed: {}; requested: {}). No service files were changed. Run `codex-helper service uninstall` first so any matching Codex client switch is restored safely, then rerun the install command",
+        installed.describe(),
+        candidate.describe(),
+    )))
+}
+
 fn begin_service_receipt_transaction(
     options: &ServiceInstallOptions,
-) -> CliResult<(ServiceReceiptTransaction, ServiceReceipt)> {
+) -> CliResult<(
+    ServiceReceiptTransaction,
+    ServiceReceipt,
+    ServiceInstallPreflight,
+)> {
+    begin_service_receipt_transaction_with_status(options, status)
+}
+
+fn begin_service_receipt_transaction_with_status<F>(
+    options: &ServiceInstallOptions,
+    read_platform_status: F,
+) -> CliResult<(
+    ServiceReceiptTransaction,
+    ServiceReceipt,
+    ServiceInstallPreflight,
+)>
+where
+    F: FnOnce() -> CliResult<ServiceStatus>,
+{
     let receipt = service_receipt(options)?;
     let transaction = ServiceReceiptTransaction::begin_install_replacement(
         options.helper_home.clone(),
@@ -676,7 +1647,12 @@ fn begin_service_receipt_transaction(
             "begin service receipt install replacement: {error}"
         ))
     })?;
-    Ok((transaction, receipt))
+    let installed_receipt = transaction
+        .current()
+        .and_then(|receipt| receipt.ok_or(ServiceReceiptError::Missing));
+    let preflight =
+        preflight_service_install_identity(installed_receipt, read_platform_status(), &receipt)?;
+    Ok((transaction, receipt, preflight))
 }
 
 async fn preflight_installed_service_credentials()
@@ -752,7 +1728,8 @@ fn ensure_service_operator_token() -> CliResult<()> {
         .map_err(|error| CliError::Other(format!("prepare local service operator token: {error}")))
 }
 
-async fn verify_started_service_runtime() -> CliResult<()> {
+async fn verify_started_service_runtime_identity()
+-> CliResult<codex_helper_core::credentials::CredentialAggregateReadiness> {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
     const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -766,12 +1743,12 @@ async fn verify_started_service_runtime() -> CliResult<()> {
     loop {
         match read_service_runtime_with_timeout(receipt.clone(), PROBE_TIMEOUT).await {
             Ok(runtime) => {
-                return ensure_started_service_credential_readiness(runtime.credential_readiness);
+                return Ok(runtime.credential_readiness);
             }
             Err(error) => {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(CliError::Other(format!(
-                        "installed service did not publish its matching runtime identity within {} seconds; the service remains installed for diagnosis: {error}",
+                        "started service did not publish its matching runtime identity within {} seconds: {error}",
                         STARTUP_TIMEOUT.as_secs(),
                     )));
                 }
@@ -779,6 +1756,17 @@ async fn verify_started_service_runtime() -> CliResult<()> {
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn verify_started_service_runtime() -> CliResult<()> {
+    let readiness = verify_started_service_runtime_identity()
+        .await
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{error}; the service remains installed for diagnosis"
+            ))
+        })?;
+    ensure_started_service_credential_readiness(readiness)
 }
 
 fn ensure_started_service_credential_readiness(
@@ -819,7 +1807,7 @@ async fn read_service_runtime_with_timeout(
     .map_err(|error| error.to_string())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn rollback_error(primary: CliError, failures: Vec<String>) -> CliError {
     if failures.is_empty() {
         CliError::Other(format!(
@@ -882,6 +1870,24 @@ fn print_logs() {
 }
 
 fn uninstall_with_receipt(stop_first: bool) -> CliResult<()> {
+    validate_service_receipt_for_uninstall(
+        read_service_receipt(proxy_home_dir()),
+        ServicePlatformBackend::current(),
+    )?;
+    run_service_uninstall_with_switch_preflight(
+        stop_first,
+        reconcile_installed_service_switch,
+        uninstall_platform_with_receipt,
+    )
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+fn uninstall_platform_with_receipt(stop_first: bool) -> CliResult<()> {
+    uninstall(stop_first)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn uninstall_platform_with_receipt(stop_first: bool) -> CliResult<()> {
     let mut receipt = ServiceReceiptTransaction::begin(proxy_home_dir())
         .map_err(|error| CliError::Other(format!("begin service receipt removal: {error}")))?;
     receipt
@@ -938,22 +1944,30 @@ fn run_command(program: &str, args: &[OsString]) -> CliResult<String> {
 }
 
 #[cfg(windows)]
-fn install(options: ServiceInstallOptions) -> CliResult<()> {
-    windows::install(options)
+async fn install(
+    options: ServiceInstallOptions,
+) -> CliResult<Option<codex_helper_core::credentials::CredentialAggregateReadiness>> {
+    windows::install(options).await
 }
 
 #[cfg(target_os = "macos")]
-fn install(options: ServiceInstallOptions) -> CliResult<()> {
-    macos::install(options)
+async fn install(
+    options: ServiceInstallOptions,
+) -> CliResult<Option<codex_helper_core::credentials::CredentialAggregateReadiness>> {
+    macos::install(options).await
 }
 
 #[cfg(target_os = "linux")]
-fn install(options: ServiceInstallOptions) -> CliResult<()> {
-    linux::install(options)
+async fn install(
+    options: ServiceInstallOptions,
+) -> CliResult<Option<codex_helper_core::credentials::CredentialAggregateReadiness>> {
+    linux::install(options).await
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn install(_options: ServiceInstallOptions) -> CliResult<()> {
+async fn install(
+    _options: ServiceInstallOptions,
+) -> CliResult<Option<codex_helper_core::credentials::CredentialAggregateReadiness>> {
     Err(unsupported_platform())
 }
 
@@ -1035,6 +2049,10 @@ fn status() -> CliResult<ServiceStatus> {
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn status() -> CliResult<ServiceStatus> {
     Err(unsupported_platform())
+}
+
+pub(crate) fn current_service_runtime_state() -> CliResult<ServiceRuntimeState> {
+    status().map(|status| status.state)
 }
 
 async fn service_status() -> CliResult<ServiceStatus> {
@@ -1154,11 +2172,13 @@ fn unsupported_platform() -> CliError {
 mod windows {
     use std::ffi::{OsStr, OsString};
     use std::sync::{OnceLock, mpsc};
+    use std::time::Instant;
 
     use windows_service::define_windows_service;
     use windows_service::service::{
-        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceStartType,
-        ServiceState, ServiceStatus as WindowsStatus, ServiceType,
+        Service, ServiceAccess, ServiceConfig, ServiceControl, ServiceControlAccept,
+        ServiceExitCode, ServiceStartType, ServiceState, ServiceStatus as WindowsStatus,
+        ServiceType,
     };
     use windows_service::service_control_handler::{
         self, ServiceControlHandlerResult, ServiceStatusHandle,
@@ -1169,6 +2189,8 @@ mod windows {
     use super::*;
 
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+    const TASK_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+    const TASK_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
     static SERVICE_OPTIONS: OnceLock<ServiceInstallOptions> = OnceLock::new();
 
     define_windows_service!(service_entry, service_main);
@@ -1179,9 +2201,32 @@ mod windows {
         definition: Vec<u8>,
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     struct LegacyScmSnapshot {
         was_running: bool,
+        definition: LegacyWindowsScmDefinition,
+        invocation: LegacyWindowsServiceInvocation,
+    }
+
+    struct LegacyScmRetirementFailure {
+        error: CliError,
+        preserve_replacement: bool,
+    }
+
+    impl LegacyScmRetirementFailure {
+        fn rollback_safe(error: CliError) -> Self {
+            Self {
+                error,
+                preserve_replacement: false,
+            }
+        }
+
+        fn commit_unknown(error: CliError) -> Self {
+            Self {
+                error,
+                preserve_replacement: true,
+            }
+        }
     }
 
     struct WindowsInstallContext {
@@ -1191,6 +2236,7 @@ mod windows {
         definition_path: PathBuf,
         definition_document: Vec<u8>,
         scoped_snapshot: Option<OwnedTaskSnapshot>,
+        scoped_requires_end: bool,
         fixed_snapshot: Option<OwnedTaskSnapshot>,
         legacy_scm: Option<LegacyScmSnapshot>,
     }
@@ -1199,12 +2245,15 @@ mod windows {
         options: ServiceInstallOptions,
         context: Option<WindowsInstallContext>,
         scoped_task_changed: bool,
+        scoped_task_stopped: bool,
+        fixed_task_stopped: bool,
         fixed_task_changed: bool,
         legacy_scm_stopped: bool,
         preserve_scoped_task: bool,
         definition_transaction: Option<codex_helper_core::ManagedFileTransaction>,
         receipt_transaction: Option<ServiceReceiptTransaction>,
         receipt: Option<ServiceReceipt>,
+        registered_scoped_snapshot: Option<OwnedTaskSnapshot>,
     }
 
     impl NativeWindowsInstallBackend {
@@ -1213,12 +2262,15 @@ mod windows {
                 options,
                 context: None,
                 scoped_task_changed: false,
+                scoped_task_stopped: false,
+                fixed_task_stopped: false,
                 fixed_task_changed: false,
                 legacy_scm_stopped: false,
                 preserve_scoped_task: false,
                 definition_transaction: None,
                 receipt_transaction: None,
                 receipt: None,
+                registered_scoped_snapshot: None,
             }
         }
 
@@ -1257,23 +2309,65 @@ mod windows {
             let definition_path = task_definition_path(&self.options.helper_home);
             let definition_document =
                 render_windows_task_definition(&executable, &self.options, &user_sid).into_bytes();
+            let (receipt_transaction, receipt, install_preflight) =
+                begin_service_receipt_transaction(&self.options)?;
+            let installed_options = install_preflight
+                .installed_receipt
+                .as_ref()
+                .map(|receipt| service_install_options_from_receipt(receipt, false))
+                .transpose()?;
 
-            let scoped_snapshot = match query_scheduled_task(&scoped_task_name)? {
-                Some(record) => {
-                    require_task_owner(&record, &user_sid, "SID-scoped")?;
-                    let _ = scheduled_task_requires_end(&record)?;
-                    Some(snapshot_owned_task(record)?)
-                }
-                None => None,
-            };
+            let (scoped_snapshot, scoped_requires_end) =
+                match query_scheduled_task(&scoped_task_name)? {
+                    Some(record) => {
+                        verify_existing_windows_task_for_replacement(
+                            &record,
+                            &scoped_task_name,
+                            &user_sid,
+                            &executable,
+                            installed_options.as_ref(),
+                        )?;
+                        let requires_end = scheduled_task_requires_end(&record)?;
+                        (Some(snapshot_owned_task(record)?), requires_end)
+                    }
+                    None => (None, false),
+                };
             let fixed_snapshot = match query_scheduled_task(WINDOWS_TASK_BASENAME)? {
                 Some(record) if windows_task_owner_matches(&record, &user_sid) => {
-                    let _ = scheduled_task_requires_end(&record)?;
-                    Some(snapshot_owned_task(record)?)
+                    let invocation =
+                        verify_legacy_fixed_windows_task_record(&record, &user_sid, &executable)?;
+                    if invocation.matches_install(&self.options) {
+                        let _ = scheduled_task_requires_end(&record)?;
+                        Some(snapshot_owned_task(record)?)
+                    } else if invocation.conflicts_with_install(&self.options) {
+                        return Err(CliError::Other(
+                            "the verified legacy fixed-name task listens on the requested port but belongs to a different service or home; uninstall it with the codex-helper version that created it before retrying"
+                                .to_string(),
+                        ));
+                    } else {
+                        None
+                    }
                 }
                 Some(_) | None => None,
             };
-            let legacy_scm = probe_legacy_scm_for_migration()?;
+            let legacy_scm = probe_legacy_scm(
+                "preflight the legacy LocalSystem SCM service for migration",
+                &executable,
+            )?
+            .map(|snapshot| {
+                if snapshot.invocation.matches_install(&self.options) {
+                    Ok(Some(snapshot))
+                } else if snapshot.invocation.conflicts_with_install(&self.options) {
+                    Err(CliError::Other(
+                        "the verified legacy SCM service listens on the requested port but belongs to a different service or home; uninstall it with the codex-helper version that created it before retrying"
+                            .to_string(),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            })
+            .transpose()?
+            .flatten();
             let definition_transaction = codex_helper_core::ManagedFileTransaction::begin(
                 definition_path.clone(),
                 MAX_SERVICE_DEFINITION_BYTES,
@@ -1281,7 +2375,7 @@ mod windows {
             .map_err(|error| {
                 CliError::Other(format!("begin Windows definition transaction: {error}"))
             })?;
-            let (receipt_transaction, receipt) = begin_service_receipt_transaction(&self.options)?;
+            prepare_service_switch_for_install(&self.options, &install_preflight)?;
             self.context = Some(WindowsInstallContext {
                 executable,
                 user_sid,
@@ -1289,6 +2383,7 @@ mod windows {
                 definition_path,
                 definition_document,
                 scoped_snapshot,
+                scoped_requires_end,
                 fixed_snapshot,
                 legacy_scm,
             });
@@ -1298,10 +2393,102 @@ mod windows {
             Ok(())
         }
 
+        fn stop_existing_scoped_task(&mut self) -> CliResult<()> {
+            let (task_name, snapshot, preflight_requires_end) = {
+                let context = self.context()?;
+                (
+                    context.scoped_task_name.clone(),
+                    context.scoped_snapshot.clone(),
+                    context.scoped_requires_end,
+                )
+            };
+            let current = query_scheduled_task(&task_name)?;
+            let (snapshot, current) = match (snapshot.as_ref(), current.as_ref()) {
+                (None, None) => return Ok(()),
+                (None, Some(_)) => {
+                    return Err(CliError::Other(
+                        "the SID-scoped Windows task appeared after installation preflight; retry after confirming no other service command is running"
+                            .to_string(),
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(CliError::Other(
+                        "the SID-scoped Windows task disappeared after installation preflight; retry after inspecting Task Scheduler"
+                            .to_string(),
+                    ));
+                }
+                (Some(snapshot), Some(current)) => (snapshot, current),
+            };
+            require_task_owner(current, &snapshot.record.owner_sid, "SID-scoped")?;
+            let current_requires_end = scheduled_task_requires_end(current)?;
+            self.scoped_task_stopped = preflight_requires_end || current_requires_end;
+            if !current_requires_end {
+                return Ok(());
+            }
+            end_unchanged_scheduled_task(snapshot, "existing SID-scoped").map_err(|error| {
+                CliError::Other(format!(
+                    "stop the existing SID-scoped Windows task before replacing it: {error}"
+                ))
+            })
+        }
+
+        fn stop_legacy_runtimes(&mut self) -> CliResult<()> {
+            if let Some(snapshot) = self.context()?.fixed_snapshot.clone() {
+                let current =
+                    query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+                        CliError::Other(
+                        "the verified legacy fixed-name Windows task disappeared before migration"
+                            .to_string(),
+                    )
+                    })?;
+                require_task_snapshot_unchanged(&current, &snapshot, "legacy fixed-name")?;
+                let preflight_running = scheduled_task_requires_end(&snapshot.record)?;
+                let current_running = scheduled_task_requires_end(&current)?;
+                self.fixed_task_stopped = preflight_running || current_running;
+                if current_running {
+                    end_unchanged_scheduled_task(&snapshot, "legacy fixed-name")
+                        .map_err(|error| {
+                            CliError::Other(format!(
+                                "stop the legacy fixed-name Windows task before starting its replacement: {error}"
+                            ))
+                        })?;
+                }
+            }
+
+            if let Some(snapshot) = self
+                .context()?
+                .legacy_scm
+                .clone()
+                .filter(|snapshot| snapshot.was_running)
+            {
+                // Mark the state before Stop because Windows can report an error after accepting
+                // the control request. Rollback will re-query the signed legacy definition.
+                self.legacy_scm_stopped = true;
+                stop_legacy_scm_service(&snapshot).map_err(|error| {
+                    CliError::Other(format!(
+                        "stop the legacy SCM runtime before starting its replacement: {error}"
+                    ))
+                })?;
+            }
+            Ok(())
+        }
+
         fn register_scoped_task(&mut self) -> CliResult<()> {
             let context = self.context()?;
             if let Some(record) = query_scheduled_task(&context.scoped_task_name)? {
-                require_task_owner(&record, &context.user_sid, "SID-scoped")?;
+                let Some(snapshot) = context.scoped_snapshot.as_ref() else {
+                    return Err(CliError::Other(
+                        "the SID-scoped Windows task appeared after installation preflight; its definition and receipt were not replaced"
+                            .to_string(),
+                    ));
+                };
+                require_task_snapshot_unchanged(&record, snapshot, "existing SID-scoped")?;
+                if scheduled_task_requires_end(&record)? {
+                    return Err(CliError::Other(format!(
+                        "the SID-scoped Windows task '{}' restarted after it was stopped; its definition and receipt were not replaced",
+                        record.task_name
+                    )));
+                }
             }
             let task_name = context.scoped_task_name.clone();
             let definition_path = context.definition_path.clone();
@@ -1324,21 +2511,23 @@ mod windows {
         }
 
         fn verify_scoped_task(&mut self) -> CliResult<()> {
-            let context = self.context()?;
-            let record = query_scheduled_task(&context.scoped_task_name)?.ok_or_else(|| {
+            let (task_name, user_sid, executable) = {
+                let context = self.context()?;
+                (
+                    context.scoped_task_name.clone(),
+                    context.user_sid.clone(),
+                    context.executable.clone(),
+                )
+            };
+            let record = query_scheduled_task(&task_name)?.ok_or_else(|| {
                 CliError::Other(format!(
                     "the newly registered Windows task '{}' was not found during verification",
-                    context.scoped_task_name
+                    task_name
                 ))
             })?;
-            require_task_owner(&record, &context.user_sid, "new SID-scoped")?;
-            verify_windows_task_record(
-                &record,
-                &context.scoped_task_name,
-                &context.user_sid,
-                &context.executable,
-                &self.options,
-            )
+            verify_windows_task_record(&record, &task_name, &user_sid, &executable, &self.options)?;
+            self.registered_scoped_snapshot = Some(snapshot_owned_task(record)?);
+            Ok(())
         }
 
         fn publish_receipt(&mut self) -> CliResult<()> {
@@ -1356,31 +2545,36 @@ mod windows {
             let Some(snapshot) = self.context()?.fixed_snapshot.clone() else {
                 return Ok(());
             };
-            self.fixed_task_changed = true;
-            if scheduled_task_requires_end(&snapshot.record)? {
-                end_owned_scheduled_task(&snapshot.record.task_name, &snapshot.record.owner_sid)?;
+            let current = query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+                CliError::Other(
+                    "the verified legacy fixed-name Windows task disappeared before migration"
+                        .to_string(),
+                )
+            })?;
+            require_task_snapshot_unchanged(&current, &snapshot, "legacy fixed-name")?;
+            if scheduled_task_requires_end(&current)? {
+                return Err(CliError::Other(format!(
+                    "the legacy fixed-name Windows task '{}' restarted after handoff; its registration was left in place",
+                    current.task_name
+                )));
             }
-            delete_owned_scheduled_task(&snapshot.record.task_name, &snapshot.record.owner_sid)
+            // The delete command can commit even when its process reports an error. Treat the
+            // registration as changed until rollback proves or restores its exact snapshot.
+            self.fixed_task_changed = true;
+            delete_unchanged_scheduled_task(&snapshot, "legacy fixed-name")
         }
 
         fn retire_legacy_scm(&mut self) -> CliResult<()> {
-            let Some(snapshot) = self.context()?.legacy_scm else {
+            let Some(snapshot) = self.context()?.legacy_scm.clone() else {
                 return Ok(());
             };
-            let result = retire_legacy_scm_service(snapshot, &mut self.legacy_scm_stopped);
-            if let Err(primary) = result {
-                if snapshot.was_running && self.legacy_scm_stopped {
-                    if let Err(rollback) = start_legacy_scm_service() {
-                        self.preserve_scoped_task = true;
-                        return Err(CliError::Other(format!(
-                            "{primary}; restarting the legacy SCM service also failed: {rollback}"
-                        )));
-                    }
-                    self.legacy_scm_stopped = false;
+            match retire_legacy_scm_service(&snapshot) {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    self.preserve_scoped_task = failure.preserve_replacement;
+                    Err(failure.error)
                 }
-                return Err(primary);
             }
-            Ok(())
         }
 
         fn rollback_receipt(&mut self) -> CliResult<()> {
@@ -1391,43 +2585,131 @@ mod windows {
 
         fn rollback(&mut self) -> CliResult<()> {
             let mut failures = Vec::new();
-            let fixed_snapshot = self.context()?.fixed_snapshot.clone();
-            let legacy_snapshot = self.context()?.legacy_scm;
-            if self.fixed_task_changed
-                && let Some(snapshot) = fixed_snapshot.as_ref()
-                && let Err(error) =
-                    restore_task_snapshot(snapshot, &self.context()?.definition_path)
+            let (
+                scoped_task_name,
+                definition_path,
+                scoped_snapshot,
+                fixed_snapshot,
+                legacy_snapshot,
+            ) = {
+                let context = self.context()?;
+                (
+                    context.scoped_task_name.clone(),
+                    context.definition_path.clone(),
+                    context.scoped_snapshot.clone(),
+                    context.fixed_snapshot.clone(),
+                    context.legacy_scm.clone(),
+                )
+            };
+
+            // The replacement runtime must be stopped before any previous runtime is restarted;
+            // both generations listen on the same proxy address.
+            let mut scoped_registration_needs_restore = self.scoped_task_changed;
+            if self.scoped_task_changed
+                && let Some(current) = query_scheduled_task(&scoped_task_name)?
             {
-                self.preserve_scoped_task = true;
-                failures.push(format!("restore the fixed-name task: {error}"));
-            }
-            if self.legacy_scm_stopped
-                && legacy_snapshot.is_some_and(|snapshot| snapshot.was_running)
-            {
-                match start_legacy_scm_service() {
-                    Ok(()) => self.legacy_scm_stopped = false,
-                    Err(error) => {
+                let current_is_previous = scoped_snapshot.as_ref().is_some_and(|snapshot| {
+                    require_task_snapshot_unchanged(&current, snapshot, "previous SID-scoped")
+                        .is_ok()
+                });
+                if current_is_previous {
+                    scoped_registration_needs_restore = false;
+                } else {
+                    let Some(replacement) = self.registered_scoped_snapshot.as_ref() else {
                         self.preserve_scoped_task = true;
-                        failures.push(format!("restart the legacy SCM service: {error}"));
+                        failures.push(
+                            "the replacement SID-scoped task was not fully verified; rollback left it untouched"
+                                .to_string(),
+                        );
+                        return Err(CliError::Other(failures.join("; ")));
+                    };
+                    if require_task_snapshot_unchanged(
+                        &current,
+                        replacement,
+                        "replacement SID-scoped",
+                    )
+                    .is_err()
+                    {
+                        self.preserve_scoped_task = true;
+                        failures.push(
+                            "the SID-scoped task changed after migration verification; rollback left it untouched"
+                                .to_string(),
+                        );
+                    } else {
+                        if scheduled_task_requires_end(&current)?
+                            && let Err(error) =
+                                end_unchanged_scheduled_task(replacement, "replacement SID-scoped")
+                        {
+                            self.preserve_scoped_task = true;
+                            failures.push(format!(
+                                "stop the replacement SID-scoped task before rollback: {error}"
+                            ));
+                        }
+                        if !self.preserve_scoped_task
+                            && let Err(error) = delete_unchanged_scheduled_task(
+                                replacement,
+                                "replacement SID-scoped",
+                            )
+                        {
+                            self.preserve_scoped_task = true;
+                            failures.push(format!(
+                                "remove the replacement SID-scoped task before rollback: {error}"
+                            ));
+                        }
                     }
                 }
             }
-            if self.scoped_task_changed && !self.preserve_scoped_task {
-                let context = self.context()?;
-                let result = match context.scoped_snapshot.as_ref() {
-                    Some(snapshot) => restore_task_snapshot(snapshot, &context.definition_path),
-                    None => {
-                        delete_owned_scheduled_task(&context.scoped_task_name, &context.user_sid)
-                    }
+            if self.preserve_scoped_task {
+                return Err(CliError::Other(failures.join("; ")));
+            }
+
+            // Restore every registration before restarting any runtime.
+            if scoped_registration_needs_restore {
+                let result = match scoped_snapshot.as_ref() {
+                    Some(snapshot) => restore_task_snapshot(snapshot, &definition_path, false),
+                    None => Ok(()),
                 };
                 if let Err(error) = result {
                     failures.push(format!(
-                        "restore the previous SID-scoped task state: {error}"
+                        "restore the previous SID-scoped task registration: {error}"
                     ));
                 }
             }
+            if self.fixed_task_changed
+                && let Some(snapshot) = fixed_snapshot.as_ref()
+                && let Err(error) = restore_task_snapshot(snapshot, &definition_path, false)
+            {
+                failures.push(format!(
+                    "restore the legacy fixed-name task registration: {error}"
+                ));
+            }
             if let Err(error) = self.definition_transaction_mut()?.rollback() {
                 failures.push(format!("restore the Windows task definition: {error}"));
+            }
+
+            if self.scoped_task_stopped
+                && let Some(snapshot) = scoped_snapshot.as_ref()
+                && let Err(error) = restart_restored_task(snapshot)
+            {
+                failures.push(format!("restart the previous SID-scoped task: {error}"));
+            }
+            if self.fixed_task_stopped
+                && let Some(snapshot) = fixed_snapshot.as_ref()
+                && let Err(error) = restart_restored_task(snapshot)
+            {
+                failures.push(format!("restart the legacy fixed-name task: {error}"));
+            }
+            if self.legacy_scm_stopped
+                && let Some(snapshot) = legacy_snapshot
+                    .as_ref()
+                    .filter(|snapshot| snapshot.was_running)
+            {
+                match start_legacy_scm_service(snapshot) {
+                    Ok(()) => self.legacy_scm_stopped = false,
+                    Err(error) => {
+                        failures.push(format!("restart the legacy SCM service: {error}"));
+                    }
+                }
             }
             if failures.is_empty() {
                 Ok(())
@@ -1436,59 +2718,478 @@ mod windows {
             }
         }
 
+        fn rollback_preserved_replacement(&self) -> bool {
+            self.preserve_scoped_task
+        }
+
         fn start_scoped_task(&mut self) -> CliResult<()> {
-            let context = self.context()?;
-            let record = query_scheduled_task(&context.scoped_task_name)?.ok_or_else(|| {
+            let (task_name, user_sid, executable) = {
+                let context = self.context()?;
+                (
+                    context.scoped_task_name.clone(),
+                    context.user_sid.clone(),
+                    context.executable.clone(),
+                )
+            };
+            let record = query_scheduled_task(&task_name)?.ok_or_else(|| {
                 CliError::Other(format!(
                     "the verified Windows task '{}' disappeared before start",
-                    context.scoped_task_name
+                    task_name
                 ))
             })?;
-            require_task_owner(&record, &context.user_sid, "SID-scoped")?;
-            run_scheduled_task(&record.task_name)
+            verify_windows_task_record(&record, &task_name, &user_sid, &executable, &self.options)?;
+            let registered = self.registered_scoped_snapshot.as_ref().ok_or_else(|| {
+                CliError::Other(
+                    "the replacement SID-scoped task has no verified registration snapshot"
+                        .to_string(),
+                )
+            })?;
+            require_task_snapshot_unchanged(&record, registered, "replacement SID-scoped")?;
+            // `scoped_task_changed` is set before registration, so rollback always re-queries and
+            // stops a possibly started replacement even if schtasks accepts /Run then errors.
+            run_unchanged_scheduled_task(registered, "replacement SID-scoped")?;
+            Ok(())
+        }
+
+        async fn verify_started_runtime_identity(
+            &mut self,
+        ) -> CliResult<codex_helper_core::credentials::CredentialAggregateReadiness> {
+            verify_started_service_runtime_identity().await
         }
     }
 
-    pub(super) fn install(options: ServiceInstallOptions) -> CliResult<()> {
+    struct WindowsUninstallContext {
+        scoped_task_name: String,
+        scoped_snapshot: Option<OwnedTaskSnapshot>,
+        fixed_snapshot: Option<OwnedTaskSnapshot>,
+        ignore_foreign_fixed_task: bool,
+        legacy_scm: Option<LegacyScmSnapshot>,
+        definition_path: PathBuf,
+    }
+
+    struct NativeWindowsUninstallBackend {
+        context: WindowsUninstallContext,
+        stop_requested: bool,
+        scoped_task_stopped: bool,
+        scoped_task_removed: bool,
+        fixed_task_stopped: bool,
+        fixed_task_removed: bool,
+        legacy_scm_stopped: bool,
+        legacy_scm_retirement_attempted: bool,
+        definition: codex_helper_core::ManagedFileTransaction,
+        receipt: ServiceReceiptTransaction,
+    }
+
+    impl NativeWindowsUninstallBackend {
+        fn new() -> CliResult<Self> {
+            let helper_home = proxy_home_dir();
+            let definition_path = task_definition_path(&helper_home);
+            let definition = codex_helper_core::ManagedFileTransaction::begin(
+                definition_path.clone(),
+                MAX_SERVICE_DEFINITION_BYTES,
+            )
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "begin Windows task definition removal transaction: {error}"
+                ))
+            })?;
+            let receipt =
+                ServiceReceiptTransaction::begin(helper_home.clone()).map_err(|error| {
+                    CliError::Other(format!(
+                        "begin Windows service receipt removal transaction: {error}"
+                    ))
+                })?;
+            let installed_receipt = receipt
+                .current()
+                .map_err(|error| {
+                    CliError::Other(format!(
+                        "read the installed Windows service receipt before uninstall: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    CliError::Other(
+                    "the installed Windows service receipt disappeared before uninstall preflight"
+                        .to_string(),
+                )
+                })?;
+            let options = service_install_options_from_receipt(&installed_receipt, false)?;
+            let executable = current_executable()?;
+            let (user_sid, scoped_task_name) = current_task_identity()?;
+            let scoped_snapshot = match query_scheduled_task(&scoped_task_name)? {
+                Some(record) => {
+                    verify_windows_task_record(
+                        &record,
+                        &scoped_task_name,
+                        &user_sid,
+                        &executable,
+                        &options,
+                    )?;
+                    Some(snapshot_owned_task(record)?)
+                }
+                None => None,
+            };
+            let (fixed_snapshot, ignore_foreign_fixed_task) = match query_scheduled_task(
+                WINDOWS_TASK_BASENAME,
+            )? {
+                Some(record) if windows_task_owner_matches(&record, &user_sid) => {
+                    let invocation =
+                        verify_legacy_fixed_windows_task_record(&record, &user_sid, &executable)?;
+                    if invocation.matches_install(&options) {
+                        (Some(snapshot_owned_task(record)?), false)
+                    } else if invocation.conflicts_with_install(&options) {
+                        return Err(CliError::Other(
+                                "the legacy fixed-name task uses the installed service port but does not match the signed service receipt; no task was removed"
+                                    .to_string(),
+                            ));
+                    } else {
+                        (None, true)
+                    }
+                }
+                Some(_) => (None, true),
+                None => (None, false),
+            };
+            let legacy_scm = probe_legacy_scm(
+                "preflight the legacy LocalSystem SCM service for uninstall",
+                &executable,
+            )?
+            .map(|snapshot| {
+                if snapshot.invocation.matches_install(&options) {
+                    Ok(Some(snapshot))
+                } else if snapshot.invocation.conflicts_with_install(&options) {
+                    Err(CliError::Other(
+                        "the legacy SCM service uses the installed service port but does not match the signed service receipt; no service was removed"
+                            .to_string(),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            })
+            .transpose()?
+            .flatten();
+            Ok(Self {
+                context: WindowsUninstallContext {
+                    scoped_task_name,
+                    scoped_snapshot,
+                    fixed_snapshot,
+                    ignore_foreign_fixed_task,
+                    legacy_scm,
+                    definition_path,
+                },
+                stop_requested: false,
+                scoped_task_stopped: false,
+                scoped_task_removed: false,
+                fixed_task_stopped: false,
+                fixed_task_removed: false,
+                legacy_scm_stopped: false,
+                legacy_scm_retirement_attempted: false,
+                definition,
+                receipt,
+            })
+        }
+
+        fn stop_task(
+            snapshot: Option<&OwnedTaskSnapshot>,
+            stopped: &mut bool,
+            description: &str,
+        ) -> CliResult<()> {
+            let Some(snapshot) = snapshot else {
+                return Ok(());
+            };
+            let current = query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+                CliError::Other(format!(
+                    "the {description} Windows task disappeared after uninstall preflight; no service files were removed"
+                ))
+            })?;
+            require_task_snapshot_unchanged(&current, snapshot, description)?;
+            if !scheduled_task_requires_end(&current)? {
+                return Ok(());
+            }
+            // Mark the state before issuing /End because a command or verification error can be
+            // returned after the runtime has already stopped.
+            *stopped = true;
+            end_unchanged_scheduled_task(snapshot, description).map_err(|error| {
+                CliError::Other(format!(
+                    "stop the {description} Windows task before uninstalling it: {error}"
+                ))
+            })
+        }
+
+        fn remove_task(
+            task_name: &str,
+            snapshot: Option<&OwnedTaskSnapshot>,
+            stop_requested: bool,
+            removed: &mut bool,
+            description: &str,
+        ) -> CliResult<()> {
+            let current = query_scheduled_task(task_name)?;
+            let Some(snapshot) = snapshot else {
+                return if current.is_none() {
+                    Ok(())
+                } else {
+                    Err(CliError::Other(format!(
+                        "the {description} Windows task appeared after uninstall preflight; no unverified task was removed"
+                    )))
+                };
+            };
+            let current = current.as_ref().ok_or_else(|| {
+                CliError::Other(format!(
+                    "the {description} Windows task disappeared after uninstall preflight; no service files were removed"
+                ))
+            })?;
+            require_task_snapshot_unchanged(current, snapshot, description)?;
+            if stop_requested && scheduled_task_requires_end(current)? {
+                return Err(CliError::Other(format!(
+                    "the {description} Windows task restarted after it was stopped; its registration and service files were left in place"
+                )));
+            }
+            // Treat the mutation as commit-state-unknown until the absence read-back succeeds.
+            *removed = true;
+            delete_unchanged_scheduled_task(snapshot, description).map_err(|error| {
+                CliError::Other(format!(
+                    "remove the {description} Windows task registration: {error}"
+                ))
+            })
+        }
+    }
+
+    impl WindowsUninstallTransactionBackend for NativeWindowsUninstallBackend {
+        fn stop_and_verify(&mut self) -> CliResult<()> {
+            self.stop_requested = true;
+            Self::stop_task(
+                self.context.scoped_snapshot.as_ref(),
+                &mut self.scoped_task_stopped,
+                "SID-scoped",
+            )?;
+            if !self.context.ignore_foreign_fixed_task {
+                Self::stop_task(
+                    self.context.fixed_snapshot.as_ref(),
+                    &mut self.fixed_task_stopped,
+                    "legacy fixed-name",
+                )?;
+            }
+            if let Some(snapshot) = self
+                .context
+                .legacy_scm
+                .as_ref()
+                .filter(|snapshot| snapshot.was_running)
+            {
+                // As with scheduled tasks, an error can arrive after the stop took effect.
+                self.legacy_scm_stopped = true;
+                stop_legacy_scm_service(snapshot).map_err(|error| {
+                    CliError::Other(format!(
+                        "stop the legacy SCM service before uninstalling it: {error}"
+                    ))
+                })?;
+            }
+            Ok(())
+        }
+
+        fn remove_scoped_task(&mut self) -> CliResult<()> {
+            Self::remove_task(
+                &self.context.scoped_task_name,
+                self.context.scoped_snapshot.as_ref(),
+                self.stop_requested,
+                &mut self.scoped_task_removed,
+                "SID-scoped",
+            )
+        }
+
+        fn remove_fixed_task(&mut self) -> CliResult<()> {
+            if self.context.ignore_foreign_fixed_task {
+                return Ok(());
+            }
+            Self::remove_task(
+                WINDOWS_TASK_BASENAME,
+                self.context.fixed_snapshot.as_ref(),
+                self.stop_requested,
+                &mut self.fixed_task_removed,
+                "legacy fixed-name",
+            )
+        }
+
+        fn remove_definition(&mut self) -> CliResult<()> {
+            self.definition.remove().map_err(|error| {
+                CliError::Other(format!(
+                    "remove Windows task definition {}: {error}",
+                    self.context.definition_path.display()
+                ))
+            })?;
+            if self.definition.current().bytes().is_some() {
+                return Err(CliError::Other(format!(
+                    "Windows task definition {} still exists after removal",
+                    self.context.definition_path.display()
+                )));
+            }
+            Ok(())
+        }
+
+        fn remove_receipt(&mut self) -> CliResult<()> {
+            self.receipt.remove().map_err(|error| {
+                CliError::Other(format!(
+                    "remove service receipt after Windows task removal: {error}"
+                ))
+            })
+        }
+
+        fn retire_legacy_scm(&mut self) -> CliResult<()> {
+            self.legacy_scm_retirement_attempted = true;
+            let Some(snapshot) = self.context.legacy_scm.as_ref() else {
+                return match probe_legacy_scm(
+                    "verify that no legacy LocalSystem SCM service appeared during uninstall",
+                    &current_executable()?,
+                )? {
+                    None => Ok(()),
+                    Some(_) => Err(CliError::Other(
+                        "a legacy SCM service appeared after uninstall preflight and was left untouched"
+                            .to_string(),
+                    )),
+                };
+            };
+            // This is the final commit step. In keep-running mode the SCM definition is removed
+            // without stopping its current process, preserving the explicit detached-runtime
+            // contract.
+            remove_legacy_scm_service(self.stop_requested, snapshot)
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
+            let mut failures = Vec::new();
+            if let Err(error) = self.receipt.rollback() {
+                failures.push(format!("restore the Windows service receipt: {error}"));
+            }
+            if let Err(error) = self.definition.rollback() {
+                failures.push(format!("restore the Windows task definition: {error}"));
+            }
+            // Restore both registrations before starting either previous runtime. This avoids a
+            // failed first start preventing the second task definition from being recovered.
+            let mut fixed_task_restored = false;
+            if (self.fixed_task_removed || self.fixed_task_stopped)
+                && let Some(snapshot) = self.context.fixed_snapshot.as_ref()
+            {
+                match restore_task_snapshot(snapshot, &self.context.definition_path, false) {
+                    Ok(()) => fixed_task_restored = true,
+                    Err(error) => failures.push(format!(
+                        "restore the legacy fixed-name task registration: {error}"
+                    )),
+                }
+            }
+            let mut scoped_task_restored = false;
+            if (self.scoped_task_removed || self.scoped_task_stopped)
+                && let Some(snapshot) = self.context.scoped_snapshot.as_ref()
+            {
+                match restore_task_snapshot(snapshot, &self.context.definition_path, false) {
+                    Ok(()) => scoped_task_restored = true,
+                    Err(error) => {
+                        failures.push(format!("restore the SID-scoped task registration: {error}"))
+                    }
+                }
+            }
+            if fixed_task_restored
+                && self.fixed_task_stopped
+                && let Some(snapshot) = self.context.fixed_snapshot.as_ref()
+                && let Err(error) = restart_restored_task(snapshot)
+            {
+                failures.push(format!(
+                    "restore the legacy fixed-name task runtime state: {error}"
+                ));
+            }
+            if scoped_task_restored
+                && self.scoped_task_stopped
+                && let Some(snapshot) = self.context.scoped_snapshot.as_ref()
+                && let Err(error) = restart_restored_task(snapshot)
+            {
+                failures.push(format!(
+                    "restore the SID-scoped task runtime state: {error}"
+                ));
+            }
+            if self.legacy_scm_stopped || self.legacy_scm_retirement_attempted {
+                match self.context.legacy_scm.as_ref() {
+                    Some(snapshot) => {
+                        if let Err(error) = restore_legacy_scm_snapshot(snapshot) {
+                            failures.push(format!(
+                                "restore and verify the legacy SCM definition and runtime state: {error}"
+                            ));
+                        }
+                    }
+                    None if self.legacy_scm_retirement_attempted => {
+                        match probe_legacy_scm(
+                            "verify legacy LocalSystem SCM absence during uninstall rollback",
+                            &current_executable()?,
+                        ) {
+                            Ok(None) => {}
+                            Ok(Some(_)) => failures.push(
+                                "a legacy SCM service appeared concurrently and was left untouched"
+                                    .to_string(),
+                            ),
+                            Err(error) => failures.push(format!(
+                                "verify that the legacy SCM definition remains absent: {error}"
+                            )),
+                        }
+                    }
+                    None => {}
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(CliError::Other(failures.join("; ")))
+            }
+        }
+    }
+
+    pub(super) async fn install(
+        options: ServiceInstallOptions,
+    ) -> CliResult<Option<codex_helper_core::credentials::CredentialAggregateReadiness>> {
         let start = options.start;
-        run_windows_install_transaction(&mut NativeWindowsInstallBackend::new(options), start)
+        run_windows_install_transaction(&mut NativeWindowsInstallBackend::new(options), start).await
     }
 
     pub(super) fn uninstall(stop_first: bool) -> CliResult<()> {
+        run_windows_uninstall_transaction(&mut NativeWindowsUninstallBackend::new()?, stop_first)
+    }
+
+    fn installed_service_options() -> CliResult<ServiceInstallOptions> {
+        let receipt = validate_service_receipt_for_uninstall(
+            read_service_receipt(proxy_home_dir()),
+            Some(ServicePlatformBackend::WindowsScheduledTask),
+        )?;
+        service_install_options_from_receipt(&receipt, false)
+    }
+
+    fn matching_installed_task_snapshot(
+        options: &ServiceInstallOptions,
+    ) -> CliResult<Option<OwnedTaskSnapshot>> {
         let (user_sid, scoped_task_name) = current_task_identity()?;
+        let executable = current_executable()?;
         if let Some(record) = query_scheduled_task(&scoped_task_name)? {
-            require_task_owner(&record, &user_sid, "SID-scoped")?;
-            if stop_first && scheduled_task_requires_end(&record)? {
-                end_owned_scheduled_task(&record.task_name, &user_sid)?;
-            }
-            delete_owned_scheduled_task(&record.task_name, &user_sid)?;
+            verify_windows_task_record(
+                &record,
+                &scoped_task_name,
+                &user_sid,
+                &executable,
+                options,
+            )?;
+            return snapshot_owned_task(record).map(Some);
         }
-        if let Some(record) = query_scheduled_task(WINDOWS_TASK_BASENAME)?
-            && windows_task_owner_matches(&record, &user_sid)
-        {
-            if stop_first && scheduled_task_requires_end(&record)? {
-                end_owned_scheduled_task(&record.task_name, &user_sid)?;
-            }
-            delete_owned_scheduled_task(&record.task_name, &user_sid)?;
+        let Some(record) = query_scheduled_task(WINDOWS_TASK_BASENAME)? else {
+            return Ok(None);
+        };
+        if !windows_task_owner_matches(&record, &user_sid) {
+            return Ok(None);
         }
-        let definition = task_definition_path(&proxy_home_dir());
-        match std::fs::remove_file(&definition) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(CliError::Other(format!(
-                    "remove scheduled-task definition {}: {error}",
-                    definition.display()
-                )));
-            }
+        let invocation = verify_legacy_fixed_windows_task_record(&record, &user_sid, &executable)?;
+        if !invocation.matches_install(options) {
+            return Err(CliError::Other(
+                "the legacy fixed-name task does not match the signed service receipt and was left untouched"
+                    .to_string(),
+            ));
         }
-        remove_legacy_scm_service(stop_first)
+        snapshot_owned_task(record).map(Some)
     }
 
     pub(super) fn start() -> CliResult<()> {
-        let (user_sid, scoped_task_name) = current_task_identity()?;
-        if let Some(record) = current_user_task(&user_sid, &scoped_task_name)? {
-            return run_scheduled_task(&record.task_name);
+        let options = installed_service_options()?;
+        if let Some(snapshot) = matching_installed_task_snapshot(&options)? {
+            return run_unchanged_scheduled_task(&snapshot, "installed");
         }
         Err(CliError::Other(
             "the current user's Windows task is not installed; run `codex-helper service install` to migrate any legacy SCM service"
@@ -1497,34 +3198,72 @@ mod windows {
     }
 
     pub(super) fn stop() -> CliResult<()> {
-        let (user_sid, scoped_task_name) = current_task_identity()?;
-        if let Some(record) = current_user_task(&user_sid, &scoped_task_name)? {
-            return if scheduled_task_requires_end(&record)? {
-                end_owned_scheduled_task(&record.task_name, &user_sid)
+        let options = installed_service_options()?;
+        if let Some(snapshot) = matching_installed_task_snapshot(&options)? {
+            return if scheduled_task_requires_end(&snapshot.record)? {
+                end_unchanged_scheduled_task(&snapshot, "installed")
             } else {
                 Ok(())
             };
         }
-        stop_legacy_scm_service()
+        let executable = current_executable()?;
+        let Some(snapshot) = probe_legacy_scm(
+            "verify the legacy LocalSystem SCM service before stopping it",
+            &executable,
+        )?
+        else {
+            return Ok(());
+        };
+        if !snapshot.invocation.matches_install(&options) {
+            return Err(CliError::Other(
+                "the legacy SCM service does not match the signed service receipt and was left untouched"
+                    .to_string(),
+            ));
+        }
+        stop_legacy_scm_service(&snapshot)
     }
 
     pub(super) fn status() -> CliResult<ServiceStatus> {
         let (user_sid, scoped_task_name) = current_task_identity()?;
-        if let Some(record) = current_user_task(&user_sid, &scoped_task_name)? {
+        if let Some(record) = query_scheduled_task(&scoped_task_name)? {
             let state = match record.state {
                 4 => ServiceRuntimeState::Running,
                 2 => ServiceRuntimeState::Starting,
                 1 | 3 => ServiceRuntimeState::Stopped,
                 _ => ServiceRuntimeState::Unknown,
             };
-            let fixed_name = record.task_name == WINDOWS_TASK_BASENAME;
-            let mut status = base_status(state, true, record.enabled);
+            let validation = read_service_receipt(proxy_home_dir())
+                .map_err(|error| error.to_string())
+                .and_then(|receipt| {
+                    service_install_options_from_receipt(&receipt, false)
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|options| {
+                    verify_windows_task_record(
+                        &record,
+                        &scoped_task_name,
+                        &user_sid,
+                        &current_executable().map_err(|error| error.to_string())?,
+                        &options,
+                    )
+                    .map_err(|error| error.to_string())
+                });
+            let verified = validation.is_ok();
+            let mut status = base_status(
+                if verified {
+                    state
+                } else {
+                    ServiceRuntimeState::Unknown
+                },
+                true,
+                record.enabled,
+            );
             status.service_name.clone_from(&record.task_name);
             status.service_definition = Some(task_definition_path(&proxy_home_dir()));
-            status.detail = Some(if fixed_name {
+            status.detail = Some(if let Err(error) = validation {
                 format!(
-                    "legacy fixed-name per-user scheduled task owned by the current SID; run `codex-helper service install` to migrate; task_state_code={}",
-                    record.state
+                    "the SID-scoped task is not proven to match the signed service receipt and will not be mutated; task_state_code={}; verification_error={error}",
+                    record.state,
                 )
             } else {
                 format!(
@@ -1532,6 +3271,26 @@ mod windows {
                     record.state
                 )
             });
+            return Ok(status);
+        }
+        if let Some(record) = query_scheduled_task(WINDOWS_TASK_BASENAME)?
+            && windows_task_owner_matches(&record, &user_sid)
+        {
+            verify_legacy_fixed_windows_task_record(&record, &user_sid, &current_executable()?)?;
+            let state = match record.state {
+                4 => ServiceRuntimeState::Running,
+                2 => ServiceRuntimeState::Starting,
+                1 | 3 => ServiceRuntimeState::Stopped,
+                _ => ServiceRuntimeState::Unknown,
+            };
+            let mut status = base_status(state, true, record.enabled);
+            status.service_name.clone_from(&record.task_name);
+            status.service_definition = Some(task_definition_path(&proxy_home_dir()));
+            status.legacy_installation = true;
+            status.detail = Some(format!(
+                "legacy fixed-name per-user scheduled task owned by the current SID; run `codex-helper service install` to migrate; task_state_code={}",
+                record.state
+            ));
             return Ok(status);
         }
         legacy_scm_status()
@@ -1556,6 +3315,10 @@ mod windows {
         let config = service
             .query_config()
             .map_err(windows_error("query Windows service config"))?;
+        verify_legacy_windows_scm_definition(
+            &legacy_scm_definition(&config),
+            &current_executable()?,
+        )?;
         let state = match raw.current_state {
             ServiceState::Running => ServiceRuntimeState::Running,
             ServiceState::Stopped => ServiceRuntimeState::Stopped,
@@ -1568,6 +3331,7 @@ mod windows {
             true,
             config.start_type == ServiceStartType::AutoStart,
         );
+        status.legacy_installation = true;
         status.detail = Some(match raw.process_id {
             Some(pid) => format!(
                 "legacy LocalSystem SCM service, pid={pid}; run `codex-helper service install` to migrate"
@@ -1585,20 +3349,6 @@ mod windows {
             })?;
         let task_name = windows_task_name_for_sid(&user_sid)?;
         Ok((user_sid, task_name))
-    }
-
-    fn current_user_task(
-        user_sid: &str,
-        scoped_task_name: &str,
-    ) -> CliResult<Option<WindowsTaskRecord>> {
-        if let Some(record) = query_scheduled_task(scoped_task_name)? {
-            require_task_owner(&record, user_sid, "SID-scoped")?;
-            return Ok(Some(record));
-        }
-        match query_scheduled_task(WINDOWS_TASK_BASENAME)? {
-            Some(record) if windows_task_owner_matches(&record, user_sid) => Ok(Some(record)),
-            Some(_) | None => Ok(None),
-        }
     }
 
     fn scheduled_task_requires_end(record: &WindowsTaskRecord) -> CliResult<bool> {
@@ -1708,6 +3458,13 @@ function Resolve-Sid([string] $identity) {
     return ([System.Security.Principal.NTAccount] $identity).Translate([System.Security.Principal.SecurityIdentifier]).Value
 }
 $task = $tasks[0]
+$taskDocument = New-Object System.Xml.XmlDocument
+$taskDocument.LoadXml((Export-ScheduledTask -TaskName $target -TaskPath '\' -ErrorAction Stop))
+$namespaces = New-Object System.Xml.XmlNamespaceManager($taskDocument.NameTable)
+$namespaces.AddNamespace('task', $taskDocument.DocumentElement.NamespaceURI)
+$principalNodes = @($taskDocument.SelectNodes('/task:Task/task:Principals/task:Principal', $namespaces))
+$actionsNode = $taskDocument.SelectSingleNode('/task:Task/task:Actions', $namespaces)
+$descriptionNode = $taskDocument.SelectSingleNode('/task:Task/task:RegistrationInfo/task:Description', $namespaces)
 $actions = @($task.Actions)
 $triggers = @($task.Triggers)
 $ownerSid = Resolve-Sid ([string] $task.Principal.UserId)
@@ -1733,9 +3490,28 @@ if ($null -ne $action) {
 $record = [ordered]@{
     task_name = [string] $task.TaskName
     task_path = [string] $task.TaskPath
+    version = [string] $taskDocument.DocumentElement.GetAttribute('version')
+    description = if ($null -eq $descriptionNode) { '' } else { [string] $descriptionNode.InnerText }
     owner_sid = [string] $ownerSid
+    principal_count = [int] $principalNodes.Count
+    principal_id = if ($principalNodes.Count -eq 1) { [string] $principalNodes[0].GetAttribute('id') } else { '' }
+    actions_context = if ($null -eq $actionsNode) { '' } else { [string] $actionsNode.GetAttribute('Context') }
     state = [int] $task.State
     enabled = [bool] $task.Settings.Enabled
+    multiple_instances = [string] $task.Settings.MultipleInstances
+    disallow_start_if_on_batteries = [bool] $task.Settings.DisallowStartIfOnBatteries
+    stop_if_going_on_batteries = [bool] $task.Settings.StopIfGoingOnBatteries
+    allow_hard_terminate = [bool] $task.Settings.AllowHardTerminate
+    start_when_available = [bool] $task.Settings.StartWhenAvailable
+    run_only_if_network_available = [bool] $task.Settings.RunOnlyIfNetworkAvailable
+    allow_start_on_demand = [bool] $task.Settings.AllowStartOnDemand
+    hidden = [bool] $task.Settings.Hidden
+    run_only_if_idle = [bool] $task.Settings.RunOnlyIfIdle
+    wake_to_run = [bool] $task.Settings.WakeToRun
+    execution_time_limit = [string] $task.Settings.ExecutionTimeLimit
+    priority = [int] $task.Settings.Priority
+    restart_interval = [string] $task.Settings.RestartInterval
+    restart_count = [int] $task.Settings.RestartCount
     action_count = [int] $actions.Count
     execute = $execute
     arguments = $arguments
@@ -1764,6 +3540,29 @@ $record = [ordered]@{
             Err(CliError::Other(format!(
                 "refusing to alter {description} Windows task '{}': its Principal SID does not match the current process SID",
                 record.task_name
+            )))
+        }
+    }
+
+    fn require_task_snapshot_unchanged(
+        current: &WindowsTaskRecord,
+        snapshot: &OwnedTaskSnapshot,
+        description: &str,
+    ) -> CliResult<()> {
+        require_task_owner(current, &snapshot.record.owner_sid, description)?;
+        let mut expected = snapshot.record.clone();
+        // Running/ready transitions are expected while the transaction is being prepared. Every
+        // registration field remains a CAS boundary so an external Task Scheduler edit is never
+        // silently deleted.
+        expected.state = current.state;
+        let definition_unchanged =
+            snapshot_owned_task(current.clone())?.definition == snapshot.definition;
+        if &expected == current && definition_unchanged {
+            Ok(())
+        } else {
+            Err(CliError::Other(format!(
+                "refusing to alter the {description} Windows task '{}': its registration changed after uninstall preflight",
+                current.task_name
             )))
         }
     }
@@ -1835,17 +3634,26 @@ try {
     fn restore_task_snapshot(
         snapshot: &OwnedTaskSnapshot,
         installed_definition: &Path,
+        restart_runtime: bool,
     ) -> CliResult<()> {
-        if let Some(current) = query_scheduled_task(&snapshot.record.task_name)? {
-            require_task_owner(&current, &snapshot.record.owner_sid, "rollback destination")?;
-        }
+        let destination_exists =
+            if let Some(current) = query_scheduled_task(&snapshot.record.task_name)? {
+                require_task_snapshot_unchanged(&current, snapshot, "rollback destination")?;
+                true
+            } else {
+                false
+            };
         let rollback_path = installed_definition.with_file_name(format!(
             "windows-task-rollback-{}-{}.xml",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
         write_service_definition(&rollback_path, &snapshot.definition)?;
-        let restore = register_task_from_file(&snapshot.record.task_name, &rollback_path);
+        let restore = if destination_exists {
+            Ok(())
+        } else {
+            register_task_from_file(&snapshot.record.task_name, &rollback_path)
+        };
         let cleanup = match std::fs::remove_file(&rollback_path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1861,13 +3669,46 @@ try {
                 snapshot.record.task_name
             ))
         })?;
-        require_task_owner(&restored, &snapshot.record.owner_sid, "restored")?;
-        if scheduled_task_requires_end(&snapshot.record)?
-            && !scheduled_task_requires_end(&restored)?
-        {
-            run_scheduled_task(&restored.task_name)?;
+        require_task_snapshot_unchanged(&restored, snapshot, "restored")?;
+        if restart_runtime && scheduled_task_requires_end(&snapshot.record)? {
+            restart_restored_task(snapshot)?;
         }
         cleanup
+    }
+
+    fn restart_restored_task(snapshot: &OwnedTaskSnapshot) -> CliResult<()> {
+        let current = query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+            CliError::Other(format!(
+                "restored Windows task '{}' disappeared before its runtime state could be restored",
+                snapshot.record.task_name
+            ))
+        })?;
+        require_task_snapshot_unchanged(&current, snapshot, "restored")?;
+        if scheduled_task_requires_end(&current)? {
+            return Ok(());
+        }
+        run_scheduled_task(&current.task_name)?;
+        let deadline = Instant::now() + TASK_STOP_TIMEOUT;
+        loop {
+            let current = query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+                CliError::Other(format!(
+                    "restored Windows task '{}' disappeared after schtasks /Run",
+                    snapshot.record.task_name
+                ))
+            })?;
+            require_task_snapshot_unchanged(&current, snapshot, "restored")?;
+            if scheduled_task_requires_end(&current)? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(CliError::Other(format!(
+                    "restored Windows task '{}' did not enter a queued or running state within {} seconds",
+                    snapshot.record.task_name,
+                    TASK_STOP_TIMEOUT.as_secs()
+                )));
+            }
+            std::thread::sleep(TASK_STOP_POLL_INTERVAL);
+        }
     }
 
     fn run_scheduled_task(task_name: &str) -> CliResult<()> {
@@ -1882,43 +3723,143 @@ try {
         .map(|_| ())
     }
 
-    fn end_owned_scheduled_task(task_name: &str, expected_sid: &str) -> CliResult<()> {
-        let Some(record) = query_scheduled_task(task_name)? else {
+    fn run_unchanged_scheduled_task(
+        snapshot: &OwnedTaskSnapshot,
+        description: &str,
+    ) -> CliResult<()> {
+        let current = query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+            CliError::Other(format!(
+                "the {description} Windows task disappeared before it could be started"
+            ))
+        })?;
+        require_task_snapshot_unchanged(&current, snapshot, description)?;
+        run_scheduled_task(&current.task_name)
+    }
+
+    fn end_unchanged_scheduled_task(
+        snapshot: &OwnedTaskSnapshot,
+        description: &str,
+    ) -> CliResult<()> {
+        let current = query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+            CliError::Other(format!(
+                "the {description} Windows task disappeared before it could be stopped"
+            ))
+        })?;
+        require_task_snapshot_unchanged(&current, snapshot, description)?;
+        if !scheduled_task_requires_end(&current)? {
             return Ok(());
-        };
-        require_task_owner(&record, expected_sid, "owned")?;
+        }
         run_command(
             "schtasks.exe",
             &[
                 OsString::from("/End"),
                 OsString::from("/TN"),
-                OsString::from(task_name),
+                OsString::from(&current.task_name),
             ],
-        )
-        .map(|_| ())
+        )?;
+
+        let deadline = Instant::now() + TASK_STOP_TIMEOUT;
+        loop {
+            let current = query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+                CliError::Other(format!(
+                    "the {description} Windows task disappeared while waiting for it to stop"
+                ))
+            })?;
+            require_task_snapshot_unchanged(&current, snapshot, description)?;
+            if !scheduled_task_requires_end(&current)? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(CliError::Other(format!(
+                    "the {description} Windows task '{}' did not stop within {} seconds",
+                    current.task_name,
+                    TASK_STOP_TIMEOUT.as_secs()
+                )));
+            }
+            std::thread::sleep(TASK_STOP_POLL_INTERVAL);
+        }
     }
 
-    fn delete_owned_scheduled_task(task_name: &str, expected_sid: &str) -> CliResult<()> {
-        let Some(record) = query_scheduled_task(task_name)? else {
-            return Ok(());
-        };
-        require_task_owner(&record, expected_sid, "owned")?;
+    fn delete_unchanged_scheduled_task(
+        snapshot: &OwnedTaskSnapshot,
+        description: &str,
+    ) -> CliResult<()> {
+        let current = query_scheduled_task(&snapshot.record.task_name)?.ok_or_else(|| {
+            CliError::Other(format!(
+                "the {description} Windows task disappeared before deletion"
+            ))
+        })?;
+        require_task_snapshot_unchanged(&current, snapshot, description)?;
         run_command(
             "schtasks.exe",
             &[
                 OsString::from("/Delete"),
                 OsString::from("/TN"),
-                OsString::from(task_name),
+                OsString::from(&current.task_name),
                 OsString::from("/F"),
             ],
-        )
-        .map(|_| ())
+        )?;
+        if query_scheduled_task(&snapshot.record.task_name)?.is_some() {
+            return Err(CliError::Other(format!(
+                "the {description} Windows task still exists after deletion"
+            )));
+        }
+        Ok(())
     }
 
-    fn probe_legacy_scm_for_migration() -> CliResult<Option<LegacyScmSnapshot>> {
+    fn legacy_scm_definition(config: &ServiceConfig) -> LegacyWindowsScmDefinition {
+        LegacyWindowsScmDefinition {
+            own_process: config.service_type == SERVICE_TYPE,
+            start_type: config.start_type.to_raw(),
+            error_control: config.error_control.to_raw(),
+            dependencies: config
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    dependency
+                        .to_system_identifier()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect(),
+            account_name: config
+                .account_name
+                .as_ref()
+                .map(|account| account.to_string_lossy().into_owned()),
+            display_name: config.display_name.to_string_lossy().into_owned(),
+            load_order_group: config
+                .load_order_group
+                .as_ref()
+                .map(|group| group.to_string_lossy().into_owned()),
+            command_line: config.executable_path.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn require_legacy_scm_snapshot_unchanged(
+        service: &Service,
+        snapshot: &LegacyScmSnapshot,
+        operation: &str,
+    ) -> CliResult<()> {
+        let current = service
+            .query_config()
+            .map_err(|error| CliError::Other(format!("{operation}: query config: {error}")))?;
+        if legacy_scm_definition(&current) == snapshot.definition {
+            Ok(())
+        } else {
+            Err(CliError::Other(format!(
+                "{operation}: refusing to alter the same-name SCM service because its definition changed after preflight"
+            )))
+        }
+    }
+
+    fn probe_legacy_scm(
+        operation: &str,
+        executable: &Path,
+    ) -> CliResult<Option<LegacyScmSnapshot>> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(windows_error("open Windows Service Control Manager"))?;
         let access = ServiceAccess::QUERY_STATUS
+            | ServiceAccess::QUERY_CONFIG
             | ServiceAccess::START
             | ServiceAccess::STOP
             | ServiceAccess::DELETE;
@@ -1927,32 +3868,107 @@ try {
             Err(error) if windows_service_missing(&error) => return Ok(None),
             Err(error) => {
                 return Err(CliError::Other(format!(
-                    "preflight legacy LocalSystem SCM service migration: {error}; rerun once from an elevated terminal"
+                    "{operation}: {error}; rerun once from an elevated terminal"
                 )));
             }
         };
+        let definition = legacy_scm_definition(
+            &service
+                .query_config()
+                .map_err(|error| CliError::Other(format!("{operation}: query config: {error}")))?,
+        );
+        let invocation = verify_legacy_windows_scm_definition(&definition, executable)
+            .map_err(|error| CliError::Other(format!("{operation}: {error}")))?;
         let state = service
             .query_status()
-            .map_err(windows_error(
-                "query legacy Windows service status during preflight",
-            ))?
+            .map_err(|error| CliError::Other(format!("{operation}: query status: {error}")))?
             .current_state;
+        let was_running = match state {
+            ServiceState::Running => true,
+            ServiceState::Stopped => false,
+            ServiceState::StartPending | ServiceState::StopPending => {
+                return Err(CliError::Other(format!(
+                    "{operation}: the legacy SCM service is transitioning; wait for it to become Running or Stopped, then retry"
+                )));
+            }
+            _ => {
+                return Err(CliError::Other(format!(
+                    "{operation}: the legacy SCM service is not in a supported Running or Stopped state"
+                )));
+            }
+        };
         Ok(Some(LegacyScmSnapshot {
-            was_running: state != ServiceState::Stopped,
+            was_running,
+            definition,
+            invocation,
         }))
     }
 
-    fn stop_legacy_scm_service() -> CliResult<()> {
+    fn restore_legacy_scm_snapshot(snapshot: &LegacyScmSnapshot) -> CliResult<()> {
+        let current = probe_legacy_scm(
+            "verify the legacy LocalSystem SCM service after failed uninstall",
+            &current_executable()?,
+        )?
+        .ok_or_else(|| {
+            CliError::Other(
+                "the legacy SCM definition is absent after failed removal and cannot be reconstructed automatically"
+                    .to_string(),
+            )
+        })?;
+        if current.definition != snapshot.definition {
+            return Err(CliError::Other(
+                "the legacy SCM definition changed after uninstall preflight and was left untouched"
+                    .to_string(),
+            ));
+        }
+        if snapshot.was_running && !current.was_running {
+            start_legacy_scm_service(snapshot)?;
+        } else if !snapshot.was_running && current.was_running {
+            stop_legacy_scm_service(snapshot)?;
+        }
+        let restored = probe_legacy_scm(
+            "verify the restored legacy LocalSystem SCM service runtime state",
+            &current_executable()?,
+        )?
+        .ok_or_else(|| {
+            CliError::Other(
+                "the legacy SCM definition disappeared during rollback and cannot be reconstructed automatically"
+                    .to_string(),
+            )
+        })?;
+        if restored.definition == snapshot.definition
+            && restored.was_running == snapshot.was_running
+        {
+            Ok(())
+        } else {
+            Err(CliError::Other(format!(
+                "the legacy SCM runtime state did not return to {}",
+                if snapshot.was_running {
+                    "running"
+                } else {
+                    "stopped"
+                }
+            )))
+        }
+    }
+
+    fn stop_legacy_scm_service(snapshot: &LegacyScmSnapshot) -> CliResult<()> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(windows_error("open Windows Service Control Manager"))?;
         let service = match manager.open_service(
             WINDOWS_SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::STOP,
         ) {
             Ok(service) => service,
-            Err(error) if windows_service_missing(&error) => return Ok(()),
+            Err(error) if windows_service_missing(&error) => {
+                return Err(CliError::Other(
+                    "the verified legacy SCM service disappeared before it could be stopped"
+                        .to_string(),
+                ));
+            }
             Err(error) => return Err(windows_error("open legacy codex-helper SCM service")(error)),
         };
+        require_legacy_scm_snapshot_unchanged(&service, snapshot, "stop the legacy SCM service")?;
         if service
             .query_status()
             .map_err(windows_error("query legacy Windows service status"))?
@@ -1967,12 +3983,12 @@ try {
         wait_for_legacy_service_stop(&service)
     }
 
-    fn start_legacy_scm_service() -> CliResult<()> {
+    fn start_legacy_scm_service(snapshot: &LegacyScmSnapshot) -> CliResult<()> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(windows_error("open Windows Service Control Manager"))?;
         let service = match manager.open_service(
             WINDOWS_SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::START,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::START,
         ) {
             Ok(service) => service,
             Err(error) if windows_service_missing(&error) => {
@@ -1982,6 +3998,11 @@ try {
             }
             Err(error) => return Err(windows_error("open legacy SCM service for rollback")(error)),
         };
+        require_legacy_scm_snapshot_unchanged(
+            &service,
+            snapshot,
+            "restart the legacy SCM service",
+        )?;
         if service
             .query_status()
             .map_err(windows_error("query legacy SCM service during rollback"))?
@@ -1995,56 +4016,118 @@ try {
             .map_err(windows_error("restart legacy codex-helper Windows service"))
     }
 
-    fn retire_legacy_scm_service(snapshot: LegacyScmSnapshot, stopped: &mut bool) -> CliResult<()> {
+    fn retire_legacy_scm_service(
+        snapshot: &LegacyScmSnapshot,
+    ) -> Result<(), LegacyScmRetirementFailure> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(windows_error("open Windows Service Control Manager"))
+            .map_err(LegacyScmRetirementFailure::rollback_safe)?;
+        let service = match manager.open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::DELETE,
+        ) {
+            Ok(service) => service,
+            Err(error) if windows_service_missing(&error) => {
+                return Err(LegacyScmRetirementFailure::rollback_safe(CliError::Other(
+                    "the verified legacy SCM service disappeared before migration committed"
+                        .to_string(),
+                )));
+            }
+            Err(error) => {
+                return Err(LegacyScmRetirementFailure::rollback_safe(windows_error(
+                    "open legacy SCM service for migration",
+                )(
+                    error
+                )));
+            }
+        };
+        require_legacy_scm_snapshot_unchanged(&service, snapshot, "retire the legacy SCM service")
+            .map_err(LegacyScmRetirementFailure::rollback_safe)?;
+        if service
+            .query_status()
+            .map_err(windows_error("query legacy Windows service status"))
+            .map_err(LegacyScmRetirementFailure::rollback_safe)?
+            .current_state
+            != ServiceState::Stopped
+        {
+            return Err(LegacyScmRetirementFailure::rollback_safe(
+                CliError::Other(
+                "the legacy SCM service restarted after handoff; its registration was left in place"
+                    .to_string(),
+                ),
+            ));
+        }
+        require_legacy_scm_snapshot_unchanged(
+            &service,
+            snapshot,
+            "delete the legacy SCM service after handoff",
+        )
+        .map_err(LegacyScmRetirementFailure::rollback_safe)?;
+        let Err(delete_error) = service.delete() else {
+            return Ok(());
+        };
+        let delete_error =
+            windows_error("delete legacy codex-helper Windows service")(delete_error);
+        drop(service);
+
+        match manager.open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+        ) {
+            Err(error)
+                if matches!(
+                    windows_service_probe_classification(&error),
+                    WindowsServiceProbeClassification::Missing
+                        | WindowsServiceProbeClassification::MarkedForDelete
+                ) =>
+            {
+                Ok(())
+            }
+            Ok(service) => {
+                require_legacy_scm_snapshot_unchanged(
+                    &service,
+                    snapshot,
+                    "verify the legacy SCM service after DeleteService reported an error",
+                )
+                .map_err(|probe_error| {
+                    LegacyScmRetirementFailure::commit_unknown(CliError::Other(format!(
+                        "{delete_error}; the legacy SCM registration changed while confirming whether deletion committed: {probe_error}. The verified replacement and its receipt were preserved"
+                    )))
+                })?;
+                Err(LegacyScmRetirementFailure::rollback_safe(delete_error))
+            }
+            Err(probe_error) => Err(LegacyScmRetirementFailure::commit_unknown(CliError::Other(
+                format!(
+                    "{delete_error}; could not determine whether the legacy SCM deletion committed: {probe_error}. The verified replacement and its receipt were preserved"
+                ),
+            ))),
+        }
+    }
+
+    fn remove_legacy_scm_service(stop_first: bool, snapshot: &LegacyScmSnapshot) -> CliResult<()> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(windows_error("open Windows Service Control Manager"))?;
         let service = match manager.open_service(
             WINDOWS_SERVICE_NAME,
             ServiceAccess::QUERY_STATUS
-                | ServiceAccess::START
+                | ServiceAccess::QUERY_CONFIG
                 | ServiceAccess::STOP
                 | ServiceAccess::DELETE,
         ) {
             Ok(service) => service,
-            Err(error) if windows_service_missing(&error) => return Ok(()),
-            Err(error) => {
-                return Err(windows_error("open legacy SCM service for migration")(
-                    error,
+            Err(error) if windows_service_missing(&error) => {
+                return Err(CliError::Other(
+                    "the verified legacy SCM service disappeared before uninstall committed"
+                        .to_string(),
                 ));
             }
-        };
-        *stopped = snapshot.was_running;
-        if service
-            .query_status()
-            .map_err(windows_error("query legacy Windows service status"))?
-            .current_state
-            != ServiceState::Stopped
-        {
-            service
-                .stop()
-                .map_err(windows_error("stop legacy codex-helper Windows service"))?;
-            wait_for_legacy_service_stop(&service)?;
-        }
-        service
-            .delete()
-            .map_err(windows_error("delete legacy codex-helper Windows service"))
-    }
-
-    fn remove_legacy_scm_service(stop_first: bool) -> CliResult<()> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .map_err(windows_error("open Windows Service Control Manager"))?;
-        let service = match manager.open_service(
-            WINDOWS_SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-        ) {
-            Ok(service) => service,
-            Err(error) if windows_service_missing(&error) => return Ok(()),
             Err(error) => {
                 return Err(CliError::Other(format!(
                     "remove legacy LocalSystem SCM service before installing the per-user task: {error}; rerun once from an elevated terminal"
                 )));
             }
         };
+        require_legacy_scm_snapshot_unchanged(&service, snapshot, "remove the legacy SCM service")?;
         if stop_first
             && service
                 .query_status()
@@ -2079,13 +4162,18 @@ try {
         ))
     }
 
-    fn windows_service_missing(error: &windows_service::Error) -> bool {
+    fn windows_service_probe_classification(
+        error: &windows_service::Error,
+    ) -> WindowsServiceProbeClassification {
         let raw_os_error = match error {
             windows_service::Error::Winapi(error) => error.raw_os_error(),
             _ => None,
         };
         classify_windows_service_probe_error(raw_os_error)
-            == WindowsServiceProbeClassification::Missing
+    }
+
+    fn windows_service_missing(error: &windows_service::Error) -> bool {
+        windows_service_probe_classification(error) == WindowsServiceProbeClassification::Missing
     }
 
     pub(super) fn run_dispatcher(options: ServiceInstallOptions) -> CliResult<()> {
@@ -2189,6 +4277,7 @@ try {
             service_name: WINDOWS_SERVICE_NAME.to_string(),
             state,
             installed,
+            legacy_installation: false,
             autostart,
             service_definition: None,
             log_directory: service_log_dir(),
@@ -2205,108 +4294,374 @@ try {
 mod macos {
     use super::*;
 
-    pub(super) fn install(options: ServiceInstallOptions) -> CliResult<()> {
-        let executable = current_executable()?;
-        let log_dir = ensure_service_log_dir()?;
-        let path = launch_agent_path()?;
-        let document = render_launch_agent(&executable, &log_dir, &options);
-        let domain = launchd_domain()?;
-        let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
-        let was_loaded = run_command(
-            "launchctl",
-            &[OsString::from("print"), OsString::from(target)],
-        )
-        .is_ok();
-        let mut definition = codex_helper_core::ManagedFileTransaction::begin(
-            path.clone(),
-            MAX_SERVICE_DEFINITION_BYTES,
-        )
-        .map_err(|error| CliError::Other(format!("begin LaunchAgent transaction: {error}")))?;
-        let original_definition_exists = definition.current().bytes().is_some();
-        let (mut receipt_transaction, receipt) = begin_service_receipt_transaction(&options)?;
-        let mutation = (|| {
-            if was_loaded {
+    struct NativeMacosInstallBackend {
+        path: PathBuf,
+        domain: OsString,
+        target: String,
+        was_loaded: bool,
+        original_definition_exists: bool,
+        definition: codex_helper_core::ManagedFileTransaction,
+        receipt_transaction: ServiceReceiptTransaction,
+        receipt: ServiceReceipt,
+        document: String,
+        replacement_start_attempted: bool,
+    }
+
+    impl NativeMacosInstallBackend {
+        fn new(options: ServiceInstallOptions) -> CliResult<Self> {
+            let executable = current_executable()?;
+            let log_dir = ensure_service_log_dir()?;
+            let path = launch_agent_path()?;
+            let document = render_launch_agent(&executable, &log_dir, &options);
+            let domain = launchd_domain()?;
+            let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
+            let was_loaded = NativeMacosUninstallBackend::query_loaded(&target)?;
+            let definition = codex_helper_core::ManagedFileTransaction::begin(
+                path.clone(),
+                MAX_SERVICE_DEFINITION_BYTES,
+            )
+            .map_err(|error| CliError::Other(format!("begin LaunchAgent transaction: {error}")))?;
+            let original_definition_exists = definition.current().bytes().is_some();
+            let (receipt_transaction, receipt, install_preflight) =
+                begin_service_receipt_transaction(&options)?;
+            prepare_service_switch_for_install(&options, &install_preflight)?;
+            Ok(Self {
+                path,
+                domain,
+                target,
+                was_loaded,
+                original_definition_exists,
+                definition,
+                receipt_transaction,
+                receipt,
+                document,
+                replacement_start_attempted: false,
+            })
+        }
+    }
+
+    impl UnixInstallTransactionBackend for NativeMacosInstallBackend {
+        fn prepare_replacement(&mut self) -> CliResult<()> {
+            if self.was_loaded {
                 run_command(
                     "launchctl",
                     &[
                         OsString::from("bootout"),
-                        domain.clone(),
-                        path.clone().into_os_string(),
+                        self.domain.clone(),
+                        self.path.clone().into_os_string(),
                     ],
                 )?;
             }
-            definition.replace(document.as_bytes()).map_err(|error| {
-                CliError::Other(format!("publish LaunchAgent definition: {error}"))
-            })?;
-            if definition.current().bytes() != Some(document.as_bytes()) {
+            self.definition
+                .replace(self.document.as_bytes())
+                .map_err(|error| {
+                    CliError::Other(format!("publish LaunchAgent definition: {error}"))
+                })?;
+            if self.definition.current().bytes() != Some(self.document.as_bytes()) {
                 return Err(CliError::Other(
                     "LaunchAgent definition failed transaction read-back verification".to_string(),
                 ));
             }
             run_command(
                 "plutil",
-                &[OsString::from("-lint"), path.clone().into_os_string()],
+                &[OsString::from("-lint"), self.path.clone().into_os_string()],
             )?;
-            receipt_transaction.replace(&receipt).map_err(|error| {
-                CliError::Other(format!("publish LaunchAgent service receipt: {error}"))
-            })
-        })();
-        if let Err(primary) = mutation {
+            self.receipt_transaction
+                .replace(&self.receipt)
+                .map_err(|error| {
+                    CliError::Other(format!("publish LaunchAgent service receipt: {error}"))
+                })
+        }
+
+        fn start_replacement(&mut self) -> CliResult<()> {
+            self.replacement_start_attempted = true;
+            start()
+        }
+
+        async fn verify_started_runtime_identity(
+            &mut self,
+        ) -> CliResult<codex_helper_core::credentials::CredentialAggregateReadiness> {
+            verify_started_service_runtime_identity().await
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
             let mut failures = Vec::new();
-            if let Err(error) = receipt_transaction.rollback() {
+            let replacement_stopped = if self.replacement_start_attempted {
+                match stop() {
+                    Ok(()) => true,
+                    Err(stop_error) => {
+                        match NativeMacosUninstallBackend::query_loaded(&self.target) {
+                            Ok(false) => true,
+                            Ok(true) => {
+                                failures.push(format!(
+                                "stop the replacement LaunchAgent before rollback: {stop_error}; launchd still reports it loaded"
+                            ));
+                                false
+                            }
+                            Err(probe_error) => {
+                                failures.push(format!(
+                                "stop the replacement LaunchAgent before rollback: {stop_error}; its state could not be verified: {probe_error}"
+                            ));
+                                false
+                            }
+                        }
+                    }
+                }
+            } else {
+                true
+            };
+            if !replacement_stopped {
+                failures.push(
+                    "the replacement LaunchAgent definition and service receipt were preserved because its runtime may still be active"
+                        .to_string(),
+                );
+                return Err(CliError::Other(failures.join("; ")));
+            }
+            if let Err(error) = self.receipt_transaction.rollback() {
                 failures.push(format!("restore previous service receipt: {error}"));
             }
-            if let Err(error) = definition.rollback() {
+            if let Err(error) = self.definition.rollback() {
                 failures.push(format!("restore previous LaunchAgent definition: {error}"));
             }
-            if was_loaded
-                && original_definition_exists
-                && let Err(error) = run_command(
-                    "launchctl",
-                    &[OsString::from("bootstrap"), domain, path.into_os_string()],
-                )
-            {
-                failures.push(format!("reload previous LaunchAgent: {error}"));
+            if self.was_loaded {
+                if !self.original_definition_exists {
+                    if !NativeMacosUninstallBackend::query_loaded(&self.target)? {
+                        failures.push(
+                            "the previous detached LaunchAgent had no definition and could not be reconstructed"
+                                .to_string(),
+                        );
+                    }
+                } else if !NativeMacosUninstallBackend::query_loaded(&self.target)?
+                    && let Err(error) = run_command(
+                        "launchctl",
+                        &[
+                            OsString::from("bootstrap"),
+                            self.domain.clone(),
+                            self.path.clone().into_os_string(),
+                        ],
+                    )
+                {
+                    failures.push(format!("reload previous LaunchAgent: {error}"));
+                }
+                match NativeMacosUninstallBackend::query_loaded(&self.target) {
+                    Ok(true) => {}
+                    Ok(false) => failures
+                        .push("the previous LaunchAgent was not loaded after rollback".to_string()),
+                    Err(error) => failures.push(format!(
+                        "verify the previous LaunchAgent after rollback: {error}"
+                    )),
+                }
             }
-            return Err(rollback_error(primary, failures));
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(CliError::Other(failures.join("; ")))
+            }
         }
-        if options.start {
-            start()?;
-        }
-        Ok(())
     }
 
-    pub(super) fn uninstall(stop_first: bool) -> CliResult<()> {
-        let path = launch_agent_path()?;
-        if stop_first && path.exists() {
-            let _ = run_command(
+    pub(super) async fn install(
+        options: ServiceInstallOptions,
+    ) -> CliResult<Option<codex_helper_core::credentials::CredentialAggregateReadiness>> {
+        let start = options.start;
+        run_unix_install_transaction(&mut NativeMacosInstallBackend::new(options)?, start).await
+    }
+
+    struct NativeMacosUninstallBackend {
+        path: PathBuf,
+        domain: OsString,
+        target: String,
+        was_loaded: bool,
+        stopped: bool,
+        original_definition_exists: bool,
+        definition: codex_helper_core::ManagedFileTransaction,
+        receipt: ServiceReceiptTransaction,
+    }
+
+    impl NativeMacosUninstallBackend {
+        fn new() -> CliResult<Self> {
+            let path = launch_agent_path()?;
+            let domain = launchd_domain()?;
+            let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
+            let was_loaded = Self::query_loaded(&target)?;
+            let definition = codex_helper_core::ManagedFileTransaction::begin(
+                path.clone(),
+                MAX_SERVICE_DEFINITION_BYTES,
+            )
+            .map_err(|error| {
+                CliError::Other(format!("begin LaunchAgent removal transaction: {error}"))
+            })?;
+            let original_definition_exists = definition.current().bytes().is_some();
+            let receipt = ServiceReceiptTransaction::begin(proxy_home_dir()).map_err(|error| {
+                CliError::Other(format!("begin service receipt removal: {error}"))
+            })?;
+            Ok(Self {
+                path,
+                domain,
+                target,
+                was_loaded,
+                stopped: false,
+                original_definition_exists,
+                definition,
+                receipt,
+            })
+        }
+
+        fn query_loaded(target: &str) -> CliResult<bool> {
+            match run_command(
+                "launchctl",
+                &[OsString::from("print"), OsString::from(target)],
+            ) {
+                Ok(_) => Ok(true),
+                Err(error) if launchctl_reports_missing(&error) => Ok(false),
+                Err(error) => Err(CliError::Other(format!(
+                    "query LaunchAgent state before uninstalling it: {error}"
+                ))),
+            }
+        }
+
+        fn is_loaded(&self) -> CliResult<bool> {
+            Self::query_loaded(&self.target)
+        }
+    }
+
+    fn launchctl_reports_missing(error: &CliError) -> bool {
+        let text = error.to_string().to_ascii_lowercase();
+        text.contains("could not find service")
+            || text.contains("no such process")
+            || text.contains("not found")
+    }
+
+    impl ServiceUninstallTransactionBackend for NativeMacosUninstallBackend {
+        fn stop_and_verify(&mut self) -> CliResult<()> {
+            if !self.is_loaded()? {
+                return Ok(());
+            }
+            self.was_loaded = true;
+            self.stopped = true;
+            run_command(
                 "launchctl",
                 &[
                     OsString::from("bootout"),
-                    launchd_domain()?,
-                    path.clone().into_os_string(),
+                    self.domain.clone(),
+                    self.path.clone().into_os_string(),
                 ],
-            );
+            )
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "boot out the LaunchAgent before uninstalling it: {error}"
+                ))
+            })?;
+            if self.is_loaded()? {
+                return Err(CliError::Other(format!(
+                    "LaunchAgent {MACOS_LABEL} is still loaded after launchctl bootout; its definition and receipt were not removed"
+                )));
+            }
+            Ok(())
         }
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(CliError::Other(format!(
-                "remove launch agent {}: {error}",
-                path.display()
-            ))),
+
+        fn disable_and_verify(&mut self) -> CliResult<()> {
+            Ok(())
         }
+
+        fn remove_definition(&mut self) -> CliResult<()> {
+            self.definition.remove().map_err(|error| {
+                CliError::Other(format!(
+                    "remove LaunchAgent definition {}: {error}",
+                    self.path.display()
+                ))
+            })?;
+            if self.definition.current().bytes().is_some() {
+                return Err(CliError::Other(format!(
+                    "LaunchAgent definition {} still exists after removal",
+                    self.path.display()
+                )));
+            }
+            Ok(())
+        }
+
+        fn remove_receipt(&mut self) -> CliResult<()> {
+            self.receipt.remove().map_err(|error| {
+                CliError::Other(format!(
+                    "remove service receipt after LaunchAgent removal: {error}"
+                ))
+            })
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
+            let mut failures = Vec::new();
+            let definition_restored = match self.definition.rollback() {
+                Ok(()) => true,
+                Err(error) => {
+                    failures.push(format!("restore the LaunchAgent definition: {error}"));
+                    false
+                }
+            };
+            if let Err(error) = self.receipt.rollback() {
+                failures.push(format!("restore the service receipt: {error}"));
+            }
+            if definition_restored && self.stopped && self.was_loaded {
+                if !self.original_definition_exists {
+                    failures.push(
+                        "restart the previous LaunchAgent: its original definition was absent"
+                            .to_string(),
+                    );
+                } else {
+                    match self.is_loaded() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Err(error) = run_command(
+                                "launchctl",
+                                &[
+                                    OsString::from("bootstrap"),
+                                    self.domain.clone(),
+                                    self.path.clone().into_os_string(),
+                                ],
+                            ) {
+                                failures.push(format!("restart the previous LaunchAgent: {error}"));
+                            } else {
+                                match self.is_loaded() {
+                                    Ok(true) => {}
+                                    Ok(false) => failures.push(
+                                        "restart the previous LaunchAgent: launchctl did not report it loaded"
+                                            .to_string(),
+                                    ),
+                                    Err(error) => failures.push(format!(
+                                        "verify the restarted LaunchAgent state: {error}"
+                                    )),
+                                }
+                            }
+                        }
+                        Err(error) => failures
+                            .push(format!("verify the restarted LaunchAgent state: {error}")),
+                    }
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(CliError::Other(failures.join("; ")))
+            }
+        }
+    }
+
+    pub(super) fn uninstall(stop_first: bool) -> CliResult<()> {
+        run_service_uninstall_transaction(&mut NativeMacosUninstallBackend::new()?, stop_first)
     }
 
     pub(super) fn start() -> CliResult<()> {
         let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
-        if run_command(
+        match run_command(
             "launchctl",
             &[OsString::from("print"), OsString::from(&target)],
-        )
-        .is_err()
-        {
-            return run_command(
+        ) {
+            Ok(output) if output.contains("state = running") => Ok(()),
+            Ok(_) => run_command(
+                "launchctl",
+                &[OsString::from("kickstart"), OsString::from(target)],
+            )
+            .map(|_| ()),
+            Err(error) if launchctl_reports_missing(&error) => run_command(
                 "launchctl",
                 &[
                     OsString::from("bootstrap"),
@@ -2314,52 +4669,123 @@ mod macos {
                     launch_agent_path()?.into_os_string(),
                 ],
             )
-            .map(|_| ());
+            .map(|_| ()),
+            Err(error) => Err(CliError::Other(format!(
+                "query LaunchAgent state before starting it: {error}"
+            ))),
         }
-        run_command(
-            "launchctl",
-            &[
-                OsString::from("kickstart"),
-                OsString::from("-k"),
-                OsString::from(target),
-            ],
-        )
-        .map(|_| ())
     }
 
     pub(super) fn stop() -> CliResult<()> {
-        run_command(
-            "launchctl",
-            &[
-                OsString::from("kill"),
-                OsString::from("SIGTERM"),
-                OsString::from(format!("{}/{MACOS_LABEL}", launchd_domain_string()?)),
-            ],
+        let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
+        let domain = launchd_domain()?;
+        let path = launch_agent_path()?;
+        stop_launch_agent_with(
+            || {
+                run_command(
+                    "launchctl",
+                    &[OsString::from("print"), OsString::from(&target)],
+                )
+            },
+            || {
+                run_command(
+                    "launchctl",
+                    &[OsString::from("bootout"), domain, path.into_os_string()],
+                )
+            },
+            || {
+                run_command(
+                    "launchctl",
+                    &[OsString::from("print"), OsString::from(&target)],
+                )
+            },
         )
-        .map(|_| ())
+    }
+
+    pub(super) fn stop_launch_agent_with<Q, B, V>(
+        query: Q,
+        bootout: B,
+        verify_unloaded: V,
+    ) -> CliResult<()>
+    where
+        Q: FnOnce() -> CliResult<String>,
+        B: FnOnce() -> CliResult<String>,
+        V: FnOnce() -> CliResult<String>,
+    {
+        match query() {
+            Ok(_) => {}
+            Err(error) if launchctl_reports_missing(&error) => return Ok(()),
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "query LaunchAgent state before stopping it: {error}"
+                )));
+            }
+        }
+        match bootout() {
+            Ok(_) => {}
+            Err(error) if launchctl_reports_missing(&error) => {}
+            Err(error) => Err(CliError::Other(format!(
+                "unload the LaunchAgent with launchctl bootout: {error}"
+            )))?,
+        }
+        match verify_unloaded() {
+            Err(error) if launchctl_reports_missing(&error) => Ok(()),
+            Err(error) => Err(CliError::Other(format!(
+                "verify the LaunchAgent was unloaded after launchctl bootout: {error}"
+            ))),
+            Ok(_) => Err(CliError::Other(format!(
+                "LaunchAgent {MACOS_LABEL} is still loaded after launchctl bootout"
+            ))),
+        }
     }
 
     pub(super) fn status() -> CliResult<ServiceStatus> {
         let path = launch_agent_path()?;
-        if !path.exists() {
-            return Ok(base_status(
-                ServiceRuntimeState::NotInstalled,
-                false,
-                false,
-                Some(path),
-            ));
-        }
         let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
         let output = run_command(
             "launchctl",
             &[OsString::from("print"), OsString::from(target)],
         );
+        if !path.exists() {
+            return match output.as_ref() {
+                Ok(output) => {
+                    let state = if output.contains("state = running") {
+                        ServiceRuntimeState::Running
+                    } else {
+                        ServiceRuntimeState::Stopped
+                    };
+                    let mut status = base_status(state, false, false, Some(path));
+                    status.detail = Some(
+                        "LaunchAgent definition is absent, but launchd still has the detached runtime loaded (for example after uninstall --keep-running)"
+                            .to_string(),
+                    );
+                    Ok(status)
+                }
+                Err(error) if launchctl_reports_missing(error) => Ok(base_status(
+                    ServiceRuntimeState::NotInstalled,
+                    false,
+                    false,
+                    Some(path),
+                )),
+                Err(error) => {
+                    let mut status =
+                        base_status(ServiceRuntimeState::Unknown, false, false, Some(path));
+                    status.detail = Some(format!(
+                        "LaunchAgent definition is absent, but launchd state could not be verified: {error}"
+                    ));
+                    Ok(status)
+                }
+            };
+        }
         let (state, detail) = match output {
             Ok(output) if output.contains("state = running") => {
                 (ServiceRuntimeState::Running, Some(output))
             }
             Ok(output) => (ServiceRuntimeState::Stopped, Some(output)),
-            Err(error) => (ServiceRuntimeState::Installed, Some(error.to_string())),
+            Err(error) if launchctl_reports_missing(&error) => {
+                (ServiceRuntimeState::Installed, Some(error.to_string()))
+            }
+            Err(error) => (ServiceRuntimeState::Unknown, Some(error.to_string())),
         };
         let mut status = base_status(state, true, true, Some(path));
         status.detail = detail;
@@ -2433,6 +4859,7 @@ mod macos {
             service_name: MACOS_LABEL.to_string(),
             state,
             installed,
+            legacy_installation: false,
             autostart,
             service_definition: definition,
             log_directory: service_log_dir(),
@@ -2449,30 +4876,58 @@ mod macos {
 mod linux {
     use super::*;
 
-    pub(super) fn install(options: ServiceInstallOptions) -> CliResult<()> {
-        let executable = current_executable()?;
-        ensure_service_log_dir()?;
-        systemctl(&["show-environment"])?;
-        let path = user_unit_path()?;
-        let document = render_systemd_unit(&executable, &options);
-        let was_active =
-            systemctl_output(&["is-active", LINUX_UNIT_NAME]).is_ok_and(|value| value == "active");
-        let was_enabled = systemctl_output(&["is-enabled", LINUX_UNIT_NAME])
-            .is_ok_and(|value| value == "enabled");
-        let mut definition =
-            codex_helper_core::ManagedFileTransaction::begin(path, MAX_SERVICE_DEFINITION_BYTES)
-                .map_err(|error| {
-                    CliError::Other(format!("begin systemd unit transaction: {error}"))
-                })?;
-        let (mut receipt_transaction, receipt) = begin_service_receipt_transaction(&options)?;
-        let mutation = (|| {
-            if was_active {
+    struct NativeLinuxInstallBackend {
+        was_active: bool,
+        was_enabled: bool,
+        definition: codex_helper_core::ManagedFileTransaction,
+        receipt_transaction: ServiceReceiptTransaction,
+        receipt: ServiceReceipt,
+        document: String,
+        replacement_start_attempted: bool,
+    }
+
+    impl NativeLinuxInstallBackend {
+        fn new(options: ServiceInstallOptions) -> CliResult<Self> {
+            let executable = current_executable()?;
+            ensure_service_log_dir()?;
+            systemctl(&["show-environment"])?;
+            let path = user_unit_path()?;
+            let document = render_systemd_unit(&executable, &options);
+            let load_state = systemd_property("LoadState")?;
+            let unit_was_present = systemd_load_state_is_present(&load_state)?;
+            let was_active = unit_was_present
+                && systemd_active_state_requires_stop(&systemd_property("ActiveState")?)?;
+            let was_enabled = unit_was_present
+                && systemd_unit_file_state_requires_disable(&systemd_property("UnitFileState")?)?;
+            let definition = codex_helper_core::ManagedFileTransaction::begin(
+                path,
+                MAX_SERVICE_DEFINITION_BYTES,
+            )
+            .map_err(|error| CliError::Other(format!("begin systemd unit transaction: {error}")))?;
+            let (receipt_transaction, receipt, install_preflight) =
+                begin_service_receipt_transaction(&options)?;
+            prepare_service_switch_for_install(&options, &install_preflight)?;
+            Ok(Self {
+                was_active,
+                was_enabled,
+                definition,
+                receipt_transaction,
+                receipt,
+                document,
+                replacement_start_attempted: false,
+            })
+        }
+    }
+
+    impl UnixInstallTransactionBackend for NativeLinuxInstallBackend {
+        fn prepare_replacement(&mut self) -> CliResult<()> {
+            if self.was_active {
                 systemctl(&["stop", LINUX_UNIT_NAME])?;
             }
-            definition
-                .replace(document.as_bytes())
+            self.definition
+                .replace(self.document.as_bytes())
                 .map_err(|error| CliError::Other(format!("publish systemd user unit: {error}")))?;
-            if definition.current().bytes() != Some(document.as_bytes()) {
+            if self.definition.current().bytes() != Some(self.document.as_bytes()) {
                 return Err(CliError::Other(
                     "systemd user unit failed transaction read-back verification".to_string(),
                 ));
@@ -2487,22 +4942,65 @@ mod linux {
                     "systemd user unit did not report enabled after installation".to_string(),
                 ));
             }
-            receipt_transaction.replace(&receipt).map_err(|error| {
-                CliError::Other(format!("publish systemd service receipt: {error}"))
-            })
-        })();
-        if let Err(primary) = mutation {
+            self.receipt_transaction
+                .replace(&self.receipt)
+                .map_err(|error| {
+                    CliError::Other(format!("publish systemd service receipt: {error}"))
+                })
+        }
+
+        fn start_replacement(&mut self) -> CliResult<()> {
+            self.replacement_start_attempted = true;
+            systemctl(&["start", LINUX_UNIT_NAME])
+        }
+
+        async fn verify_started_runtime_identity(
+            &mut self,
+        ) -> CliResult<codex_helper_core::credentials::CredentialAggregateReadiness> {
+            verify_started_service_runtime_identity().await
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
             let mut failures = Vec::new();
-            if let Err(error) = receipt_transaction.rollback() {
+            let replacement_stopped = if self.replacement_start_attempted {
+                match systemctl(&["stop", LINUX_UNIT_NAME]) {
+                    Ok(()) => true,
+                    Err(stop_error) => match systemd_property("ActiveState") {
+                        Ok(state) if matches!(state.as_str(), "inactive" | "failed") => true,
+                        Ok(state) => {
+                            failures.push(format!(
+                                "stop the replacement systemd user unit before rollback: {stop_error}; systemd still reports ActiveState={state:?}"
+                            ));
+                            false
+                        }
+                        Err(probe_error) => {
+                            failures.push(format!(
+                                "stop the replacement systemd user unit before rollback: {stop_error}; its state could not be verified: {probe_error}"
+                            ));
+                            false
+                        }
+                    },
+                }
+            } else {
+                true
+            };
+            if !replacement_stopped {
+                failures.push(
+                    "the replacement systemd unit and service receipt were preserved because its runtime may still be active"
+                        .to_string(),
+                );
+                return Err(CliError::Other(failures.join("; ")));
+            }
+            if let Err(error) = self.receipt_transaction.rollback() {
                 failures.push(format!("restore previous service receipt: {error}"));
             }
-            if let Err(error) = definition.rollback() {
+            if let Err(error) = self.definition.rollback() {
                 failures.push(format!("restore previous systemd user unit: {error}"));
             }
             if let Err(error) = systemctl(&["daemon-reload"]) {
                 failures.push(format!("reload restored systemd user units: {error}"));
             }
-            let restore_enablement = if was_enabled {
+            let restore_enablement = if self.was_enabled {
                 systemctl(&["enable", LINUX_UNIT_NAME])
             } else {
                 systemctl(&["disable", LINUX_UNIT_NAME])
@@ -2510,34 +5008,206 @@ mod linux {
             if let Err(error) = restore_enablement {
                 failures.push(format!("restore systemd user unit enablement: {error}"));
             }
-            if was_active && let Err(error) = systemctl(&["start", LINUX_UNIT_NAME]) {
-                failures.push(format!("restart previous systemd user unit: {error}"));
+            if self.was_active {
+                match systemctl(&["start", LINUX_UNIT_NAME]) {
+                    Ok(()) => match systemd_property("ActiveState") {
+                        Ok(state) if state == "active" => {}
+                        Ok(state) => failures.push(format!(
+                            "the previous systemd user unit reported ActiveState={state:?} after rollback"
+                        )),
+                        Err(error) => failures.push(format!(
+                            "verify the previous systemd user unit after rollback: {error}"
+                        )),
+                    },
+                    Err(error) => {
+                        failures.push(format!("restart previous systemd user unit: {error}"));
+                    }
+                }
             }
-            return Err(rollback_error(primary, failures));
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(CliError::Other(failures.join("; ")))
+            }
         }
-        if options.start {
-            systemctl(&["start", LINUX_UNIT_NAME])?;
+    }
+
+    pub(super) async fn install(
+        options: ServiceInstallOptions,
+    ) -> CliResult<Option<codex_helper_core::credentials::CredentialAggregateReadiness>> {
+        let start = options.start;
+        run_unix_install_transaction(&mut NativeLinuxInstallBackend::new(options)?, start).await
+    }
+
+    struct NativeLinuxUninstallBackend {
+        path: PathBuf,
+        restore_active: bool,
+        restore_enabled: bool,
+        stopped: bool,
+        disabled: bool,
+        definition: codex_helper_core::ManagedFileTransaction,
+        receipt: ServiceReceiptTransaction,
+    }
+
+    impl NativeLinuxUninstallBackend {
+        fn new() -> CliResult<Self> {
+            let path = user_unit_path()?;
+            let load_state = systemd_property("LoadState")?;
+            let load_state_is_present = systemd_load_state_is_present(&load_state)?;
+            let restore_active = if !load_state_is_present {
+                false
+            } else {
+                systemd_active_state_requires_stop(&systemd_property("ActiveState")?)?
+            };
+            let restore_enabled = if !load_state_is_present {
+                false
+            } else {
+                systemd_unit_file_state_requires_disable(&systemd_property("UnitFileState")?)?
+            };
+            let definition = codex_helper_core::ManagedFileTransaction::begin(
+                path.clone(),
+                MAX_SERVICE_DEFINITION_BYTES,
+            )
+            .map_err(|error| {
+                CliError::Other(format!("begin systemd unit removal transaction: {error}"))
+            })?;
+            let receipt = ServiceReceiptTransaction::begin(proxy_home_dir()).map_err(|error| {
+                CliError::Other(format!("begin service receipt removal: {error}"))
+            })?;
+            Ok(Self {
+                path,
+                restore_active,
+                restore_enabled,
+                stopped: false,
+                disabled: false,
+                definition,
+                receipt,
+            })
         }
-        Ok(())
+    }
+
+    impl ServiceUninstallTransactionBackend for NativeLinuxUninstallBackend {
+        fn stop_and_verify(&mut self) -> CliResult<()> {
+            let load_state = systemd_property("LoadState")?;
+            if !systemd_load_state_is_present(&load_state)? {
+                return Ok(());
+            }
+            let active_state = systemd_property("ActiveState")?;
+            if systemd_active_state_requires_stop(&active_state)? {
+                self.restore_active = true;
+                self.stopped = true;
+                systemctl(&["stop", LINUX_UNIT_NAME]).map_err(|error| {
+                    CliError::Other(format!(
+                        "stop {LINUX_UNIT_NAME} before uninstalling it: {error}"
+                    ))
+                })?;
+            }
+            let active_state = systemd_property("ActiveState")?;
+            if systemd_active_state_requires_stop(&active_state)? {
+                return Err(CliError::Other(format!(
+                    "{LINUX_UNIT_NAME} still reports ActiveState={active_state} after systemctl stop; its definition and receipt were not removed"
+                )));
+            }
+            Ok(())
+        }
+
+        fn disable_and_verify(&mut self) -> CliResult<()> {
+            let load_state = systemd_property("LoadState")?;
+            if !systemd_load_state_is_present(&load_state)? {
+                return Ok(());
+            }
+            let unit_file_state = systemd_property("UnitFileState")?;
+            if systemd_unit_file_state_requires_disable(&unit_file_state)? {
+                self.restore_enabled = true;
+                self.disabled = true;
+                systemctl(&["disable", LINUX_UNIT_NAME]).map_err(|error| {
+                    CliError::Other(format!(
+                        "disable {LINUX_UNIT_NAME} before removing its definition: {error}"
+                    ))
+                })?;
+            }
+            let unit_file_state = systemd_property("UnitFileState")?;
+            if systemd_unit_file_state_requires_disable(&unit_file_state)? {
+                return Err(CliError::Other(format!(
+                    "{LINUX_UNIT_NAME} still reports UnitFileState={unit_file_state} after systemctl disable; its definition and receipt were not removed"
+                )));
+            }
+            Ok(())
+        }
+
+        fn remove_definition(&mut self) -> CliResult<()> {
+            self.definition.remove().map_err(|error| {
+                CliError::Other(format!(
+                    "remove systemd user unit {}: {error}",
+                    self.path.display()
+                ))
+            })?;
+            if self.definition.current().bytes().is_some() {
+                return Err(CliError::Other(format!(
+                    "systemd user unit {} still exists after removal",
+                    self.path.display()
+                )));
+            }
+            systemctl(&["daemon-reload"]).map_err(|error| {
+                CliError::Other(format!(
+                    "reload systemd after removing {LINUX_UNIT_NAME}: {error}"
+                ))
+            })
+        }
+
+        fn remove_receipt(&mut self) -> CliResult<()> {
+            self.receipt.remove().map_err(|error| {
+                CliError::Other(format!(
+                    "remove service receipt after systemd unit removal: {error}"
+                ))
+            })
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
+            let mut failures = Vec::new();
+            let definition_restored = match self.definition.rollback() {
+                Ok(()) => true,
+                Err(error) => {
+                    failures.push(format!("restore the systemd user unit: {error}"));
+                    false
+                }
+            };
+            if let Err(error) = self.receipt.rollback() {
+                failures.push(format!("restore the service receipt: {error}"));
+            }
+            if definition_restored {
+                let reloaded = match systemctl(&["daemon-reload"]) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        failures.push(format!("reload the restored systemd user unit: {error}"));
+                        false
+                    }
+                };
+                if reloaded
+                    && self.disabled
+                    && self.restore_enabled
+                    && let Err(error) = systemctl(&["enable", LINUX_UNIT_NAME])
+                {
+                    failures.push(format!("re-enable the previous systemd user unit: {error}"));
+                }
+                if reloaded
+                    && self.stopped
+                    && self.restore_active
+                    && let Err(error) = systemctl(&["start", LINUX_UNIT_NAME])
+                {
+                    failures.push(format!("restart the previous systemd user unit: {error}"));
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(CliError::Other(failures.join("; ")))
+            }
+        }
     }
 
     pub(super) fn uninstall(stop_first: bool) -> CliResult<()> {
-        if stop_first {
-            let _ = systemctl(&["stop", LINUX_UNIT_NAME]);
-        }
-        let _ = systemctl(&["disable", LINUX_UNIT_NAME]);
-        let path = user_unit_path()?;
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(CliError::Other(format!(
-                    "remove systemd user unit {}: {error}",
-                    path.display()
-                )));
-            }
-        }
-        systemctl(&["daemon-reload"])
+        run_service_uninstall_transaction(&mut NativeLinuxUninstallBackend::new()?, stop_first)
     }
 
     pub(super) fn start() -> CliResult<()> {
@@ -2550,7 +5220,25 @@ mod linux {
 
     pub(super) fn status() -> CliResult<ServiceStatus> {
         let path = user_unit_path()?;
+        let load_state = systemd_property("LoadState")?;
+        let loaded = systemd_load_state_is_present(&load_state)?;
+        let active_state = systemd_property("ActiveState")?;
+        let runtime_state = systemd_runtime_state(&active_state);
         if !path.exists() {
+            if loaded
+                && matches!(
+                    runtime_state,
+                    ServiceRuntimeState::Running
+                        | ServiceRuntimeState::Starting
+                        | ServiceRuntimeState::Stopping
+                )
+            {
+                let mut status = base_status(runtime_state, false, false, Some(path));
+                status.detail = Some(format!(
+                    "systemd unit definition is absent, but the detached runtime remains {active_state} (for example after uninstall --keep-running)"
+                ));
+                return Ok(status);
+            }
             return Ok(base_status(
                 ServiceRuntimeState::NotInstalled,
                 false,
@@ -2558,22 +5246,32 @@ mod linux {
                 Some(path),
             ));
         }
-        let active = systemctl_output(&["is-active", LINUX_UNIT_NAME]);
-        let enabled = systemctl_output(&["is-enabled", LINUX_UNIT_NAME]);
-        let state = match active.as_deref() {
-            Ok("active") => ServiceRuntimeState::Running,
-            Ok("activating") => ServiceRuntimeState::Starting,
-            Ok("deactivating") => ServiceRuntimeState::Stopping,
-            Ok(_) => ServiceRuntimeState::Stopped,
-            Err(_) => ServiceRuntimeState::Unknown,
+        let unit_file_state = if loaded {
+            Some(systemd_property("UnitFileState")?)
+        } else {
+            None
         };
         let mut status = base_status(
-            state,
+            if loaded {
+                runtime_state
+            } else {
+                ServiceRuntimeState::Installed
+            },
             true,
-            enabled.as_deref().is_ok_and(|value| value == "enabled"),
+            unit_file_state.as_deref() == Some("enabled"),
             Some(path),
         );
-        status.detail = active.err().map(|error| error.to_string());
+        if runtime_state == ServiceRuntimeState::Unknown {
+            status.detail = Some(format!(
+                "systemd reports unknown ActiveState={active_state:?}"
+            ));
+        } else if let Some(unit_file_state) = unit_file_state.as_deref()
+            && !matches!(unit_file_state, "enabled" | "disabled")
+        {
+            status.detail = Some(format!(
+                "systemd reports nonstandard UnitFileState={unit_file_state:?}"
+            ));
+        }
         Ok(status)
     }
 
@@ -2585,6 +5283,51 @@ mod linux {
         let mut args = vec![OsString::from("--user")];
         args.extend(arguments.iter().map(OsString::from));
         run_command("systemctl", &args)
+    }
+
+    fn systemd_property(property: &str) -> CliResult<String> {
+        let property = format!("--property={property}");
+        systemctl_output(&["show", LINUX_UNIT_NAME, property.as_str(), "--value"])
+    }
+
+    fn systemd_active_state_requires_stop(state: &str) -> CliResult<bool> {
+        match state {
+            "active" | "activating" | "deactivating" | "reloading" | "refreshing" => Ok(true),
+            "inactive" | "failed" => Ok(false),
+            state => Err(CliError::Other(format!(
+                "refusing to uninstall {LINUX_UNIT_NAME} while systemd reports unknown ActiveState={state:?}"
+            ))),
+        }
+    }
+
+    fn systemd_runtime_state(state: &str) -> ServiceRuntimeState {
+        match state {
+            "active" | "reloading" | "refreshing" => ServiceRuntimeState::Running,
+            "activating" => ServiceRuntimeState::Starting,
+            "deactivating" => ServiceRuntimeState::Stopping,
+            "inactive" | "failed" => ServiceRuntimeState::Stopped,
+            _ => ServiceRuntimeState::Unknown,
+        }
+    }
+
+    fn systemd_load_state_is_present(state: &str) -> CliResult<bool> {
+        match state {
+            "loaded" => Ok(true),
+            "not-found" => Ok(false),
+            state => Err(CliError::Other(format!(
+                "refusing to uninstall {LINUX_UNIT_NAME} while systemd reports non-restorable LoadState={state:?}"
+            ))),
+        }
+    }
+
+    fn systemd_unit_file_state_requires_disable(state: &str) -> CliResult<bool> {
+        match state {
+            "enabled" => Ok(true),
+            "disabled" => Ok(false),
+            state => Err(CliError::Other(format!(
+                "refusing to uninstall {LINUX_UNIT_NAME} while systemd reports non-restorable UnitFileState={state:?}; restore it to enabled or disabled first"
+            ))),
+        }
     }
 
     fn user_unit_path() -> CliResult<PathBuf> {
@@ -2607,6 +5350,7 @@ mod linux {
             service_name: LINUX_UNIT_NAME.to_string(),
             state,
             installed,
+            legacy_installation: false,
             autostart,
             service_definition: definition,
             log_directory: service_log_dir(),
@@ -2637,7 +5381,7 @@ fn render_systemd_unit(executable: &Path, options: &ServiceInstallOptions) -> St
         options.install_generation
     );
     format!(
-        "[Unit]\nDescription=codex-helper resident relay\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nEnvironment={helper_home}\nEnvironment={client_home}\nEnvironment={install_generation}\nExecStart={} serve {service_flag} --host {} --port {} --no-tui --service-managed\nRestart=on-failure\nRestartSec=10s\nStartLimitIntervalSec=300\nStartLimitBurst=10\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=codex-helper resident relay\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=300\nStartLimitBurst=10\n\n[Service]\nType=simple\nEnvironment={helper_home}\nEnvironment={client_home}\nEnvironment={install_generation}\nExecStart={} serve {service_flag} --host {} --port {} --no-tui --service-managed\nRestart=on-failure\nRestartSec=10s\n\n[Install]\nWantedBy=default.target\n",
         systemd_quote(executable),
         options.host,
         options.port,
@@ -2770,12 +5514,675 @@ mod tests {
         assert!(service_name_from_flags(true, true).is_err());
     }
 
+    fn test_service_receipt(
+        service: codex_helper_core::config::ServiceKind,
+        admin_base_url: &str,
+    ) -> ServiceReceipt {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-switch-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        ServiceReceipt::new(
+            service,
+            root.join("helper"),
+            root.join("client"),
+            admin_base_url,
+            ServicePlatformBackend::current().expect("supported test platform"),
+            codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        )
+        .expect("build service receipt")
+    }
+
+    fn test_service_identity_receipt(
+        service: codex_helper_core::config::ServiceKind,
+        proxy_port: u16,
+        helper_home: &Path,
+        client_home: &Path,
+    ) -> ServiceReceipt {
+        ServiceReceipt::new(
+            service,
+            helper_home.to_path_buf(),
+            client_home.to_path_buf(),
+            codex_helper_core::proxy::local_admin_base_url_for_proxy_port(proxy_port),
+            ServicePlatformBackend::current().expect("supported test platform"),
+            codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        )
+        .expect("build service identity receipt")
+    }
+
+    #[test]
+    fn service_install_identity_allows_same_target_and_new_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-install-identity-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_home = root.join("client");
+        let installed = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+        );
+        let candidate = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+        );
+
+        preflight_service_install_identity(
+            Ok(installed),
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::Running,
+                true,
+            )),
+            &candidate,
+        )
+        .expect("same canonical identity must allow a binary update");
+    }
+
+    #[test]
+    fn service_install_identity_rejects_proxy_port_change() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-install-port-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_home = root.join("client");
+        let installed = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+        );
+        let candidate = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            4321,
+            &helper_home,
+            &client_home,
+        );
+
+        let error = preflight_service_install_identity(
+            Ok(installed),
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::Running,
+                true,
+            )),
+            &candidate,
+        )
+        .expect_err("changing the installed proxy port must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("proxy_target=http://127.0.0.1:3211"));
+        assert!(message.contains("proxy_target=http://127.0.0.1:4321"));
+        assert!(message.contains("codex-helper service uninstall"));
+        assert!(message.contains("No service files were changed"));
+    }
+
+    #[test]
+    fn service_install_identity_rejects_service_change() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-install-kind-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_home = root.join("client");
+        let installed = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+        );
+        let candidate = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Claude,
+            3211,
+            &helper_home,
+            &client_home,
+        );
+
+        let error = preflight_service_install_identity(
+            Ok(installed),
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::Running,
+                true,
+            )),
+            &candidate,
+        )
+        .expect_err("changing the installed service kind must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("service=codex"));
+        assert!(message.contains("service=claude"));
+        assert!(message.contains("codex-helper service uninstall"));
+    }
+
+    #[test]
+    fn service_install_identity_rejects_client_home_change() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-install-client-home-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let installed_client_home = root.join("client-old");
+        let requested_client_home = root.join("client-new");
+        let installed = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &installed_client_home,
+        );
+        let candidate = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &requested_client_home,
+        );
+
+        let error = preflight_service_install_identity(
+            Ok(installed),
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::Running,
+                true,
+            )),
+            &candidate,
+        )
+        .expect_err("changing the installed client home must fail closed");
+        let message = error.to_string();
+        assert!(message.contains(installed_client_home.to_string_lossy().as_ref()));
+        assert!(message.contains(requested_client_home.to_string_lossy().as_ref()));
+        assert!(message.contains("codex-helper service uninstall"));
+    }
+
+    #[test]
+    fn service_install_identity_allows_only_proven_first_install_without_a_receipt() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-install-repair-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let candidate = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &root.join("helper"),
+            &root.join("client"),
+        );
+
+        preflight_service_install_identity(
+            Err(ServiceReceiptError::Missing),
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::NotInstalled,
+                false,
+            )),
+            &candidate,
+        )
+        .expect("a missing receipt with a proven absent registration is a first install");
+
+        let registered = preflight_service_install_identity(
+            Err(ServiceReceiptError::Missing),
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::Running,
+                true,
+            )),
+            &candidate,
+        )
+        .expect_err("a platform registration without a receipt must fail closed");
+        assert!(registered.to_string().contains("registration"));
+        assert!(registered.to_string().contains("version that created"));
+
+        let unknown = preflight_service_install_identity(
+            Err(ServiceReceiptError::Missing),
+            Err(CliError::Other(
+                "injected platform registration query failure".to_string(),
+            )),
+            &candidate,
+        )
+        .expect_err("an unverified platform registration state must fail closed");
+        assert!(unknown.to_string().contains("query failure"));
+
+        let legacy = preflight_service_install_identity(
+            Err(ServiceReceiptError::LegacySchema {
+                schema_version: Some(0),
+            }),
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::NotInstalled,
+                false,
+            )),
+            &candidate,
+        )
+        .expect_err("legacy receipts require an explicit uninstall or migration");
+        assert!(legacy.to_string().contains("legacy schema"));
+    }
+
+    #[test]
+    fn service_install_identity_allows_only_explicit_windows_legacy_migration() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-windows-legacy-migration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let candidate = ServiceReceipt::new(
+            codex_helper_core::config::ServiceKind::Codex,
+            root.join("helper"),
+            root.join("client"),
+            codex_helper_core::proxy::local_admin_base_url_for_proxy_port(3211),
+            ServicePlatformBackend::WindowsScheduledTask,
+            codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        )
+        .expect("build Windows migration receipt");
+        let mut legacy = test_install_platform_status(ServiceRuntimeState::Running, true);
+        legacy.platform = ServicePlatform::Windows;
+        legacy.legacy_installation = true;
+
+        let preflight = preflight_service_install_identity(
+            Err(ServiceReceiptError::Missing),
+            Ok(legacy.clone()),
+            &candidate,
+        )
+        .expect("an explicitly identified Windows legacy installation must reach migration");
+        assert!(preflight.installed_receipt.is_none());
+        assert_eq!(preflight.platform_state, ServiceRuntimeState::Running);
+
+        legacy.legacy_installation = false;
+        let error = preflight_service_install_identity(
+            Err(ServiceReceiptError::Missing),
+            Ok(legacy),
+            &candidate,
+        )
+        .expect_err("a current Windows registration without a receipt must still fail closed");
+        assert!(error.to_string().contains("registration"));
+    }
+
+    #[test]
+    fn service_uninstall_requires_a_current_receipt_even_when_runtime_is_kept() {
+        let future = validate_service_receipt_for_uninstall(
+            Err(ServiceReceiptError::UnsupportedSchema { schema_version: 99 }),
+            ServicePlatformBackend::current(),
+        )
+        .expect_err("a future receipt must not be deleted by uninstall");
+        assert!(future.to_string().contains("newer unsupported schema"));
+        assert!(future.to_string().contains("No service registration"));
+
+        let receipt = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+        );
+        let foreign_backend = match receipt.platform_backend() {
+            ServicePlatformBackend::WindowsScheduledTask => {
+                ServicePlatformBackend::MacosLaunchAgent
+            }
+            ServicePlatformBackend::MacosLaunchAgent | ServicePlatformBackend::LinuxSystemdUser => {
+                ServicePlatformBackend::WindowsScheduledTask
+            }
+        };
+        let mismatch = validate_service_receipt_for_uninstall(Ok(receipt), Some(foreign_backend))
+            .expect_err("a receipt for another platform backend must remain untouched");
+        assert!(mismatch.to_string().contains("refusing to uninstall"));
+    }
+
+    #[test]
+    fn service_install_transaction_rechecks_platform_registration_with_missing_receipt() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-install-transaction-preflight-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_home = root.join("client");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&client_home).expect("create client home");
+        let options = ServiceInstallOptions {
+            service_name: "codex",
+            host: IpAddr::from([127, 0, 0, 1]),
+            port: 3211,
+            start: true,
+            helper_home,
+            client_home,
+            install_generation:
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        };
+
+        let error = begin_service_receipt_transaction_with_status(&options, || {
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::Stopped,
+                true,
+            ))
+        })
+        .expect_err("the transaction-local registration check must reject a missing receipt");
+        assert!(error.to_string().contains("registration"));
+
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn explicit_service_stop_restores_before_stop_while_restart_preserves_switch() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        run_service_stop_with_switch_policy(
+            ServiceStopSwitchPolicy::RestoreMatchingCodexSwitch,
+            || {
+                events.borrow_mut().push("restore");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("stop");
+                Ok(())
+            },
+        )
+        .expect("explicit stop");
+        assert_eq!(&*events.borrow(), &["restore", "stop"]);
+
+        events.borrow_mut().clear();
+        run_service_stop_with_switch_policy(
+            ServiceStopSwitchPolicy::PreserveForRestart,
+            || -> CliResult<()> { unreachable!("restart must not restore the client switch") },
+            || {
+                events.borrow_mut().push("stop");
+                Ok(())
+            },
+        )
+        .expect("restart stop phase");
+        assert_eq!(&*events.borrow(), &["stop"]);
+    }
+
+    #[test]
+    fn no_start_replacement_restores_only_when_it_will_stop_a_running_runtime() {
+        let receipt = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+        );
+        let calls = std::cell::Cell::new(0);
+        let preparation = reconcile_service_switch_before_no_start_install(
+            false,
+            ServiceRuntimeState::Running,
+            Some(&receipt),
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(
+                    codex_helper_core::codex_switch::CodexSwitchTargetRestoreOutcome::Unchanged(
+                        test_switch_status(
+                            codex_helper_core::codex_switch::CodexSwitchPhase::Off,
+                            false,
+                            false,
+                            None,
+                        ),
+                    ),
+                )
+            },
+        )
+        .expect("prepare a no-start replacement");
+        assert_eq!(preparation, ServiceSwitchUninstallPreparation::Unchanged);
+        assert_eq!(calls.get(), 1);
+
+        for (start, state) in [
+            (true, ServiceRuntimeState::Running),
+            (false, ServiceRuntimeState::Stopped),
+        ] {
+            let preparation = reconcile_service_switch_before_no_start_install(
+                start,
+                state,
+                Some(&receipt),
+                |_, _| -> Result<_, codex_helper_core::codex_switch::CodexSwitchError> {
+                    unreachable!("this install does not make a running runtime unavailable")
+                },
+            )
+            .expect("skip switch reconciliation");
+            assert_eq!(
+                preparation,
+                ServiceSwitchUninstallPreparation::NotApplicable
+            );
+        }
+    }
+
+    fn test_install_platform_status(state: ServiceRuntimeState, installed: bool) -> ServiceStatus {
+        ServiceStatus {
+            platform: ServicePlatform::current(),
+            service_name: "test-service".to_string(),
+            state,
+            installed,
+            legacy_installation: false,
+            autostart: installed,
+            service_definition: None,
+            log_directory: PathBuf::from("/tmp/test-service-logs"),
+            detail: None,
+            receipt_state: ServiceReceiptState::Absent,
+            credential_context: ServiceCredentialContext::Unverified,
+            runtime_identity_verified: false,
+            install_generation: None,
+        }
+    }
+
+    fn test_switch_status(
+        phase: codex_helper_core::codex_switch::CodexSwitchPhase,
+        enabled: bool,
+        managed: bool,
+        base_url: Option<&str>,
+    ) -> codex_helper_core::codex_switch::CodexSwitchStatus {
+        codex_helper_core::codex_switch::CodexSwitchStatus {
+            phase,
+            enabled,
+            managed,
+            base_url: base_url.map(str::to_string),
+            client_patch: None,
+            recovery_reason: None,
+            config_path: PathBuf::from("/tmp/codex/config.toml"),
+            state_path: PathBuf::from("/tmp/helper/state/codex-switch.json"),
+        }
+    }
+
+    #[test]
+    fn service_receipt_admin_target_has_one_verified_inverse() {
+        let receipt = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+        );
+        assert_eq!(
+            local_proxy_target_from_service_receipt(&receipt)
+                .expect("derive proxy target")
+                .as_str(),
+            "http://127.0.0.1:3211"
+        );
+
+        let ambiguous = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            "http://127.0.0.1:63536",
+        );
+        assert!(
+            local_proxy_target_from_service_receipt(&ambiguous)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn matching_service_switch_is_restored_before_uninstall() {
+        let receipt = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+        );
+        let preparation =
+            reconcile_service_switch_before_uninstall(&receipt, true, |client_home, target| {
+                assert_eq!(client_home, receipt.client_home());
+                assert_eq!(target.as_str(), "http://127.0.0.1:3211");
+                Ok(
+                    codex_helper_core::codex_switch::CodexSwitchTargetRestoreOutcome::Restored(
+                        codex_helper_core::codex_switch::CodexSwitchOutcome {
+                            change: codex_helper_core::codex_switch::CodexSwitchChange::Removed,
+                            status: test_switch_status(
+                                codex_helper_core::codex_switch::CodexSwitchPhase::Off,
+                                false,
+                                false,
+                                None,
+                            ),
+                            restore_lease: None,
+                        },
+                    ),
+                )
+            })
+            .expect("prepare uninstall");
+
+        assert_eq!(preparation, ServiceSwitchUninstallPreparation::Restored);
+    }
+
+    #[test]
+    fn different_local_or_remote_switch_target_is_not_modified() {
+        let receipt = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+        );
+        for target in ["http://127.0.0.1:4321", "https://relay.example/v1"] {
+            let preparation = reconcile_service_switch_before_uninstall(&receipt, true, |_, _| {
+                Ok(
+                    codex_helper_core::codex_switch::CodexSwitchTargetRestoreOutcome::Unchanged(
+                        test_switch_status(
+                            codex_helper_core::codex_switch::CodexSwitchPhase::Applied,
+                            true,
+                            true,
+                            Some(target),
+                        ),
+                    ),
+                )
+            })
+            .expect("different target does not block uninstall");
+
+            let ServiceSwitchUninstallPreparation::Warning(warning) = preparation else {
+                panic!("different target must produce an actionable warning")
+            };
+            assert!(warning.contains(target));
+            assert!(warning.contains("was not modified"));
+        }
+    }
+
+    #[test]
+    fn active_matching_foreign_or_edited_switch_fails_closed() {
+        let receipt = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+        );
+        for active_target in [
+            "http://127.0.0.1:3211",
+            "http://localhost:3211",
+            "http://[::1]:3211",
+        ] {
+            for managed in [false, true] {
+                let error = reconcile_service_switch_before_uninstall(&receipt, true, |_, _| {
+                    Ok(
+                        codex_helper_core::codex_switch::CodexSwitchTargetRestoreOutcome::Unchanged(
+                            test_switch_status(
+                                codex_helper_core::codex_switch::CodexSwitchPhase::RecoveryRequired,
+                                true,
+                                managed,
+                                Some(active_target),
+                            ),
+                        ),
+                    )
+                })
+                .expect_err("active matching unsafe switch must block uninstall");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("still selects the service target")
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains("No client or service files were changed")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matching_switch_restore_failure_prevents_platform_mutation() {
+        let receipt = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+        );
+        let platform_called = std::cell::Cell::new(false);
+        let error = run_service_uninstall_with_switch_preflight(
+            true,
+            || {
+                reconcile_service_switch_before_uninstall(&receipt, true, |_, _| {
+                    Err(
+                        codex_helper_core::codex_switch::CodexSwitchError::RecoveryRequired {
+                            reason: "injected matching switch CAS failure".to_string(),
+                        },
+                    )
+                })
+                .map(|_| ())
+            },
+            |_| {
+                platform_called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("switch failure must fail closed");
+
+        assert!(!platform_called.get());
+        assert!(error.to_string().contains("switch CAS failure"));
+        assert!(
+            error
+                .to_string()
+                .contains("registration, receipt, and runtime were left in place")
+        );
+    }
+
+    #[test]
+    fn platform_rollback_keeps_a_successfully_restored_switch_off() {
+        let switch_enabled = std::cell::Cell::new(true);
+        let mut backend = FakeServiceUninstallBackend {
+            fail_at: Some("remove_definition"),
+            ..FakeServiceUninstallBackend::default()
+        };
+
+        let error = run_service_uninstall_with_switch_preflight(
+            true,
+            || {
+                switch_enabled.set(false);
+                Ok(())
+            },
+            |_| run_service_uninstall_transaction(&mut backend, true),
+        )
+        .expect_err("platform uninstall failure must be reported");
+
+        assert!(!switch_enabled.get());
+        assert!(backend.runtime_running);
+        assert!(backend.enabled);
+        assert_eq!(backend.definition, Some(b"original-definition".as_slice()));
+        assert_eq!(backend.receipt, Some(b"original-receipt".as_slice()));
+        assert!(error.to_string().contains("were restored"));
+    }
+
+    #[test]
+    fn keep_running_and_claude_uninstall_never_touch_codex_switch() {
+        let codex = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            "http://127.0.0.1:4211",
+        );
+        let claude = test_service_receipt(
+            codex_helper_core::config::ServiceKind::Claude,
+            "http://127.0.0.1:4210",
+        );
+        for (receipt, stop_first) in [(&codex, false), (&claude, true)] {
+            let called = std::cell::Cell::new(false);
+            let preparation =
+                reconcile_service_switch_before_uninstall(receipt, stop_first, |_, _| {
+                    called.set(true);
+                    unreachable!("Codex switch must not be called")
+                })
+                .expect("skip Codex switch reconciliation");
+            assert_eq!(
+                preparation,
+                ServiceSwitchUninstallPreparation::NotApplicable
+            );
+            assert!(!called.get());
+        }
+    }
+
     fn test_service_status(state: ServiceRuntimeState) -> ServiceStatus {
         ServiceStatus {
             platform: ServicePlatform::current(),
             service_name: "test-service".to_string(),
             state,
             installed: true,
+            legacy_installation: false,
             autostart: true,
             service_definition: None,
             log_directory: PathBuf::from("/tmp/test-service-logs"),
@@ -2963,6 +6370,78 @@ mod tests {
         assert!(document.contains(options.install_generation.as_str()));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stop_is_idempotent_for_an_unloaded_launch_agent() {
+        let bootout_called = std::cell::Cell::new(false);
+        macos::stop_launch_agent_with(
+            || {
+                Err(CliError::Other(
+                    "launchctl failed: Could not find service".to_string(),
+                ))
+            },
+            || {
+                bootout_called.set(true);
+                Ok(String::new())
+            },
+            || -> CliResult<String> { unreachable!("an unloaded job needs no verification") },
+        )
+        .expect("an unloaded LaunchAgent is already stopped");
+        assert!(!bootout_called.get());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stop_surfaces_a_real_launchctl_query_failure() {
+        let error = macos::stop_launch_agent_with(
+            || {
+                Err(CliError::Other(
+                    "launchctl failed: Input/output error".to_string(),
+                ))
+            },
+            || -> CliResult<String> {
+                unreachable!("query failure must prevent launchctl bootout")
+            },
+            || -> CliResult<String> {
+                unreachable!("query failure must prevent unload verification")
+            },
+        )
+        .expect_err("a real launchctl query failure must not look like an absent job");
+        assert!(error.to_string().contains("query LaunchAgent state"));
+        assert!(error.to_string().contains("Input/output error"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stop_accepts_a_job_that_disappears_after_the_query() {
+        macos::stop_launch_agent_with(
+            || Ok("state = running".to_string()),
+            || {
+                Err(CliError::Other(
+                    "launchctl failed: No such process".to_string(),
+                ))
+            },
+            || {
+                Err(CliError::Other(
+                    "launchctl failed: Could not find service".to_string(),
+                ))
+            },
+        )
+        .expect("a concurrently unloaded LaunchAgent is already stopped");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stop_requires_launchd_to_confirm_the_job_is_unloaded() {
+        let error = macos::stop_launch_agent_with(
+            || Ok("state = running".to_string()),
+            || Ok(String::new()),
+            || Ok("state = running".to_string()),
+        )
+        .expect_err("a still-loaded job must not be reported as stopped");
+        assert!(error.to_string().contains("still loaded"));
+    }
+
     #[test]
     fn systemd_unit_preserves_helper_home_and_runs_as_user() {
         let options = ServiceInstallOptions {
@@ -2988,6 +6467,15 @@ mod tests {
                 .contains(codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR)
         );
         assert!(document.contains(options.install_generation.as_str()));
+        let (unit, remaining) = document
+            .split_once("\n\n[Service]\n")
+            .expect("separate Unit and Service sections");
+        let (service, _) = remaining
+            .split_once("\n\n[Install]\n")
+            .expect("separate Service and Install sections");
+        assert!(unit.contains("StartLimitIntervalSec=300"));
+        assert!(unit.contains("StartLimitBurst=10"));
+        assert!(!service.contains("StartLimit"));
     }
 
     #[test]
@@ -3122,9 +6610,28 @@ mod tests {
         let record = WindowsTaskRecord {
             task_name: task_name.clone(),
             task_path: "\\".to_string(),
+            version: "1.2".to_string(),
+            description: "Resident codex-helper relay for the current user.".to_string(),
             owner_sid: sid.to_string(),
+            principal_count: 1,
+            principal_id: "Author".to_string(),
+            actions_context: "Author".to_string(),
             state: 3,
             enabled: true,
+            multiple_instances: "IgnoreNew".to_string(),
+            disallow_start_if_on_batteries: false,
+            stop_if_going_on_batteries: false,
+            allow_hard_terminate: true,
+            start_when_available: true,
+            run_only_if_network_available: false,
+            allow_start_on_demand: true,
+            hidden: false,
+            run_only_if_idle: false,
+            wake_to_run: false,
+            execution_time_limit: "PT0S".to_string(),
+            priority: 7,
+            restart_interval: "PT10S".to_string(),
+            restart_count: 10,
             action_count: 1,
             execute: executable.display().to_string(),
             arguments,
@@ -3138,27 +6645,226 @@ mod tests {
         };
 
         assert!(verify_windows_task_record(&record, &task_name, sid, executable, &options).is_ok());
+        assert!(
+            verify_existing_windows_task_for_replacement(
+                &record, &task_name, sid, executable, None,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_existing_windows_task_for_replacement(
+                &record,
+                &task_name,
+                sid,
+                executable,
+                Some(&options),
+            )
+            .is_ok()
+        );
         let mut foreign = record.clone();
         foreign.owner_sid = "S-1-5-21-100-200-300-999".to_string();
         assert!(!windows_task_owner_matches(&foreign, sid));
         assert!(
             verify_windows_task_record(&foreign, &task_name, sid, executable, &options).is_err()
         );
-        let mut changed_action = record;
+        let mut changed_action = record.clone();
         changed_action.execute = "C:/Windows/System32/cmd.exe".to_string();
         assert!(
             verify_windows_task_record(&changed_action, &task_name, sid, executable, &options)
                 .is_err()
         );
+
+        let mut changed_settings = record.clone();
+        changed_settings.hidden = true;
+        assert!(
+            verify_windows_task_record(&changed_settings, &task_name, sid, executable, &options,)
+                .is_err()
+        );
+
+        let mut changed_context = record.clone();
+        changed_context.actions_context = "OtherPrincipal".to_string();
+        assert!(
+            verify_windows_task_record(&changed_context, &task_name, sid, executable, &options,)
+                .is_err()
+        );
+
+        let mut replacement_options = options.clone();
+        replacement_options.install_generation =
+            codex_helper_core::service_target::ServiceInstallGeneration::generate();
+        assert!(
+            verify_existing_windows_task_for_replacement(
+                &record,
+                &task_name,
+                sid,
+                executable,
+                Some(&replacement_options),
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn windows_service_probe_only_classifies_error_1060_as_missing() {
+    fn legacy_fixed_task_requires_the_known_codex_helper_definition() {
+        let sid = "S-1-5-21-100-200-300-400";
+        let executable = Path::new("C:/Users/test/.cargo/bin/codex-helper.exe");
+        let options = ServiceInstallOptions {
+            service_name: "codex",
+            host: IpAddr::from([127, 0, 0, 1]),
+            port: 3211,
+            start: true,
+            helper_home: PathBuf::from("C:/Users/test/.codex-helper"),
+            client_home: PathBuf::from("C:/Users/test/.codex"),
+            install_generation:
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        };
+        let mut legacy_arguments = service_task_arguments(&options);
+        legacy_arguments.truncate(12);
+        let record = WindowsTaskRecord {
+            task_name: WINDOWS_TASK_BASENAME.to_string(),
+            task_path: "\\".to_string(),
+            version: "1.2".to_string(),
+            description: "Resident codex-helper relay for the current user.".to_string(),
+            owner_sid: sid.to_string(),
+            principal_count: 1,
+            principal_id: "Author".to_string(),
+            actions_context: "Author".to_string(),
+            state: 3,
+            enabled: true,
+            multiple_instances: "IgnoreNew".to_string(),
+            disallow_start_if_on_batteries: false,
+            stop_if_going_on_batteries: false,
+            allow_hard_terminate: true,
+            start_when_available: true,
+            run_only_if_network_available: false,
+            allow_start_on_demand: true,
+            hidden: false,
+            run_only_if_idle: false,
+            wake_to_run: false,
+            execution_time_limit: "PT0S".to_string(),
+            priority: 7,
+            restart_interval: "PT10S".to_string(),
+            restart_count: 10,
+            action_count: 1,
+            execute: executable.display().to_string(),
+            arguments: legacy_arguments
+                .iter()
+                .map(|argument| quote_windows_argument(argument.to_string_lossy().as_ref()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            working_directory: "C:/Users/test/.cargo/bin".to_string(),
+            logon_type: "InteractiveToken".to_string(),
+            run_level: "LeastPrivilege".to_string(),
+            trigger_count: 1,
+            trigger_enabled: true,
+            trigger_type: "MSFT_TaskLogonTrigger".to_string(),
+            trigger_user_sid: sid.to_string(),
+        };
+
+        let invocation = verify_legacy_fixed_windows_task_record(&record, sid, executable).unwrap();
+        assert!(invocation.matches_install(&options));
+        let mut different_service = options.clone();
+        different_service.service_name = "claude";
+        assert!(!invocation.matches_install(&different_service));
+        assert!(invocation.conflicts_with_install(&different_service));
+
+        let mut arbitrary_action = record.clone();
+        arbitrary_action.arguments = "service task-run --service-name codex --host 127.0.0.1 --port 3211 --helper-home C:/Users/test/.codex-helper --client-home C:/Users/test/.codex --exec calc.exe".to_string();
+        assert!(
+            verify_legacy_fixed_windows_task_record(&arbitrary_action, sid, executable).is_err()
+        );
+
+        let mut elevated = record;
+        elevated.run_level = "Highest".to_string();
+        assert!(verify_legacy_fixed_windows_task_record(&elevated, sid, executable).is_err());
+    }
+
+    #[test]
+    fn legacy_scm_requires_local_system_and_the_known_dispatcher_command() {
+        let executable = Path::new("C:/Program Files/codex-helper/codex-helper.exe");
+        let arguments = [
+            executable.to_string_lossy().into_owned(),
+            "service".to_string(),
+            "run".to_string(),
+            "--service-name".to_string(),
+            "codex".to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "3211".to_string(),
+            "--helper-home".to_string(),
+            "C:/Users/test/.codex-helper".to_string(),
+        ];
+        let definition = LegacyWindowsScmDefinition {
+            own_process: true,
+            start_type: 2,
+            error_control: 1,
+            dependencies: Vec::new(),
+            account_name: Some("LocalSystem".to_string()),
+            display_name: "codex-helper relay".to_string(),
+            load_order_group: None,
+            command_line: arguments
+                .iter()
+                .map(|argument| quote_windows_argument(argument))
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+
+        let invocation = verify_legacy_windows_scm_definition(&definition, executable).unwrap();
+        let options = ServiceInstallOptions {
+            service_name: "codex",
+            host: IpAddr::from([127, 0, 0, 1]),
+            port: 3211,
+            start: true,
+            helper_home: PathBuf::from("C:/Users/test/.codex-helper"),
+            client_home: PathBuf::from("C:/Users/test/.codex"),
+            install_generation:
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        };
+        assert!(invocation.matches_install(&options));
+
+        let mut foreign_account = definition.clone();
+        foreign_account.account_name = Some("DOMAIN\\operator".to_string());
+        assert!(verify_legacy_windows_scm_definition(&foreign_account, executable).is_err());
+
+        let mut changed_startup = definition.clone();
+        changed_startup.start_type = 3;
+        assert!(verify_legacy_windows_scm_definition(&changed_startup, executable).is_err());
+
+        let mut changed_dependencies = definition.clone();
+        changed_dependencies
+            .dependencies
+            .push("foreign".to_string());
+        assert!(verify_legacy_windows_scm_definition(&changed_dependencies, executable).is_err());
+
+        let mut foreign_command = definition;
+        foreign_command.command_line = quote_windows_argument("C:/Windows/System32/cmd.exe");
+        assert!(verify_legacy_windows_scm_definition(&foreign_command, executable).is_err());
+    }
+
+    #[test]
+    fn windows_command_line_parser_rejects_noncanonical_or_unterminated_input() {
+        assert_eq!(
+            parse_canonical_windows_command_line(
+                r#""C:/Program Files/codex-helper.exe" service run"#
+            )
+            .unwrap(),
+            ["C:/Program Files/codex-helper.exe", "service", "run"]
+        );
+        assert!(parse_canonical_windows_command_line("service  run").is_err());
+        assert!(parse_canonical_windows_command_line(r#""unterminated"#).is_err());
+    }
+
+    #[test]
+    fn windows_service_probe_distinguishes_missing_and_pending_deletion() {
         assert_eq!(
             classify_windows_service_probe_error(Some(1060)),
             WindowsServiceProbeClassification::Missing
         );
-        for raw_os_error in [Some(5), Some(1072), None] {
+        assert_eq!(
+            classify_windows_service_probe_error(Some(1072)),
+            WindowsServiceProbeClassification::MarkedForDelete
+        );
+        for raw_os_error in [Some(5), None] {
             assert_eq!(
                 classify_windows_service_probe_error(raw_os_error),
                 WindowsServiceProbeClassification::Error
@@ -3166,11 +6872,573 @@ mod tests {
         }
     }
 
+    struct FakeServiceUninstallBackend {
+        events: Vec<&'static str>,
+        fail_at: Option<&'static str>,
+        rollback_fails: bool,
+        runtime_running: bool,
+        enabled: bool,
+        definition: Option<&'static [u8]>,
+        receipt: Option<&'static [u8]>,
+    }
+
+    impl Default for FakeServiceUninstallBackend {
+        fn default() -> Self {
+            Self {
+                events: Vec::new(),
+                fail_at: None,
+                rollback_fails: false,
+                runtime_running: true,
+                enabled: true,
+                definition: Some(b"original-definition"),
+                receipt: Some(b"original-receipt"),
+            }
+        }
+    }
+
+    impl FakeServiceUninstallBackend {
+        fn step(&mut self, name: &'static str) -> CliResult<()> {
+            self.events.push(name);
+            if self.fail_at == Some(name) || (name == "rollback" && self.rollback_fails) {
+                Err(CliError::Other(format!("injected {name} failure")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ServiceUninstallTransactionBackend for FakeServiceUninstallBackend {
+        fn stop_and_verify(&mut self) -> CliResult<()> {
+            self.step("stop")?;
+            self.runtime_running = false;
+            Ok(())
+        }
+
+        fn disable_and_verify(&mut self) -> CliResult<()> {
+            self.step("disable")?;
+            self.enabled = false;
+            Ok(())
+        }
+
+        fn remove_definition(&mut self) -> CliResult<()> {
+            self.step("remove_definition")?;
+            self.definition = None;
+            Ok(())
+        }
+
+        fn remove_receipt(&mut self) -> CliResult<()> {
+            self.step("remove_receipt")?;
+            self.receipt = None;
+            Ok(())
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
+            self.step("rollback")?;
+            self.runtime_running = true;
+            self.enabled = true;
+            self.definition = Some(b"original-definition");
+            self.receipt = Some(b"original-receipt");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn service_uninstall_stops_and_disables_before_removing_owned_files() {
+        let mut backend = FakeServiceUninstallBackend::default();
+
+        run_service_uninstall_transaction(&mut backend, true).unwrap();
+
+        assert_eq!(
+            backend.events,
+            ["stop", "disable", "remove_definition", "remove_receipt"]
+        );
+        assert!(!backend.runtime_running);
+        assert!(!backend.enabled);
+        assert!(backend.definition.is_none());
+        assert!(backend.receipt.is_none());
+    }
+
+    #[test]
+    fn service_uninstall_rolls_back_every_failure_before_completion() {
+        for (failure, expected) in [
+            ("stop", vec!["stop", "rollback"]),
+            ("disable", vec!["stop", "disable", "rollback"]),
+            (
+                "remove_definition",
+                vec!["stop", "disable", "remove_definition", "rollback"],
+            ),
+            (
+                "remove_receipt",
+                vec![
+                    "stop",
+                    "disable",
+                    "remove_definition",
+                    "remove_receipt",
+                    "rollback",
+                ],
+            ),
+        ] {
+            let mut backend = FakeServiceUninstallBackend {
+                fail_at: Some(failure),
+                ..FakeServiceUninstallBackend::default()
+            };
+
+            let error = run_service_uninstall_transaction(&mut backend, true).unwrap_err();
+
+            assert_eq!(backend.events, expected, "{failure}");
+            assert!(backend.runtime_running, "{failure}");
+            assert!(backend.enabled, "{failure}");
+            assert_eq!(
+                backend.definition,
+                Some(b"original-definition".as_slice()),
+                "{failure}"
+            );
+            assert_eq!(
+                backend.receipt,
+                Some(b"original-receipt".as_slice()),
+                "{failure}"
+            );
+            assert!(error.to_string().contains("were restored"), "{error}");
+        }
+    }
+
+    #[test]
+    fn service_uninstall_keep_running_skips_stop_but_removes_registration() {
+        let mut backend = FakeServiceUninstallBackend::default();
+
+        run_service_uninstall_transaction(&mut backend, false).unwrap();
+
+        assert_eq!(
+            backend.events,
+            ["disable", "remove_definition", "remove_receipt"]
+        );
+        assert!(backend.runtime_running);
+        assert!(!backend.enabled);
+        assert!(backend.definition.is_none());
+        assert!(backend.receipt.is_none());
+    }
+
+    #[test]
+    fn service_uninstall_reports_rollback_failure_without_claiming_restoration() {
+        let mut backend = FakeServiceUninstallBackend {
+            fail_at: Some("remove_receipt"),
+            rollback_fails: true,
+            ..FakeServiceUninstallBackend::default()
+        };
+
+        let error = run_service_uninstall_transaction(&mut backend, true).unwrap_err();
+
+        assert!(error.to_string().contains("restoring"));
+        assert!(error.to_string().contains("also failed"));
+    }
+
+    struct FakeWindowsUninstallBackend {
+        events: Vec<&'static str>,
+        fail_at: Option<&'static str>,
+        rollback_fails: bool,
+        legacy_commit_unknown: bool,
+        scoped_registered: bool,
+        fixed_registered: bool,
+        legacy_registered: bool,
+        scoped_running: bool,
+        fixed_running: bool,
+        legacy_running: bool,
+        definition_exists: bool,
+        receipt_exists: bool,
+    }
+
+    impl Default for FakeWindowsUninstallBackend {
+        fn default() -> Self {
+            Self {
+                events: Vec::new(),
+                fail_at: None,
+                rollback_fails: false,
+                legacy_commit_unknown: false,
+                scoped_registered: true,
+                fixed_registered: true,
+                legacy_registered: true,
+                scoped_running: true,
+                fixed_running: false,
+                legacy_running: true,
+                definition_exists: true,
+                receipt_exists: true,
+            }
+        }
+    }
+
+    impl FakeWindowsUninstallBackend {
+        fn finish_step(&self, name: &'static str) -> CliResult<()> {
+            if self.fail_at == Some(name) {
+                Err(CliError::Other(format!("injected {name} failure")))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn assert_original_state(&self, failure: &str) {
+            assert!(self.scoped_registered, "{failure}");
+            assert!(self.fixed_registered, "{failure}");
+            assert!(self.legacy_registered, "{failure}");
+            assert!(self.scoped_running, "{failure}");
+            assert!(!self.fixed_running, "{failure}");
+            assert!(self.legacy_running, "{failure}");
+            assert!(self.definition_exists, "{failure}");
+            assert!(self.receipt_exists, "{failure}");
+        }
+    }
+
+    impl WindowsUninstallTransactionBackend for FakeWindowsUninstallBackend {
+        fn stop_and_verify(&mut self) -> CliResult<()> {
+            self.events.push("stop");
+            self.scoped_running = false;
+            self.fixed_running = false;
+            self.legacy_running = false;
+            self.finish_step("stop")
+        }
+
+        fn remove_scoped_task(&mut self) -> CliResult<()> {
+            self.events.push("remove_scoped");
+            self.scoped_registered = false;
+            self.finish_step("remove_scoped")
+        }
+
+        fn remove_fixed_task(&mut self) -> CliResult<()> {
+            self.events.push("remove_fixed");
+            self.fixed_registered = false;
+            self.finish_step("remove_fixed")
+        }
+
+        fn remove_definition(&mut self) -> CliResult<()> {
+            self.events.push("remove_definition");
+            self.definition_exists = false;
+            self.finish_step("remove_definition")
+        }
+
+        fn remove_receipt(&mut self) -> CliResult<()> {
+            self.events.push("remove_receipt");
+            self.receipt_exists = false;
+            self.finish_step("remove_receipt")
+        }
+
+        fn retire_legacy_scm(&mut self) -> CliResult<()> {
+            self.events.push("retire_legacy");
+            if self.fail_at == Some("retire_legacy") {
+                if self.legacy_commit_unknown {
+                    self.legacy_registered = false;
+                }
+                return self.finish_step("retire_legacy");
+            }
+            self.legacy_registered = false;
+            Ok(())
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
+            self.events.push("rollback");
+            if self.rollback_fails {
+                return Err(CliError::Other(
+                    "restore SID-scoped task failed; restore service receipt failed".to_string(),
+                ));
+            }
+            let legacy_commit_unknown = self.legacy_commit_unknown && !self.legacy_registered;
+            self.scoped_registered = true;
+            self.fixed_registered = true;
+            self.scoped_running = true;
+            self.fixed_running = false;
+            self.definition_exists = true;
+            self.receipt_exists = true;
+            if legacy_commit_unknown {
+                return Err(CliError::Other(
+                    "the legacy SCM definition cannot be reconstructed automatically".to_string(),
+                ));
+            }
+            self.legacy_registered = true;
+            self.legacy_running = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn windows_uninstall_commits_legacy_scm_only_after_reversible_resources() {
+        let mut backend = FakeWindowsUninstallBackend::default();
+
+        run_windows_uninstall_transaction(&mut backend, true).unwrap();
+
+        assert_eq!(
+            backend.events,
+            [
+                "stop",
+                "remove_scoped",
+                "remove_fixed",
+                "remove_definition",
+                "remove_receipt",
+                "retire_legacy",
+            ]
+        );
+        assert!(!backend.scoped_registered);
+        assert!(!backend.fixed_registered);
+        assert!(!backend.legacy_registered);
+        assert!(!backend.scoped_running);
+        assert!(!backend.legacy_running);
+        assert!(!backend.definition_exists);
+        assert!(!backend.receipt_exists);
+    }
+
+    #[test]
+    fn windows_uninstall_rolls_back_every_partial_failure() {
+        for (failure, expected) in [
+            ("stop", vec!["stop", "rollback"]),
+            ("remove_scoped", vec!["stop", "remove_scoped", "rollback"]),
+            (
+                "remove_fixed",
+                vec!["stop", "remove_scoped", "remove_fixed", "rollback"],
+            ),
+            (
+                "remove_definition",
+                vec![
+                    "stop",
+                    "remove_scoped",
+                    "remove_fixed",
+                    "remove_definition",
+                    "rollback",
+                ],
+            ),
+            (
+                "remove_receipt",
+                vec![
+                    "stop",
+                    "remove_scoped",
+                    "remove_fixed",
+                    "remove_definition",
+                    "remove_receipt",
+                    "rollback",
+                ],
+            ),
+            (
+                "retire_legacy",
+                vec![
+                    "stop",
+                    "remove_scoped",
+                    "remove_fixed",
+                    "remove_definition",
+                    "remove_receipt",
+                    "retire_legacy",
+                    "rollback",
+                ],
+            ),
+        ] {
+            let mut backend = FakeWindowsUninstallBackend {
+                fail_at: Some(failure),
+                ..FakeWindowsUninstallBackend::default()
+            };
+
+            let error = run_windows_uninstall_transaction(&mut backend, true).unwrap_err();
+
+            assert_eq!(backend.events, expected, "{failure}");
+            backend.assert_original_state(failure);
+            assert!(error.to_string().contains("were restored"), "{error}");
+            assert!(error.to_string().contains(failure), "{error}");
+        }
+    }
+
+    #[test]
+    fn windows_uninstall_keep_running_detaches_each_runtime_without_stopping_it() {
+        let mut backend = FakeWindowsUninstallBackend::default();
+
+        run_windows_uninstall_transaction(&mut backend, false).unwrap();
+
+        assert_eq!(
+            backend.events,
+            [
+                "remove_scoped",
+                "remove_fixed",
+                "remove_definition",
+                "remove_receipt",
+                "retire_legacy",
+            ]
+        );
+        assert!(backend.scoped_running);
+        assert!(!backend.fixed_running);
+        assert!(backend.legacy_running);
+        assert!(!backend.scoped_registered);
+        assert!(!backend.fixed_registered);
+        assert!(!backend.legacy_registered);
+        assert!(!backend.definition_exists);
+        assert!(!backend.receipt_exists);
+    }
+
+    #[test]
+    fn windows_uninstall_keep_running_failure_restores_registration_without_stopping_runtime() {
+        let mut backend = FakeWindowsUninstallBackend {
+            fail_at: Some("remove_receipt"),
+            ..FakeWindowsUninstallBackend::default()
+        };
+
+        let error = run_windows_uninstall_transaction(&mut backend, false).unwrap_err();
+
+        assert_eq!(
+            backend.events,
+            [
+                "remove_scoped",
+                "remove_fixed",
+                "remove_definition",
+                "remove_receipt",
+                "rollback",
+            ]
+        );
+        backend.assert_original_state("keep_running rollback");
+        assert!(error.to_string().contains("were restored"), "{error}");
+    }
+
+    #[test]
+    fn windows_uninstall_rollback_failure_reports_each_recovery_diagnostic() {
+        let mut backend = FakeWindowsUninstallBackend {
+            fail_at: Some("remove_receipt"),
+            rollback_fails: true,
+            ..FakeWindowsUninstallBackend::default()
+        };
+
+        let error = run_windows_uninstall_transaction(&mut backend, true).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("injected remove_receipt failure"),
+            "{message}"
+        );
+        assert!(message.contains("also failed"), "{message}");
+        assert!(
+            message.contains("restore SID-scoped task failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("restore service receipt failed"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn windows_uninstall_unknown_legacy_delete_is_reported_as_partial_installation() {
+        let mut backend = FakeWindowsUninstallBackend {
+            fail_at: Some("retire_legacy"),
+            legacy_commit_unknown: true,
+            ..FakeWindowsUninstallBackend::default()
+        };
+
+        let error = run_windows_uninstall_transaction(&mut backend, true).unwrap_err();
+        let message = error.to_string();
+
+        assert!(backend.scoped_registered);
+        assert!(backend.fixed_registered);
+        assert!(backend.definition_exists);
+        assert!(backend.receipt_exists);
+        assert!(!backend.legacy_registered);
+        assert!(message.contains("cannot be reconstructed"), "{message}");
+        assert!(message.contains("installation is partial"), "{message}");
+        assert!(message.contains("service install"), "{message}");
+        assert!(!message.contains("were restored"), "{message}");
+    }
+
+    #[derive(Default)]
+    struct FakeUnixInstallBackend {
+        events: Vec<&'static str>,
+        fail_at: Option<&'static str>,
+        rollback_fails: bool,
+        readiness: Option<codex_helper_core::credentials::CredentialAggregateReadiness>,
+    }
+
+    impl FakeUnixInstallBackend {
+        fn step(&mut self, name: &'static str) -> CliResult<()> {
+            self.events.push(name);
+            if self.fail_at == Some(name) || (name == "rollback" && self.rollback_fails) {
+                Err(CliError::Other(format!("injected {name} failure")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl UnixInstallTransactionBackend for FakeUnixInstallBackend {
+        fn prepare_replacement(&mut self) -> CliResult<()> {
+            self.step("prepare")
+        }
+
+        fn start_replacement(&mut self) -> CliResult<()> {
+            self.step("start")
+        }
+
+        async fn verify_started_runtime_identity(
+            &mut self,
+        ) -> CliResult<codex_helper_core::credentials::CredentialAggregateReadiness> {
+            self.step("verify_identity")?;
+            Ok(self
+                .readiness
+                .unwrap_or(codex_helper_core::credentials::CredentialAggregateReadiness::Ready))
+        }
+
+        fn rollback(&mut self) -> CliResult<()> {
+            self.step("rollback")
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_install_rolls_back_start_and_runtime_identity_failures() {
+        for failure in ["start", "verify_identity"] {
+            let mut backend = FakeUnixInstallBackend {
+                fail_at: Some(failure),
+                ..FakeUnixInstallBackend::default()
+            };
+
+            let error = run_unix_install_transaction(&mut backend, true)
+                .await
+                .unwrap_err();
+
+            assert_eq!(backend.events.last(), Some(&"rollback"), "{failure}");
+            assert!(error.to_string().contains("restored"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_install_commits_every_signed_runtime_readiness_state() {
+        use codex_helper_core::credentials::CredentialAggregateReadiness;
+
+        for readiness in [
+            CredentialAggregateReadiness::Ready,
+            CredentialAggregateReadiness::Degraded,
+            CredentialAggregateReadiness::Blocked,
+        ] {
+            let mut backend = FakeUnixInstallBackend {
+                readiness: Some(readiness),
+                ..FakeUnixInstallBackend::default()
+            };
+
+            let actual = run_unix_install_transaction(&mut backend, true)
+                .await
+                .unwrap();
+
+            assert_eq!(actual, Some(readiness));
+            assert_eq!(backend.events, ["prepare", "start", "verify_identity"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_install_without_start_commits_without_runtime_probe() {
+        let mut backend = FakeUnixInstallBackend::default();
+
+        let readiness = run_unix_install_transaction(&mut backend, false)
+            .await
+            .unwrap();
+
+        assert_eq!(readiness, None);
+        assert_eq!(backend.events, ["prepare"]);
+    }
+
     #[derive(Default)]
     struct FakeWindowsInstallBackend {
         events: Vec<&'static str>,
         fail_at: Option<&'static str>,
         rollback_fails: bool,
+        rollback_attempted: bool,
+        preserve_before_rollback: bool,
+        readiness: Option<codex_helper_core::credentials::CredentialAggregateReadiness>,
     }
 
     impl FakeWindowsInstallBackend {
@@ -3187,6 +7455,14 @@ mod tests {
     impl WindowsInstallTransactionBackend for FakeWindowsInstallBackend {
         fn preflight(&mut self) -> CliResult<()> {
             self.step("preflight")
+        }
+
+        fn stop_existing_scoped_task(&mut self) -> CliResult<()> {
+            self.step("stop")
+        }
+
+        fn stop_legacy_runtimes(&mut self) -> CliResult<()> {
+            self.step("stop_legacy")
         }
 
         fn register_scoped_task(&mut self) -> CliResult<()> {
@@ -3214,85 +7490,203 @@ mod tests {
         }
 
         fn rollback(&mut self) -> CliResult<()> {
+            self.rollback_attempted = true;
             self.step("rollback")
+        }
+
+        fn rollback_preserved_replacement(&self) -> bool {
+            self.preserve_before_rollback || (self.rollback_attempted && self.rollback_fails)
         }
 
         fn start_scoped_task(&mut self) -> CliResult<()> {
             self.step("start")
         }
+
+        async fn verify_started_runtime_identity(
+            &mut self,
+        ) -> CliResult<codex_helper_core::credentials::CredentialAggregateReadiness> {
+            self.step("verify_runtime")?;
+            Ok(self
+                .readiness
+                .unwrap_or(codex_helper_core::credentials::CredentialAggregateReadiness::Ready))
+        }
     }
 
-    #[test]
-    fn windows_migration_verifies_new_task_before_retiring_legacy_installations() {
+    #[tokio::test]
+    async fn windows_migration_verifies_runtime_before_retiring_legacy_installations() {
         let mut backend = FakeWindowsInstallBackend::default();
 
-        run_windows_install_transaction(&mut backend, true).unwrap();
+        run_windows_install_transaction(&mut backend, true)
+            .await
+            .unwrap();
 
         assert_eq!(
             backend.events,
             [
                 "preflight",
+                "stop",
+                "stop_legacy",
                 "register",
                 "verify",
                 "publish_receipt",
+                "start",
+                "verify_runtime",
                 "retire_fixed",
                 "retire_scm",
-                "start",
             ]
         );
     }
 
-    #[test]
-    fn windows_migration_rolls_back_every_failure_after_preflight() {
+    #[tokio::test]
+    async fn windows_migration_commits_a_runtime_with_blocked_credentials() {
+        use codex_helper_core::credentials::CredentialAggregateReadiness;
+
+        let mut backend = FakeWindowsInstallBackend {
+            readiness: Some(CredentialAggregateReadiness::Blocked),
+            ..FakeWindowsInstallBackend::default()
+        };
+
+        let readiness = run_windows_install_transaction(&mut backend, true)
+            .await
+            .unwrap();
+
+        assert_eq!(readiness, Some(CredentialAggregateReadiness::Blocked));
+        assert_eq!(backend.events.last(), Some(&"retire_scm"));
+        assert!(!backend.events.contains(&"rollback"));
+        assert!(!backend.events.contains(&"rollback_receipt"));
+    }
+
+    #[tokio::test]
+    async fn windows_migration_preserves_replacement_when_scm_delete_commit_is_unknown() {
+        let mut backend = FakeWindowsInstallBackend {
+            fail_at: Some("retire_scm"),
+            preserve_before_rollback: true,
+            ..FakeWindowsInstallBackend::default()
+        };
+
+        let error = run_windows_install_transaction(&mut backend, true)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("preserved"), "{error}");
+        assert_eq!(backend.events.last(), Some(&"retire_scm"));
+        assert!(!backend.events.contains(&"rollback"));
+        assert!(!backend.events.contains(&"rollback_receipt"));
+    }
+
+    #[tokio::test]
+    async fn windows_migration_rolls_back_every_failure_after_preflight() {
         for (failure, expected) in [
             (
+                "stop",
+                vec!["preflight", "stop", "rollback", "rollback_receipt"],
+            ),
+            (
+                "stop_legacy",
+                vec![
+                    "preflight",
+                    "stop",
+                    "stop_legacy",
+                    "rollback",
+                    "rollback_receipt",
+                ],
+            ),
+            (
                 "register",
-                vec!["preflight", "register", "rollback_receipt", "rollback"],
+                vec![
+                    "preflight",
+                    "stop",
+                    "stop_legacy",
+                    "register",
+                    "rollback",
+                    "rollback_receipt",
+                ],
             ),
             (
                 "verify",
                 vec![
                     "preflight",
+                    "stop",
+                    "stop_legacy",
                     "register",
                     "verify",
-                    "rollback_receipt",
                     "rollback",
+                    "rollback_receipt",
                 ],
             ),
             (
                 "publish_receipt",
                 vec![
                     "preflight",
+                    "stop",
+                    "stop_legacy",
                     "register",
                     "verify",
                     "publish_receipt",
-                    "rollback_receipt",
                     "rollback",
+                    "rollback_receipt",
+                ],
+            ),
+            (
+                "start",
+                vec![
+                    "preflight",
+                    "stop",
+                    "stop_legacy",
+                    "register",
+                    "verify",
+                    "publish_receipt",
+                    "start",
+                    "rollback",
+                    "rollback_receipt",
+                ],
+            ),
+            (
+                "verify_runtime",
+                vec![
+                    "preflight",
+                    "stop",
+                    "stop_legacy",
+                    "register",
+                    "verify",
+                    "publish_receipt",
+                    "start",
+                    "verify_runtime",
+                    "rollback",
+                    "rollback_receipt",
                 ],
             ),
             (
                 "retire_fixed",
                 vec![
                     "preflight",
+                    "stop",
+                    "stop_legacy",
                     "register",
                     "verify",
                     "publish_receipt",
+                    "start",
+                    "verify_runtime",
                     "retire_fixed",
-                    "rollback_receipt",
                     "rollback",
+                    "rollback_receipt",
                 ],
             ),
             (
                 "retire_scm",
                 vec![
                     "preflight",
+                    "stop",
+                    "stop_legacy",
                     "register",
                     "verify",
                     "publish_receipt",
+                    "start",
+                    "verify_runtime",
                     "retire_fixed",
                     "retire_scm",
-                    "rollback_receipt",
                     "rollback",
+                    "rollback_receipt",
                 ],
             ),
         ] {
@@ -3301,50 +7695,97 @@ mod tests {
                 ..FakeWindowsInstallBackend::default()
             };
 
-            let error = run_windows_install_transaction(&mut backend, true).unwrap_err();
+            let error = run_windows_install_transaction(&mut backend, true)
+                .await
+                .unwrap_err();
 
             assert_eq!(backend.events, expected, "{failure}");
             assert!(error.to_string().contains("restored"), "{error}");
         }
     }
 
-    #[test]
-    fn windows_migration_preflight_failure_never_registers_or_retires() {
+    #[tokio::test]
+    async fn windows_migration_preflight_failure_never_registers_or_retires() {
         let mut backend = FakeWindowsInstallBackend {
             fail_at: Some("preflight"),
             ..FakeWindowsInstallBackend::default()
         };
 
-        assert!(run_windows_install_transaction(&mut backend, true).is_err());
+        assert!(
+            run_windows_install_transaction(&mut backend, true)
+                .await
+                .is_err()
+        );
         assert_eq!(backend.events, ["preflight"]);
     }
 
-    #[test]
-    fn windows_migration_reports_rollback_failure_and_keeps_verified_fallback() {
+    #[tokio::test]
+    async fn windows_migration_reports_rollback_failure_and_keeps_verified_fallback() {
         let mut backend = FakeWindowsInstallBackend {
             fail_at: Some("retire_scm"),
             rollback_fails: true,
             ..FakeWindowsInstallBackend::default()
         };
 
-        let error = run_windows_install_transaction(&mut backend, true).unwrap_err();
+        let error = run_windows_install_transaction(&mut backend, true)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("rollback also failed"));
         assert!(error.to_string().contains("left installed"));
         assert_eq!(backend.events.last(), Some(&"rollback"));
     }
 
-    #[test]
-    fn windows_migration_start_failure_does_not_remove_verified_installed_task() {
+    #[tokio::test]
+    async fn windows_migration_stops_before_replacing_and_no_start_leaves_task_stopped() {
+        let mut backend = FakeWindowsInstallBackend::default();
+
+        run_windows_install_transaction(&mut backend, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.events,
+            [
+                "preflight",
+                "stop",
+                "stop_legacy",
+                "register",
+                "verify",
+                "publish_receipt",
+                "retire_fixed",
+                "retire_scm",
+            ]
+        );
+        assert!(!backend.events.contains(&"start"));
+    }
+
+    #[tokio::test]
+    async fn windows_migration_start_failure_restores_the_previous_installation() {
         let mut backend = FakeWindowsInstallBackend {
             fail_at: Some("start"),
             ..FakeWindowsInstallBackend::default()
         };
 
-        let error = run_windows_install_transaction(&mut backend, true).unwrap_err();
+        let error = run_windows_install_transaction(&mut backend, true)
+            .await
+            .unwrap_err();
 
-        assert!(error.to_string().contains("was installed"));
-        assert!(!backend.events.contains(&"rollback"));
+        assert!(error.to_string().contains("restored"));
+        assert_eq!(
+            backend.events,
+            [
+                "preflight",
+                "stop",
+                "stop_legacy",
+                "register",
+                "verify",
+                "publish_receipt",
+                "start",
+                "rollback",
+                "rollback_receipt",
+            ]
+        );
     }
 
     #[test]

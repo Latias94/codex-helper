@@ -1,0 +1,81 @@
+{
+  "providers": [
+    {
+      "id": "rightcode",
+      "kind": "rightcode_account_summary",
+      "domains": ["www.right.codes", "right.codes"],
+      "endpoint": "https://www.right.codes/account/summary",
+      "poll_interval_secs": 600,
+      "trust_exhaustion_for_routing": false
+    },
+    {
+      "id": "packycode",
+      "kind": "budget_http_json",
+      "domains": ["packycode.com"],
+      "endpoint": "https://www.packycode.com/api/backend/users/info",
+      "poll_interval_secs": 600
+    },
+    {
+      "id": "yescode",
+      "kind": "yescode_profile",
+      "domains": ["yes.vg"],
+      "endpoint": "https://co.yes.vg/api/v1/auth/profile",
+      "poll_interval_secs": 600
+    },
+    {
+      "id": "deepseek",
+      "kind": "openai_balance_http_json",
+      "domains": ["api.deepseek.com"],
+      "endpoint": "https://api.deepseek.com/user/balance",
+      "poll_interval_secs": 600
+    },
+    {
+      "id": "stepfun",
+      "kind": "openai_balance_http_json",
+      "domains": ["api.stepfun.ai", "api.stepfun.com"],
+      "endpoint": "https://api.stepfun.com/v1/accounts",
+      "poll_interval_secs": 600
+    },
+    {
+      "id": "siliconflow",
+      "kind": "openai_balance_http_json",
+      "domains": ["api.siliconflow.cn", "api.siliconflow.com"],
+      "endpoint": "{{base_url}}/v1/user/info",
+      "poll_interval_secs": 600
+    },
+    {
+      "id": "openrouter",
+      "kind": "openai_balance_http_json",
+      "domains": ["openrouter.ai"],
+      "endpoint": "https://openrouter.ai/api/v1/credits",
+      "poll_interval_secs": 600,
+      "extract": {
+        "monthly_budget_paths": ["data.total_credits"],
+        "monthly_spent_paths": ["data.total_usage"],
+        "derive_remaining_from_budget_and_spent": true
+      }
+    },
+    {
+      "id": "novita",
+      "kind": "openai_balance_http_json",
+      "domains": ["api.novita.ai"],
+      "endpoint": "https://api.novita.ai/v3/user/balance",
+      "poll_interval_secs": 600,
+      "extract": {
+        "remaining_balance_paths": ["availableBalance"],
+        "remaining_divisor": 10000
+      }
+    },
+    {
+      "id": "openai-official-costs",
+      "kind": "openai_organization_costs",
+      "domains": ["api.openai.com"],
+      "endpoint": "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30",
+      "token_env": "OPENAI_ADMIN_KEY",
+      "require_token_env": true,
+      "poll_interval_secs": 600,
+      "refresh_on_request": false,
+      "trust_exhaustion_for_routing": false
+    }
+  ]
+}

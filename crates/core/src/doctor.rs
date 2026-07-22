@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::auth_resolution::target_credential_readiness;
-use crate::codex_switch::{CodexSwitchPhase, inspect as inspect_codex_switch};
+use crate::codex_onboarding::{CodexOnboardingFeasibility, inspect_codex_onboarding_feasibility};
+use crate::codex_switch::{CodexSwitchPhase, CodexSwitchStatus, inspect as inspect_codex_switch};
 use crate::config::{
-    CURRENT_CONFIG_VERSION, HelperConfig, UpstreamAuth, load_config, proxy_home_dir,
+    CURRENT_CONFIG_VERSION, CodexClientPatchConfig, CodexClientPreset, CodexCompactionStrategy,
+    CodexHostedImageGenerationMode, HelperConfig, ServiceKind, ServiceRouteConfig, UpstreamAuth,
+    load_config, proxy_home_dir,
 };
 use crate::credentials::{
     CredentialBindingKind, CredentialCandidateInput, CredentialReadinessCode,
@@ -13,6 +17,7 @@ use crate::credentials::{
     InstallationIdentity,
 };
 use crate::logging::request_log_path;
+use crate::relay_target::default_proxy_port_for_service_kind;
 use crate::routing_ir::CompiledRouteGraph;
 use crate::runtime_identity::ProviderEndpointKey;
 
@@ -47,7 +52,157 @@ pub struct DoctorCheck {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<ConfigurationStatusSnapshot>,
     pub checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConfigurationStatusSnapshot {
+    pub config_version: u32,
+    pub codex: ConfigurationServiceStatusSnapshot,
+    pub claude: ConfigurationServiceStatusSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConfigurationServiceStatusSnapshot {
+    pub service_name: String,
+    pub default_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_patch: Option<ConfigurationClientPatchStatusSnapshot>,
+    pub providers: Vec<ConfigurationProviderStatusSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ConfigurationClientPatchStatusSnapshot {
+    pub preset: CodexClientPreset,
+    pub responses_websocket: bool,
+    pub compaction: CodexCompactionStrategy,
+    pub translate_models: bool,
+    pub hosted_image_generation: CodexHostedImageGenerationMode,
+}
+
+impl From<CodexClientPatchConfig> for ConfigurationClientPatchStatusSnapshot {
+    fn from(client_patch: CodexClientPatchConfig) -> Self {
+        Self {
+            preset: client_patch.preset,
+            responses_websocket: client_patch.responses_websocket,
+            compaction: client_patch.compaction,
+            translate_models: client_patch.translate_models,
+            hosted_image_generation: client_patch.hosted_image_generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConfigurationProviderStatusSnapshot {
+    pub provider_id: String,
+    pub alias: Option<String>,
+    pub enabled: bool,
+    pub in_route_graph: bool,
+    pub endpoints: Vec<ConfigurationEndpointStatusSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConfigurationEndpointStatusSnapshot {
+    pub endpoint_id: String,
+    pub enabled: bool,
+    pub in_route_graph: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_order: Option<usize>,
+}
+
+pub fn configuration_status_snapshot(config: &HelperConfig) -> Result<ConfigurationStatusSnapshot> {
+    Ok(ConfigurationStatusSnapshot {
+        config_version: config.version,
+        codex: configuration_service_status_snapshot("codex", &config.codex)?,
+        claude: configuration_service_status_snapshot("claude", &config.claude)?,
+    })
+}
+
+fn configuration_service_status_snapshot(
+    service_name: &str,
+    view: &ServiceRouteConfig,
+) -> Result<ConfigurationServiceStatusSnapshot> {
+    let graph = CompiledRouteGraph::compile(service_name, view)
+        .with_context(|| format!("compile {service_name} route graph for status"))?;
+    let mut route_endpoints = BTreeMap::<String, Vec<(String, usize)>>::new();
+    let mut provider_order = Vec::new();
+    let mut seen_providers = BTreeSet::new();
+    for candidate in graph.candidates() {
+        if seen_providers.insert(candidate.provider_id.clone()) {
+            provider_order.push(candidate.provider_id.clone());
+        }
+        route_endpoints
+            .entry(candidate.provider_id.clone())
+            .or_default()
+            .push((candidate.endpoint_id.clone(), candidate.stable_index));
+    }
+    for provider_id in view.providers.keys() {
+        if seen_providers.insert(provider_id.clone()) {
+            provider_order.push(provider_id.clone());
+        }
+    }
+
+    let providers = provider_order
+        .into_iter()
+        .filter_map(|provider_id| {
+            let provider = view.providers.get(&provider_id)?;
+            let routed = route_endpoints.remove(&provider_id).unwrap_or_default();
+            let mut endpoints = Vec::new();
+            let mut seen_endpoints = BTreeSet::new();
+            for (endpoint_id, route_order) in routed {
+                if seen_endpoints.insert(endpoint_id.clone()) {
+                    endpoints.push(ConfigurationEndpointStatusSnapshot {
+                        enabled: true,
+                        endpoint_id,
+                        in_route_graph: true,
+                        route_order: Some(route_order),
+                    });
+                }
+            }
+            if provider
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+                && seen_endpoints.insert("default".to_string())
+            {
+                endpoints.push(ConfigurationEndpointStatusSnapshot {
+                    endpoint_id: "default".to_string(),
+                    enabled: provider.enabled,
+                    in_route_graph: false,
+                    route_order: None,
+                });
+            }
+            for (endpoint_id, endpoint) in &provider.endpoints {
+                if seen_endpoints.insert(endpoint_id.clone()) {
+                    endpoints.push(ConfigurationEndpointStatusSnapshot {
+                        endpoint_id: endpoint_id.clone(),
+                        enabled: provider.enabled && endpoint.enabled,
+                        in_route_graph: false,
+                        route_order: None,
+                    });
+                }
+            }
+            Some(ConfigurationProviderStatusSnapshot {
+                provider_id,
+                alias: provider.alias.clone(),
+                enabled: provider.enabled,
+                in_route_graph: endpoints.iter().any(|endpoint| endpoint.in_route_graph),
+                endpoints,
+            })
+        })
+        .collect();
+
+    Ok(ConfigurationServiceStatusSnapshot {
+        service_name: service_name.to_string(),
+        default_profile: view.default_profile.clone(),
+        client_patch: (service_name == "codex").then(|| {
+            ConfigurationClientPatchStatusSnapshot::from(view.client_patch.unwrap_or_default())
+        }),
+        providers,
+    })
 }
 
 #[derive(Clone)]
@@ -146,10 +301,42 @@ pub async fn run_doctor(
     credential_sources: CredentialSourceCapabilities,
 ) -> DoctorReport {
     let mut checks: Vec<DoctorCheck> = Vec::new();
+    let mut configuration = None;
+    let mut configured_codex_patch = None;
+    let mut loaded_config = None;
 
     // 1) codex-helper main config
     match load_config().await {
         Ok(cfg) => {
+            match configuration_status_snapshot(&cfg) {
+                Ok(snapshot) => configuration = Some(snapshot),
+                Err(error) => checks.push(DoctorCheck {
+                    id: "proxy_config.routes",
+                    status: DoctorStatus::Fail,
+                    message: match lang {
+                        DoctorLang::Zh => format!("无法编译 canonical 路由快照：{error}"),
+                        DoctorLang::En => {
+                            format!("Failed to compile the canonical route snapshot: {error}")
+                        }
+                    },
+                }),
+            }
+            let client_patch = cfg.codex.client_patch.unwrap_or_default();
+            configured_codex_patch = Some(client_patch);
+            checks.push(DoctorCheck {
+                id: "codex.client_patch.configured",
+                status: DoctorStatus::Info,
+                message: match lang {
+                    DoctorLang::Zh => format!(
+                        "canonical Codex client patch：{}",
+                        codex_client_patch_summary(&client_patch)
+                    ),
+                    DoctorLang::En => format!(
+                        "Canonical Codex client patch: {}",
+                        codex_client_patch_summary(&client_patch)
+                    ),
+                },
+            });
             let codex_count = cfg.codex.providers.len();
             if codex_count == 0 {
                 checks.push(DoctorCheck {
@@ -231,6 +418,7 @@ pub async fn run_doctor(
                     }
                 }
             }
+            loaded_config = Some(cfg);
         }
         Err(err) => {
             checks.push(DoctorCheck {
@@ -250,7 +438,8 @@ pub async fn run_doctor(
     }
 
     // 2) Helper-owned explicit Codex switch state and retained auth recovery health.
-    match inspect_codex_switch() {
+    let switch_status = inspect_codex_switch();
+    match switch_status.as_ref() {
         Ok(status) if status.phase == CodexSwitchPhase::Off && status.managed => {
             checks.push(DoctorCheck {
                 id: "codex.switch_state",
@@ -313,6 +502,24 @@ pub async fn run_doctor(
                 }
             },
         }),
+    }
+    if let Ok(status) = switch_status.as_ref() {
+        append_applied_client_patch_check(
+            &mut checks,
+            lang,
+            configured_codex_patch.as_ref(),
+            status,
+        );
+    }
+    if let Some(config) = loaded_config.as_ref() {
+        append_codex_onboarding_check(
+            &mut checks,
+            lang,
+            inspect_codex_onboarding_feasibility(
+                config,
+                default_proxy_port_for_service_kind(ServiceKind::Codex),
+            ),
+        );
     }
 
     // 3) logs and usage_providers
@@ -389,7 +596,140 @@ pub async fn run_doctor(
         });
     }
 
-    DoctorReport { checks }
+    DoctorReport {
+        configuration,
+        checks,
+    }
+}
+
+fn codex_client_patch_summary(client_patch: &CodexClientPatchConfig) -> String {
+    format!(
+        "preset={}, responses_websocket={}, compaction={}, translate_models={}, hosted_image_generation={}",
+        client_patch.preset,
+        client_patch.responses_websocket,
+        client_patch.compaction,
+        client_patch.translate_models,
+        client_patch.hosted_image_generation,
+    )
+}
+
+fn append_applied_client_patch_check(
+    checks: &mut Vec<DoctorCheck>,
+    lang: DoctorLang,
+    configured: Option<&CodexClientPatchConfig>,
+    status: &CodexSwitchStatus,
+) {
+    let applied = status
+        .client_patch
+        .as_ref()
+        .map(codex_client_patch_summary)
+        .unwrap_or_else(|| "<none>".to_string());
+    let differs = configured
+        .zip(status.client_patch.as_ref())
+        .is_some_and(|(configured, applied)| configured != applied);
+    let difference = if differs {
+        match lang {
+            DoctorLang::Zh => "；应用值与当前配置不同，可能来自显式 CLI 覆盖",
+            DoctorLang::En => {
+                "; the applied value differs from current configuration and may be an explicit CLI override"
+            }
+        }
+    } else {
+        ""
+    };
+    checks.push(DoctorCheck {
+        id: "codex.client_patch.applied",
+        status: if status.phase == CodexSwitchPhase::RecoveryRequired {
+            DoctorStatus::Warn
+        } else if status.phase == CodexSwitchPhase::Applied && status.enabled {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Info
+        },
+        message: match lang {
+            DoctorLang::Zh => format!(
+                "Codex client 集成：phase={}，applied patch={}{}",
+                status.phase.as_str(),
+                applied,
+                difference
+            ),
+            DoctorLang::En => format!(
+                "Codex client integration: phase={}, applied patch={}{}",
+                status.phase.as_str(),
+                applied,
+                difference
+            ),
+        },
+    });
+}
+
+fn append_codex_onboarding_check(
+    checks: &mut Vec<DoctorCheck>,
+    lang: DoctorLang,
+    feasibility: CodexOnboardingFeasibility,
+) {
+    let (status, message) = match feasibility {
+        CodexOnboardingFeasibility::ExistingConfiguration => (
+            DoctorStatus::Ok,
+            pick(
+                lang,
+                "canonical Codex 路由已存在；无需自动 onboarding。",
+                "A canonical Codex route already exists; automatic onboarding is not required.",
+            )
+            .to_string(),
+        ),
+        CodexOnboardingFeasibility::Importable {
+            provider_id,
+            credential_reference,
+        } => {
+            let provider_id = escape_doctor_reference(&provider_id);
+            let credential = credential_reference
+                .as_deref()
+                .map(escape_doctor_reference)
+                .map(|reference| match lang {
+                    DoctorLang::Zh => format!("环境变量引用 `{reference}`"),
+                    DoctorLang::En => format!("environment reference `{reference}`"),
+                })
+                .unwrap_or_else(|| {
+                    pick(
+                        lang,
+                        "Codex client 认证透传",
+                        "Codex client authentication passthrough",
+                    )
+                    .to_string()
+                });
+            (
+                DoctorStatus::Info,
+                match lang {
+                    DoctorLang::Zh => format!(
+                        "原始 Codex client 投影可 onboarding：provider=`{provider_id}`，credential={credential}；doctor 未写入配置。"
+                    ),
+                    DoctorLang::En => format!(
+                        "The original Codex client projection is importable: provider=`{provider_id}`, credential={credential}; doctor did not write configuration."
+                    ),
+                },
+            )
+        }
+        CodexOnboardingFeasibility::Blocked { reason } => {
+            let reason = escape_doctor_reference(&reason);
+            (
+                DoctorStatus::Warn,
+                match lang {
+                    DoctorLang::Zh => {
+                        format!("原始 Codex client 投影当前无法 onboarding：{reason}")
+                    }
+                    DoctorLang::En => format!(
+                        "The original Codex client projection cannot currently be onboarded: {reason}"
+                    ),
+                },
+            )
+        }
+    };
+    checks.push(DoctorCheck {
+        id: "codex.onboarding",
+        status,
+        message,
+    });
 }
 
 fn append_credential_readiness_checks(
@@ -558,8 +898,8 @@ mod tests {
     use super::*;
     use crate::codex_switch::{CodexSwitchIntent, ValidatedCodexBaseUrl};
     use crate::config::{
-        CodexClientPatchConfig, CodexClientPreset, CredentialRef, HelperConfig, ProviderConfig,
-        RouteGraphConfig, UpstreamAuth,
+        CodexClientPatchConfig, CodexClientPreset, CodexCompactionStrategy, CredentialRef,
+        HelperConfig, ProviderConfig, RouteGraphConfig, UpstreamAuth,
     };
     use crate::credentials::SecretValue;
     use crate::runtime_store::RuntimeStore;
@@ -603,7 +943,72 @@ mod tests {
     }
 
     #[test]
-    fn doctor_ignores_codex_auth_and_import_feasibility() {
+    fn configuration_snapshot_keeps_route_shape_without_credentials_or_origins() {
+        const SECRET: &str = "configuration-snapshot-secret-canary";
+        let mut config = HelperConfig::default();
+        config.codex.default_profile = Some("work".to_string());
+        config.codex.client_patch = Some(CodexClientPatchConfig {
+            preset: CodexClientPreset::OfficialImagegen,
+            compaction: CodexCompactionStrategy::RemoteV2,
+            translate_models: true,
+            ..CodexClientPatchConfig::default()
+        });
+        config.codex.providers.insert(
+            "primary".to_string(),
+            ProviderConfig {
+                alias: Some("Primary".to_string()),
+                base_url: Some("https://private-origin.example/v1".to_string()),
+                auth: UpstreamAuth {
+                    auth_token: Some(SECRET.to_string().into()),
+                    ..UpstreamAuth::default()
+                },
+                ..ProviderConfig::default()
+            },
+        );
+        config.codex.providers.insert(
+            "disabled".to_string(),
+            ProviderConfig {
+                enabled: false,
+                base_url: Some("https://disabled-private.example/v1".to_string()),
+                ..ProviderConfig::default()
+            },
+        );
+        config.codex.routing = Some(RouteGraphConfig::ordered_failover(vec![
+            "primary".to_string(),
+        ]));
+
+        let snapshot = configuration_status_snapshot(&config).expect("configuration snapshot");
+
+        assert_eq!(snapshot.codex.default_profile.as_deref(), Some("work"));
+        assert_eq!(snapshot.codex.providers[0].provider_id, "primary");
+        assert!(snapshot.codex.providers[0].in_route_graph);
+        assert_eq!(
+            snapshot.codex.providers[0].endpoints[0].endpoint_id,
+            "default"
+        );
+        assert_eq!(
+            snapshot.codex.providers[0].endpoints[0].route_order,
+            Some(0)
+        );
+        assert_eq!(snapshot.codex.providers[1].provider_id, "disabled");
+        assert!(!snapshot.codex.providers[1].enabled);
+        assert!(!snapshot.codex.providers[1].in_route_graph);
+        let serialized = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        let client_patch = &serialized["codex"]["client_patch"];
+        assert_eq!(client_patch["preset"], "official-imagegen");
+        assert_eq!(client_patch["responses_websocket"], false);
+        assert_eq!(client_patch["compaction"], "remote-v2");
+        assert_eq!(client_patch["translate_models"], true);
+        assert_eq!(client_patch["hosted_image_generation"], "auto");
+        let rendered = serialized.to_string();
+        assert!(!rendered.contains(SECRET));
+        assert!(!rendered.contains("private-origin"));
+        assert!(!rendered.contains("disabled-private"));
+        assert!(!rendered.contains("auth_token"));
+    }
+
+    #[test]
+    fn doctor_reports_blocked_onboarding_without_exposing_invalid_auth_contents() {
         let _lock = env_lock();
         let home =
             std::env::temp_dir().join(format!("codex-helper-doctor-test-{}", uuid::Uuid::new_v4()));
@@ -644,11 +1049,199 @@ mod tests {
                 .iter()
                 .any(|check| check.id == "codex.switch_state")
         );
+        assert!(report.configuration.is_some());
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "codex.client_patch.configured")
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "codex.client_patch.applied")
+        );
+        let onboarding = report
+            .checks
+            .iter()
+            .find(|check| check.id == "codex.onboarding")
+            .expect("Codex onboarding doctor check");
+        assert_eq!(onboarding.status, DoctorStatus::Warn);
         assert!(report.checks.iter().all(|check| {
             !check.id.starts_with("codex.auth")
                 && check.id != "bootstrap.codex"
                 && !check.message.contains("import-from-codex")
+                && !check.message.contains("not-json")
         }));
+    }
+
+    #[test]
+    fn doctor_reports_configured_and_applied_patch_from_original_projection() {
+        const SECRET: &str = "doctor-original-projection-secret-canary";
+        let _lock = env_lock();
+        let home = std::env::temp_dir().join(format!(
+            "codex-helper-doctor-client-patch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = home.join(".codex-helper");
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&codex_home).expect("create Codex home");
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"model_provider = "relay"
+
+[model_providers.relay]
+name = "Relay"
+base_url = "https://relay.example/v1"
+env_key = "RELAY_API_KEY"
+requires_openai_auth = false
+"#,
+        )
+        .expect("write original Codex config");
+        std::fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "auth_mode": "apikey",
+                "RELAY_API_KEY": SECRET,
+            }))
+            .expect("serialize original Codex auth"),
+        )
+        .expect("write original Codex auth");
+
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set("HOME", &home);
+            env.set("USERPROFILE", &home);
+            env.set("CODEX_HELPER_HOME", &helper_home);
+            env.set("CODEX_HOME", &codex_home);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let report = runtime.block_on(async {
+            let mut config = HelperConfig::default();
+            config.codex.client_patch = Some(CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialRelay,
+                ..CodexClientPatchConfig::default()
+            });
+            crate::config::save_helper_config(&config)
+                .await
+                .expect("write canonical config");
+            crate::codex_switch::apply_with_client_patch(
+                CodexSwitchIntent::On {
+                    validated_base_url: ValidatedCodexBaseUrl::local(3211),
+                },
+                CodexClientPatchConfig {
+                    preset: CodexClientPreset::ImagegenBridge,
+                    ..CodexClientPatchConfig::default()
+                },
+            )
+            .expect("apply explicit client patch");
+            run_doctor(DoctorLang::En, CredentialSourceCapabilities::server()).await
+        });
+
+        let configured = report
+            .checks
+            .iter()
+            .find(|check| check.id == "codex.client_patch.configured")
+            .expect("configured client patch check");
+        assert!(configured.message.contains("preset=official-relay"));
+        let applied = report
+            .checks
+            .iter()
+            .find(|check| check.id == "codex.client_patch.applied")
+            .expect("applied client patch check");
+        assert_eq!(applied.status, DoctorStatus::Ok);
+        assert!(applied.message.contains("phase=applied"));
+        assert!(applied.message.contains("preset=imagegen-bridge"));
+        assert!(!applied.message.contains("preset=default"));
+        assert!(applied.message.contains("explicit CLI override"));
+        let onboarding = report
+            .checks
+            .iter()
+            .find(|check| check.id == "codex.onboarding")
+            .expect("onboarding feasibility check");
+        assert_eq!(onboarding.status, DoctorStatus::Info);
+        assert!(onboarding.message.contains("provider=`relay`"));
+        assert!(onboarding.message.contains("`RELAY_API_KEY`"));
+
+        let serialized = serde_json::to_string(&report).expect("serialize doctor report");
+        assert!(!serialized.contains(SECRET));
+        assert!(!serialized.contains("relay.example"));
+    }
+
+    #[test]
+    fn doctor_reports_switch_recovery_anomaly_without_exposing_auth_contents() {
+        const SECRET: &str = "doctor-recovery-secret-canary";
+        let _lock = env_lock();
+        let home = std::env::temp_dir().join(format!(
+            "codex-helper-doctor-switch-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = home.join(".codex-helper");
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&codex_home).expect("create Codex home");
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("write original Codex config");
+        std::fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": SECRET,
+            }))
+            .expect("serialize original Codex auth"),
+        )
+        .expect("write original Codex auth");
+
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set("HOME", &home);
+            env.set("USERPROFILE", &home);
+            env.set("CODEX_HELPER_HOME", &helper_home);
+            env.set("CODEX_HOME", &codex_home);
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let report = runtime.block_on(async {
+            crate::config::save_helper_config(&HelperConfig::default())
+                .await
+                .expect("write canonical config");
+            let outcome = crate::codex_switch::apply(CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            })
+            .expect("apply Codex switch");
+            std::fs::write(outcome.status.state_path, "{broken")
+                .expect("corrupt switch journal for diagnosis");
+            run_doctor(DoctorLang::En, CredentialSourceCapabilities::server()).await
+        });
+
+        let switch = report
+            .checks
+            .iter()
+            .find(|check| check.id == "codex.switch_state")
+            .expect("switch recovery check");
+        assert_eq!(switch.status, DoctorStatus::Warn);
+        let onboarding = report
+            .checks
+            .iter()
+            .find(|check| check.id == "codex.onboarding")
+            .expect("onboarding recovery check");
+        assert_eq!(onboarding.status, DoctorStatus::Warn);
+
+        let serialized = serde_json::to_string(&report).expect("serialize doctor report");
+        assert!(!serialized.contains(SECRET));
+        assert!(!serialized.contains("OPENAI_API_KEY"));
     }
 
     #[test]

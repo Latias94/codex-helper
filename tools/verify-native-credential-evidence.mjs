@@ -13,6 +13,22 @@ const EXPECTED_BACKENDS = new Map([
   ["kwallet", "linux"],
 ]);
 const MAX_EVIDENCE_AGE_MS = 6 * 60 * 60 * 1_000;
+const REQUIRED_RELEASE_ASSURANCE_CASES = [
+  "windows_relogin_persistence",
+  "macos_launchagent_zero_ui",
+  "macos_keychain_locked",
+  "macos_acl_denied",
+  "macos_path_or_signature_change",
+  "macos_sleep_wake",
+  "macos_intel_rosetta_candidate",
+  "linux_gnome_service_context",
+  "linux_kwallet_service_context",
+  "linux_session_bus_missing",
+  "linux_secret_service_missing",
+  "linux_collection_locked",
+  "observation_plus_1_hour",
+  "observation_plus_24_hours",
+];
 
 const options = parseArguments(process.argv.slice(2));
 if (options.selfTest) {
@@ -88,20 +104,10 @@ function verifyEvidenceDirectory({
       throw new Error(`required native backend evidence is missing: ${backend}`);
     }
   }
-  return {
-    schema_version: 1,
-    candidate_sha: candidateSha,
-    repository,
-    evidence: [...records.values()].sort((left, right) =>
-      left.backend.localeCompare(right.backend),
-    ),
-    approval: {
-      environment: "native-credential-release",
-      audit_source: "github_environment_deployment_history",
-      workflow_run: workflowRun,
-    },
-    verified_at: new Date(now).toISOString(),
-  };
+  throw new Error(
+    "native credential evidence schema v1 is diagnostic-only and cannot authorize a release; " +
+      `required release assurance cases are missing: ${REQUIRED_RELEASE_ASSURANCE_CASES.join(", ")}`,
+  );
 }
 
 function validateEvidence(
@@ -342,6 +348,7 @@ function runSelfTest() {
   const serverUrl = "https://github.com";
   const workflowRun = `${serverUrl}/${repository}/actions/runs/123`;
   const now = Date.now();
+  const signoff = path.join(root, "native-credential-release-signoff.json");
   try {
     for (const [index, [backend, platform]] of [...EXPECTED_BACKENDS].entries()) {
       const evidence = selfTestEvidence({
@@ -358,15 +365,24 @@ function runSelfTest() {
       fs.writeFileSync(file, encoded);
       fs.writeFileSync(`${file}.sha256`, `${sha256(encoded)}  ${path.basename(file)}\n`);
     }
-    const manifest = verifyEvidenceDirectory({
-      directory: root,
-      candidateSha,
-      repository,
-      serverUrl,
-      workflowRun,
-      now,
-    });
-    expectEqual(manifest.evidence.length, 4, "self-test evidence count");
+    let incompleteRejected = false;
+    try {
+      const manifest = verifyEvidenceDirectory({
+        directory: root,
+        candidateSha,
+        repository,
+        serverUrl,
+        workflowRun,
+        now,
+      });
+      writeManifest(signoff, manifest);
+    } catch (error) {
+      incompleteRejected =
+        error.message.includes("schema v1 is diagnostic-only") &&
+        REQUIRED_RELEASE_ASSURANCE_CASES.every((id) => error.message.includes(id));
+    }
+    expectEqual(incompleteRejected, true, "self-test incomplete release evidence rejection");
+    expectEqual(fs.existsSync(signoff), false, "self-test release signoff absence");
     fs.writeFileSync(`${path.join(root, "kwallet.json")}.sha256`, `${"0".repeat(64)}  kwallet.json\n`);
     let rejected = false;
     try {
@@ -382,7 +398,9 @@ function runSelfTest() {
       rejected = error.message.includes("checksum sidecar");
     }
     expectEqual(rejected, true, "self-test tampered evidence rejection");
-    console.log("Native credential evidence verifier self-test passed.");
+    console.log(
+      "Native credential evidence verifier self-test passed; schema v1 cannot produce a release signoff.",
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

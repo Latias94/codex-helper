@@ -726,6 +726,10 @@ function liveReadModel(overrides?: {
             runtime_source_mtime_ms: null,
             configured_default_profile: "chatgpt-bridge",
             default_profile: "chatgpt-bridge",
+            runtime_default_profile_override: null,
+            default_profile_source: "configured",
+            default_profile_control_revision: 0,
+            profile_catalog_key: "profile-catalog:test",
             default_profile_summary: {
               name: "chatgpt-bridge",
               model: null,
@@ -765,6 +769,10 @@ function liveReadModel(overrides?: {
               output_tokens: 20,
               reasoning_tokens: 0,
               total_tokens: 120,
+            },
+            cache_accounting_convention: {
+              cache_read: "unknown",
+              cache_write: "unknown",
             },
             cost: { total_cost_usd: "0.0005", confidence: "estimated" },
             observability: {

@@ -32,10 +32,15 @@ pub(super) fn render_stats_page(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(if compact {
-            vec![Constraint::Length(6), Constraint::Min(0)]
+            vec![
+                Constraint::Length(6),
+                Constraint::Length(6),
+                Constraint::Min(0),
+            ]
         } else {
             vec![
                 Constraint::Length(7),
+                Constraint::Length(6),
                 Constraint::Length(5),
                 Constraint::Min(0),
             ]
@@ -43,11 +48,12 @@ pub(super) fn render_stats_page(
         .split(area);
 
     render_quota_kpi_row(f, p, ui, snapshot, rows[0], compact);
+    render_local_usage_row(f, p, ui.language, &snapshot.usage_day, rows[1]);
     if compact {
-        render_dimension_area(f, p, ui, snapshot, rows[1], true);
+        render_dimension_area(f, p, ui, snapshot, rows[2], true);
     } else {
-        render_activity_row(f, p, ui.language, &snapshot.usage_day, rows[1]);
-        render_dimension_area(f, p, ui, snapshot, rows[2], false);
+        render_activity_row(f, p, ui.language, &snapshot.usage_day, rows[2]);
+        render_dimension_area(f, p, ui, snapshot, rows[3], false);
     }
 }
 
@@ -304,6 +310,176 @@ fn render_activity_row(
                 },
             ))
             .wrap(Wrap { trim: true }),
+        cols[1],
+    );
+}
+
+fn render_local_usage_row(
+    f: &mut Frame<'_>,
+    p: Palette,
+    lang: Language,
+    usage: &UsageDayView,
+    area: Rect,
+) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    let summary = &usage.summary;
+    let metrics = &summary.usage;
+    let ok = summary
+        .requests_total
+        .saturating_sub(summary.requests_error);
+
+    render_info_block(
+        f,
+        p,
+        match lang {
+            Language::Zh => "本机用量",
+            Language::En => "Local Usage",
+        },
+        vec![
+            Line::from(vec![
+                muted(p, "tokens "),
+                Span::styled(
+                    tokens_short(metrics.total_tokens),
+                    Style::default().fg(p.accent),
+                ),
+                Span::raw("  "),
+                muted(p, "cost "),
+                Span::styled(summary.cost.display_total(), Style::default().fg(p.text)),
+            ]),
+            Line::from(vec![
+                muted(p, "in "),
+                Span::styled(
+                    tokens_short(metrics.input_tokens),
+                    Style::default().fg(p.text),
+                ),
+                Span::raw("  "),
+                muted(p, "out "),
+                Span::styled(
+                    tokens_short(metrics.output_tokens),
+                    Style::default().fg(p.text),
+                ),
+                Span::raw("  "),
+                muted(p, "reasoning "),
+                Span::styled(
+                    tokens_short(metrics.reasoning_output_tokens_total()),
+                    Style::default().fg(p.text),
+                ),
+            ]),
+            Line::from(vec![
+                muted(p, "cache read "),
+                Span::styled(
+                    tokens_short(metrics.cache_read_tokens_total()),
+                    Style::default().fg(p.text),
+                ),
+                Span::raw("  "),
+                muted(p, "cache write "),
+                Span::styled(
+                    tokens_short(metrics.cache_creation_tokens_total()),
+                    Style::default().fg(p.text),
+                ),
+            ]),
+            Line::from(vec![
+                muted(p, "requests "),
+                Span::styled(
+                    summary.requests_total.to_string(),
+                    Style::default().fg(p.text),
+                ),
+                Span::raw("  "),
+                muted(p, "ok "),
+                Span::styled(ok.to_string(), Style::default().fg(p.good)),
+                Span::raw("  "),
+                muted(p, "err "),
+                Span::styled(
+                    summary.requests_error.to_string(),
+                    Style::default().fg(if summary.requests_error > 0 {
+                        p.warn
+                    } else {
+                        p.muted
+                    }),
+                ),
+            ]),
+        ],
+        cols[0],
+    );
+
+    let gate = &usage.retry_gate;
+    let reasons = if gate.reasons.is_empty() {
+        "-".to_string()
+    } else {
+        gate.reasons
+            .iter()
+            .map(|row| format!("{}:{}", shorten(&row.reason, 20), row.active))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let coverage = &usage.coverage;
+    let coverage_status = if coverage.day_may_be_partial {
+        match lang {
+            Language::Zh => "可能不完整",
+            Language::En => "partial",
+        }
+    } else {
+        match lang {
+            Language::Zh => "已加载窗口",
+            Language::En => "loaded window",
+        }
+    };
+    render_info_block(
+        f,
+        p,
+        match lang {
+            Language::Zh => "Retry Gate / 覆盖范围",
+            Language::En => "Retry Gate / Coverage",
+        },
+        vec![
+            Line::from(vec![
+                muted(p, "active "),
+                Span::styled(
+                    gate.active.to_string(),
+                    Style::default().fg(if gate.active > 0 { p.warn } else { p.good }),
+                ),
+                Span::raw("  "),
+                muted(p, "cooldown "),
+                Span::styled(
+                    gate.active_cooldowns.to_string(),
+                    Style::default().fg(if gate.active_cooldowns > 0 {
+                        p.warn
+                    } else {
+                        p.good
+                    }),
+                ),
+                Span::raw("  "),
+                muted(p, "max "),
+                Span::styled(
+                    gate.max_remaining_secs
+                        .map(|secs| duration_short(secs.saturating_mul(1000)))
+                        .unwrap_or_else(|| "-".to_string()),
+                    Style::default().fg(p.muted),
+                ),
+            ]),
+            kv_line(p, "reason", &shorten(&reasons, 32), p.muted),
+            Line::from(vec![
+                muted(p, "coverage "),
+                Span::styled(
+                    coverage_status,
+                    Style::default().fg(if coverage.day_may_be_partial {
+                        p.warn
+                    } else {
+                        p.good
+                    }),
+                ),
+                Span::raw("  "),
+                muted(p, "loaded "),
+                Span::styled(
+                    coverage.loaded_requests.to_string(),
+                    Style::default().fg(p.text),
+                ),
+            ]),
+            kv_line(p, "source", &shorten(&coverage.source, 24), p.text),
+        ],
         cols[1],
     );
 }
@@ -1498,6 +1674,13 @@ mod tests {
     }
 
     fn sample_snapshot() -> Snapshot {
+        let mut summary = bucket(12, 4_159);
+        summary.requests_error = 2;
+        summary.usage.input_tokens = 2_101;
+        summary.usage.output_tokens = 905;
+        summary.usage.reasoning_tokens = 321;
+        summary.usage.cache_read_input_tokens = 777;
+        summary.usage.cache_creation_input_tokens = 55;
         let hourly = (0..24)
             .map(|hour| UsageDayHourRow {
                 hour,
@@ -1514,7 +1697,7 @@ mod tests {
                 start_ms: 1,
                 end_ms: 2,
                 generated_at_ms: 2,
-                summary: bucket(12, 4096),
+                summary,
                 hourly,
                 provider_rows: vec![row("input", 7, 3000), row("input1", 5, 1096)],
                 provider_endpoint_rows: vec![row("routing", 12, 4096)],
@@ -1591,8 +1774,41 @@ mod tests {
         assert!(text.contains("relay.example"));
         assert!(text.contains("on pace"));
         assert!(text.contains("$100"));
-        assert!(!text.contains("Retry Gate"));
+        assert!(text.contains("Retry Gate"));
         assert!(text.contains("Coverage"));
+    }
+
+    #[test]
+    fn stats_render_preserves_local_usage_and_retry_diagnostics_across_terminal_sizes() {
+        let snapshot = sample_snapshot();
+
+        for (width, height) in [(80, 24), (100, 30), (160, 45)] {
+            let mut ui = UiState {
+                page: crate::tui::types::Page::Stats,
+                stats_focus: StatsFocus::Pools,
+                ..UiState::default()
+            };
+            let text = render_text(width, height, &mut ui, &snapshot);
+
+            for expected in [
+                "Local Usage",
+                "2.1k",
+                "905",
+                "reasoning",
+                "321",
+                "cache read",
+                "777",
+                "cache write",
+                "55",
+                "Retry Gate",
+                "runtime_store",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "missing {expected:?} at {width}x{height}:\n{text}"
+                );
+            }
+        }
     }
 
     #[test]

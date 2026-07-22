@@ -5,7 +5,7 @@ fn main() {
         .enable_all()
         .build()
         .expect("create tokio runtime");
-    if let Err(err) = runtime.block_on(Box::pin(codex_helper::run_cli())) {
+    if let Err(err) = runtime.block_on(Box::pin(codex_helper::run_ch_cli())) {
         eprintln!("{}", err.to_string().red());
         std::process::exit(1);
     }

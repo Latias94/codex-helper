@@ -7,7 +7,8 @@ use super::route_view;
 use crate::cli_types::{RoutingCommand, RoutingPolicy};
 use crate::config::{
     CURRENT_CONFIG_VERSION, PersistedRoutingProviderRef, PersistedRoutingSpec, RouteAffinityPolicy,
-    RouteExhaustedAction, RouteStrategy, ServiceRouteConfig, storage::save_helper_config,
+    RouteExhaustedAction, RouteStrategy, ServiceKind, ServiceRouteConfig,
+    storage::mutate_helper_config,
 };
 use crate::{CliError, CliResult};
 use serde::Serialize;
@@ -59,33 +60,44 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_helper_config(codex, claude, "routing")
+            let requested_service = requested_service(codex, claude)?;
+            load_helper_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            {
-                let (view, _) = select_service_route_config_mut(&mut cfg, service);
-                if let Some(policy) = policy {
-                    if matches!(policy, RoutingPolicy::ManualSticky) && !prefer_tags.is_empty() {
-                        return Err(CliError::Configuration(
-                            "manual-sticky routing cannot combine with prefer-tags".to_string(),
-                        ));
-                    }
-                    if !matches!(policy, RoutingPolicy::ManualSticky) && target.is_some() {
-                        return Err(CliError::Configuration(
-                            "routing target only makes sense with manual-sticky policy".to_string(),
-                        ));
-                    }
-                } else if target.is_some() && !prefer_tags.is_empty() {
+            if let Some(policy) = policy {
+                if matches!(policy, RoutingPolicy::ManualSticky) && !prefer_tags.is_empty() {
                     return Err(CliError::Configuration(
-                        "routing target and prefer-tags should not be set together without an explicit policy".to_string(),
+                        "manual-sticky routing cannot combine with prefer-tags".to_string(),
                     ));
                 }
-                if clear_target && matches!(policy, Some(RoutingPolicy::ManualSticky)) {
+                if !matches!(policy, RoutingPolicy::ManualSticky) && target.is_some() {
                     return Err(CliError::Configuration(
-                        "manual-sticky routing requires a target; do not combine it with --clear-target".to_string(),
+                        "routing target only makes sense with manual-sticky policy".to_string(),
                     ));
                 }
+            } else if target.is_some() && !prefer_tags.is_empty() {
+                return Err(CliError::Configuration(
+                    "routing target and prefer-tags should not be set together without an explicit policy".to_string(),
+                ));
+            }
+            if clear_target && matches!(policy, Some(RoutingPolicy::ManualSticky)) {
+                return Err(CliError::Configuration(
+                    "manual-sticky routing requires a target; do not combine it with --clear-target"
+                        .to_string(),
+                ));
+            }
+            let parsed_prefer_tags = if prefer_tags.is_empty() {
+                None
+            } else {
+                Some(
+                    parse_cli_tags(&prefer_tags)
+                        .map_err(|e| CliError::Configuration(e.to_string()))?,
+                )
+            };
 
+            let (_, service) = mutate_helper_config(move |config| {
+                let service = select_requested_service(config, requested_service);
+                let (view, _) = select_service_route_config_mut(config, service);
                 let mut changed = false;
                 let current_routing = crate::config::effective_routing(view);
                 let current_entry = current_routing.entry_node();
@@ -120,15 +132,11 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                     changed = true;
                 }
                 if !order.is_empty() {
-                    next_order = normalize_complete_order(view, order, next_target.as_deref())
-                        .map_err(|e| CliError::Configuration(e.to_string()))?;
+                    next_order = normalize_complete_order(view, order, next_target.as_deref())?;
                     changed = true;
                 }
-                if !prefer_tags.is_empty() {
-                    next_prefer_tags = vec![
-                        parse_cli_tags(&prefer_tags)
-                            .map_err(|e| CliError::Configuration(e.to_string()))?,
-                    ];
+                if let Some(prefer_tags) = parsed_prefer_tags {
+                    next_prefer_tags = vec![prefer_tags];
                     next_policy = RouteStrategy::TagPreferred;
                     changed = true;
                 }
@@ -141,9 +149,7 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                     changed = true;
                 }
                 if !changed {
-                    return Err(CliError::Configuration(
-                        "routing set requires at least one field change".to_string(),
-                    ));
+                    anyhow::bail!("routing set requires at least one field change");
                 }
 
                 if !matches!(next_policy, RouteStrategy::ManualSticky) {
@@ -155,8 +161,7 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                 if !matches!(next_policy, RouteStrategy::TagPreferred) && on_exhausted.is_none() {
                     next_on_exhausted = RouteExhaustedAction::Continue;
                 }
-                next_order = normalize_complete_order(view, next_order, next_target.as_deref())
-                    .map_err(|e| CliError::Configuration(e.to_string()))?;
+                next_order = normalize_complete_order(view, next_order, next_target.as_deref())?;
 
                 validate_routing_fields(
                     view,
@@ -164,8 +169,7 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                     next_target.as_deref(),
                     &next_order,
                     &next_prefer_tags,
-                )
-                .map_err(|e| CliError::Configuration(e.to_string()))?;
+                )?;
 
                 set_entry_routing(
                     view,
@@ -175,11 +179,11 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                     next_prefer_tags,
                     next_on_exhausted,
                 );
-            }
-
-            save_helper_config(&cfg)
-                .await
-                .map_err(|e| CliError::Configuration(e.to_string()))?;
+                Ok(service)
+            })
+            .await
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let label = service_label(service);
             println!("{label} routing updated");
         }
         RoutingCommand::Pin {
@@ -187,16 +191,18 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_helper_config(codex, claude, "routing")
+            let requested_service = requested_service(codex, claude)?;
+            load_helper_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            {
-                let (view, _) = select_service_route_config_mut(&mut cfg, service);
+            let target_label = target.clone();
+            let (_, service) = mutate_helper_config(move |config| {
+                let service = select_requested_service(config, requested_service);
+                let (view, _) = select_service_route_config_mut(config, service);
                 ensure_routing_target_exists(view, target.as_str())?;
 
                 let order =
-                    normalize_complete_order(view, vec![target.clone()], Some(target.as_str()))
-                        .map_err(|e| CliError::Configuration(e.to_string()))?;
+                    normalize_complete_order(view, vec![target.clone()], Some(target.as_str()))?;
                 set_entry_routing(
                     view,
                     RouteStrategy::ManualSticky,
@@ -205,25 +211,26 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                     Vec::new(),
                     RouteExhaustedAction::Continue,
                 );
-            }
-
-            save_helper_config(&cfg)
-                .await
-                .map_err(|e| CliError::Configuration(e.to_string()))?;
-            println!("{label} routing pinned to target '{}'", target);
+                Ok(service)
+            })
+            .await
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let label = service_label(service);
+            println!("{label} routing pinned to target '{}'", target_label);
         }
         RoutingCommand::Order {
             providers,
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_helper_config(codex, claude, "routing")
+            let requested_service = requested_service(codex, claude)?;
+            load_helper_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            {
-                let (view, _) = select_service_route_config_mut(&mut cfg, service);
-                let order = normalize_complete_order(view, providers, None)
-                    .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let (_, service) = mutate_helper_config(move |config| {
+                let service = select_requested_service(config, requested_service);
+                let (view, _) = select_service_route_config_mut(config, service);
+                let order = normalize_complete_order(view, providers, None)?;
                 set_entry_routing(
                     view,
                     RouteStrategy::OrderedFailover,
@@ -232,11 +239,11 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                     Vec::new(),
                     RouteExhaustedAction::Continue,
                 );
-            }
-
-            save_helper_config(&cfg)
-                .await
-                .map_err(|e| CliError::Configuration(e.to_string()))?;
+                Ok(service)
+            })
+            .await
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let label = service_label(service);
             println!("{label} routing order updated");
         }
         RoutingCommand::PreferTag {
@@ -246,19 +253,19 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_helper_config(codex, claude, "routing")
+            let requested_service = requested_service(codex, claude)?;
+            load_helper_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            {
-                let (view, _) = select_service_route_config_mut(&mut cfg, service);
-                let prefer_tag =
-                    parse_cli_tags(&tags).map_err(|e| CliError::Configuration(e.to_string()))?;
+            let prefer_tag =
+                parse_cli_tags(&tags).map_err(|e| CliError::Configuration(e.to_string()))?;
+            let (_, service) = mutate_helper_config(move |config| {
+                let service = select_requested_service(config, requested_service);
+                let (view, _) = select_service_route_config_mut(config, service);
                 let order = if order.is_empty() {
-                    normalize_complete_order(view, Vec::new(), None)
-                        .map_err(|e| CliError::Configuration(e.to_string()))?
+                    normalize_complete_order(view, Vec::new(), None)?
                 } else {
-                    normalize_complete_order(view, order, None)
-                        .map_err(|e| CliError::Configuration(e.to_string()))?
+                    normalize_complete_order(view, order, None)?
                 };
                 let next_on_exhausted = on_exhausted
                     .map(Into::into)
@@ -271,40 +278,67 @@ pub async fn handle_routing_cmd(cmd: RoutingCommand) -> CliResult<()> {
                     vec![prefer_tag],
                     next_on_exhausted,
                 );
-            }
-
-            save_helper_config(&cfg)
-                .await
-                .map_err(|e| CliError::Configuration(e.to_string()))?;
+                Ok(service)
+            })
+            .await
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let label = service_label(service);
             println!("{label} tag-preferred routing updated");
         }
         RoutingCommand::ClearTarget { codex, claude } => {
-            let (mut cfg, service, label) = load_helper_config(codex, claude, "routing")
+            let requested_service = requested_service(codex, claude)?;
+            load_helper_config(codex, claude, "routing")
                 .await
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            {
-                let (view, _) = select_service_route_config_mut(&mut cfg, service);
+            let (_, service) = mutate_helper_config(move |config| {
+                let service = select_requested_service(config, requested_service);
+                let (view, _) = select_service_route_config_mut(config, service);
                 let current_routing = crate::config::effective_routing(view);
                 let Some(current_entry) = current_routing.entry_node() else {
-                    return Err(CliError::Configuration(
-                        "routing clear-target requires an existing source routing block"
-                            .to_string(),
-                    ));
+                    anyhow::bail!("routing clear-target requires an existing source routing block");
                 };
                 let next_order =
-                    normalize_complete_order(view, current_entry.children.clone(), None)
-                        .map_err(|e| CliError::Configuration(e.to_string()))?;
+                    normalize_complete_order(view, current_entry.children.clone(), None)?;
                 view.ensure_routing_mut().clear_entry_target(next_order);
-            }
-
-            save_helper_config(&cfg)
-                .await
-                .map_err(|e| CliError::Configuration(e.to_string()))?;
+                Ok(service)
+            })
+            .await
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let label = service_label(service);
             println!("{label} routing target cleared");
         }
     }
 
     Ok(())
+}
+
+fn requested_service(codex: bool, claude: bool) -> CliResult<Option<&'static str>> {
+    match (codex, claude) {
+        (true, true) => Err(CliError::Configuration(
+            "Please specify at most one of --codex / --claude".to_string(),
+        )),
+        (true, false) => Ok(Some("codex")),
+        (false, true) => Ok(Some("claude")),
+        (false, false) => Ok(None),
+    }
+}
+
+fn select_requested_service(
+    config: &crate::config::HelperConfig,
+    requested: Option<&'static str>,
+) -> &'static str {
+    requested.unwrap_or(match config.default_service {
+        Some(ServiceKind::Claude) => "claude",
+        Some(ServiceKind::Codex) | None => "codex",
+    })
+}
+
+fn service_label(service: &str) -> &'static str {
+    if service == "claude" {
+        "Claude"
+    } else {
+        "Codex"
+    }
 }
 
 fn persisted_routing_spec_from_view(view: &ServiceRouteConfig) -> PersistedRoutingSpec {
@@ -458,14 +492,14 @@ fn matches_prefer_tags(
     })
 }
 
-fn ensure_routing_target_exists(view: &ServiceRouteConfig, target: &str) -> CliResult<()> {
+fn ensure_routing_target_exists(view: &ServiceRouteConfig, target: &str) -> anyhow::Result<()> {
     if routing_target_exists(view, target) {
         Ok(())
     } else {
-        Err(CliError::Configuration(format!(
+        anyhow::bail!(
             "routing target '{}' not found in source routing config",
             target
-        )))
+        )
     }
 }
 

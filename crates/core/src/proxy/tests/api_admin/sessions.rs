@@ -47,7 +47,7 @@ async fn operator_read_model_reports_redacted_session_from_request_context() {
     assert_eq!(response.status(), StatusCode::OK);
     response.bytes().await.expect("responses body");
 
-    let identity_cards = state.list_session_identity_cards(10).await;
+    let identity_cards = state.list_session_identity_cards("codex", 10).await;
     assert_eq!(identity_cards.len(), 1);
     assert_eq!(identity_cards[0].session_id.as_deref(), Some("sid-client"));
     assert_eq!(

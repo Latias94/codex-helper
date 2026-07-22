@@ -61,6 +61,8 @@ mod runtime_config;
 mod selected_upstream_request;
 mod service_core;
 mod session_affinity_control;
+mod session_binding_control;
+mod settings_control;
 mod stream;
 mod target_builder;
 #[cfg(test)]
@@ -97,8 +99,11 @@ pub use self::codex_relay_probe::{
 };
 use self::concurrency_limits::ConcurrencyLimiter;
 pub(crate) use self::control_plane_manifest::{
-    LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_OPERATOR_SESSION,
-    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SERVICE_RUNTIME_READ, LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_DEFAULT_PROFILE_MUTATION,
+    LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_RELAY_CAPABILITIES, LOCAL_V1_RELAY_LIVE_SMOKE,
+    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_RUNTIME_RELOAD, LOCAL_V1_SERVICE_RUNTIME_READ,
+    LOCAL_V1_SESSION_AFFINITY_MUTATION, LOCAL_V1_SESSION_BINDING_MUTATION,
+    LOCAL_V1_SESSION_METADATA_READ,
 };
 pub(crate) use self::entrypoint::handle_proxy;
 pub(crate) use self::local_operator_routes::{
@@ -117,6 +122,16 @@ use self::runtime_config::RuntimeConfig;
 pub use self::session_affinity_control::{
     OperatorSessionAffinityCommand, OperatorSessionAffinityMutationRequest,
     OperatorSessionAffinityMutationResponse, OperatorSessionAffinityMutationStatus,
+};
+pub use self::session_binding_control::{
+    OperatorSessionBindingCommand, OperatorSessionBindingMutationRequest,
+    OperatorSessionBindingMutationResponse, OperatorSessionBindingMutationStatus,
+};
+pub use self::settings_control::{
+    EffectiveDefaultProfileSource, OperatorDefaultProfileMutationRequest,
+    OperatorDefaultProfileMutationResponse, OperatorDefaultProfileMutationStatus,
+    OperatorDefaultProfileScope, OperatorRuntimeReloadRequest, OperatorRuntimeReloadResponse,
+    RuntimeDefaultProfileControlSnapshot,
 };
 
 pub const ADMIN_TOKEN_ENV_VAR: &str = "CODEX_HELPER_ADMIN_TOKEN";

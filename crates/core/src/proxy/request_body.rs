@@ -298,6 +298,34 @@ pub(super) fn normalize_codex_compact_request_value(value: &mut serde_json::Valu
     }
 }
 
+pub(super) fn build_codex_remote_compaction_v2_downgrade_body(body: &[u8]) -> Option<Bytes> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    remove_compaction_trigger_items(&mut value);
+    normalize_codex_compact_request_value(&mut value);
+    serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
+fn remove_compaction_trigger_items(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            items.retain(|item| {
+                item.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|item_type| item_type != "compaction_trigger")
+            });
+            for item in items {
+                remove_compaction_trigger_items(item);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for nested in object.values_mut() {
+                remove_compaction_trigger_items(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn remove_hosted_image_generation_tools_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(object) => {
@@ -588,9 +616,9 @@ mod tests {
         DeferredReasoningIntentError, ReasoningOrchestrationIntent, RequestDialect,
         apply_deferred_reasoning_intent, apply_model_override_value,
         apply_reasoning_effort_override_value, apply_service_tier_override_value,
-        codex_compact_request_requires_affinity, codex_responses_body_has_compaction_trigger,
-        codex_responses_body_requests_stream, complete_codex_session_fields,
-        extract_model_from_response_body, extract_model_from_value,
+        build_codex_remote_compaction_v2_downgrade_body, codex_compact_request_requires_affinity,
+        codex_responses_body_has_compaction_trigger, codex_responses_body_requests_stream,
+        complete_codex_session_fields, extract_model_from_response_body, extract_model_from_value,
         extract_reasoning_effort_from_value, extract_service_tier_from_response_body,
         extract_service_tier_from_value, is_stale_previous_response_error,
         normalize_codex_compact_request_value, remove_hosted_image_generation_tools_value,
@@ -871,6 +899,63 @@ mod tests {
             value["future_request_field"]["enabled"].as_bool(),
             Some(true)
         );
+    }
+
+    #[test]
+    fn builds_remote_compaction_downgrade_body_without_v2_only_fields() {
+        let body = br#"{
+            "model":"gpt-5.5",
+            "input":[
+                {"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"hello"},
+                    {"type":"compaction_trigger"}
+                ]},
+                {"type":"compaction_trigger","encrypted_content":"opaque"},
+                {"type":"message","metadata":{"items":[
+                    {"type":"compaction_trigger"},
+                    {"type":"future_item","enabled":true}
+                ]}}
+            ],
+            "stream":true,
+            "store":true,
+            "previous_response_id":"resp_123",
+            "include":["reasoning.encrypted_content"],
+            "future_request_field":{"enabled":true}
+        }"#;
+
+        let downgraded = build_codex_remote_compaction_v2_downgrade_body(body)
+            .expect("build v1 compact request body");
+        let value: serde_json::Value =
+            serde_json::from_slice(downgraded.as_ref()).expect("downgrade body JSON");
+
+        assert_eq!(value["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(value["input"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            value["input"][0]["content"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            value["input"][1]["metadata"]["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            value["input"][1]["metadata"]["items"][0]["type"].as_str(),
+            Some("future_item")
+        );
+        for field in ["stream", "store", "previous_response_id", "include"] {
+            assert!(value.get(field).is_none(), "{field} must be removed");
+        }
+        assert_eq!(
+            value["future_request_field"]["enabled"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn remote_compaction_downgrade_rejects_malformed_json() {
+        assert!(build_codex_remote_compaction_v2_downgrade_body(b"not json").is_none());
     }
 
     #[test]

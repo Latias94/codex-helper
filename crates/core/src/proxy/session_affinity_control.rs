@@ -58,9 +58,9 @@ pub(super) async fn mutate_operator_session_affinity(
 
     let operator_capture = proxy.operator_read_capture().await?;
     let session_id = operator_capture
-        .local_session_ids
+        .local_sessions
         .get(session_key)
-        .cloned()
+        .map(|session| session.raw_session_id.clone())
         .ok_or_else(|| {
             ProxyControlError::new(
                 StatusCode::NOT_FOUND,

@@ -126,11 +126,7 @@ pub(super) fn apply_codex_recent_refresh_result(
             ui.codex_recent_rows = payload.rows;
             ui.codex_recent_branch_cache.replace(payload.branch_cache);
             ui.codex_recent_error = None;
-            ui.codex_recent_selected_idx = 0;
-            ui.codex_recent_selected_id =
-                ui.codex_recent_rows.first().map(|r| r.session_id.clone());
-            ui.codex_recent_table
-                .select((!ui.codex_recent_rows.is_empty()).then_some(0));
+            ui.sync_codex_recent_selection(now_ms());
             ui.toast = Some((
                 i18n::format_recent_loaded(ui.language, ui.codex_recent_rows.len()),
                 Instant::now(),
@@ -243,5 +239,48 @@ async fn read_git_branch_shallow(workdir: &str) -> Option<String> {
         None
     } else {
         Some(head.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recent_row(session_id: &str) -> RecentCodexRow {
+        RecentCodexRow {
+            root: format!("/{session_id}"),
+            branch: None,
+            session_id: session_id.to_string(),
+            cwd: None,
+            mtime_ms: now_ms(),
+        }
+    }
+
+    #[test]
+    fn recent_refresh_preserves_selection_by_session_id_after_reorder() {
+        let mut ui = UiState {
+            codex_recent_refresh_generation: 7,
+            codex_recent_rows: vec![recent_row("session-a"), recent_row("session-b")],
+            codex_recent_selected_idx: 1,
+            codex_recent_selected_id: Some("session-b".to_string()),
+            ..UiState::default()
+        };
+        ui.codex_recent_table.select(Some(1));
+
+        let applied = apply_codex_recent_refresh_result(
+            &mut ui,
+            CodexRecentRefreshResult {
+                generation: 7,
+                result: Ok(CodexRecentRefreshPayload {
+                    rows: vec![recent_row("session-b"), recent_row("session-a")],
+                    branch_cache: HashMap::new(),
+                }),
+            },
+        );
+
+        assert!(applied);
+        assert_eq!(ui.codex_recent_selected_idx, 0);
+        assert_eq!(ui.codex_recent_selected_id.as_deref(), Some("session-b"));
+        assert_eq!(ui.codex_recent_table.selected(), Some(0));
     }
 }

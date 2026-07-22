@@ -56,27 +56,106 @@ pub fn append_line(path: impl AsRef<Path>, retention: LogRetention, line: &str) 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    rotate_and_prune_if_needed(path, retention);
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    try_rotate_and_prune_if_needed(path, retention)?;
+    let mut file = open_private_append_file(path)?;
     writeln!(file, "{line}")?;
     Ok(())
 }
 
+fn open_private_append_file(path: &Path) -> io::Result<File> {
+    let existed_before_open = path.exists();
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    secure_open_private_log_file(&file, path, existed_before_open)?;
+    Ok(file)
+}
+
+fn secure_existing_private_log_file(path: &Path) -> io::Result<()> {
+    let file = match OpenOptions::new().append(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    secure_open_private_log_file(&file, path, true)
+}
+
+fn secure_open_private_log_file(
+    file: &File,
+    path: &Path,
+    existed_before_open: bool,
+) -> io::Result<()> {
+    let _ = (file, path, existed_before_open);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = file.metadata()?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(windows)]
+    secure_private_windows_log_path(path, existed_before_open)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn secure_private_windows_log_path(path: &Path, existed_before_open: bool) -> io::Result<()> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static SECURED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let mut secured = SECURED_PATHS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(parent) = path.parent()
+        && !secured.contains(parent)
+    {
+        crate::local_operator::secure_private_windows_path(parent, true)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        secured.insert(parent.to_path_buf());
+    }
+
+    if !existed_before_open || !secured.contains(path) {
+        crate::local_operator::secure_private_windows_path(path, false)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        secured.insert(path.to_path_buf());
+    }
+
+    Ok(())
+}
+
 pub fn rotate_and_prune_if_needed(path: impl AsRef<Path>, retention: LogRetention) {
+    let _ = try_rotate_and_prune_if_needed(path, retention);
+}
+
+fn try_rotate_and_prune_if_needed(
+    path: impl AsRef<Path>,
+    retention: LogRetention,
+) -> io::Result<()> {
     let path = path.as_ref();
+    secure_existing_private_log_file(path)?;
     if !retention.enabled() {
-        return;
+        return Ok(());
     }
     let Ok(meta) = fs::metadata(path) else {
-        return;
+        return Ok(());
     };
     if meta.len() < retention.max_bytes {
         prune_rotated_logs(path, retention);
-        return;
+        return Ok(());
     }
-    if rotate_log_path(path).is_ok() {
-        prune_rotated_logs(path, retention);
-    }
+    rotate_log_path(path)?;
+    prune_rotated_logs(path, retention);
+    Ok(())
 }
 
 pub fn prune_rotated_logs(path: impl AsRef<Path>, retention: LogRetention) {
@@ -167,10 +246,7 @@ impl RotatingLogWriter {
             if let Some(parent) = self.path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?;
+            let file = open_private_append_file(&self.path)?;
             self.current_len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
             self.file = Some(file);
         }
@@ -199,6 +275,7 @@ impl RotatingLogWriter {
 
 impl Write for RotatingLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.ensure_file()?;
         self.rotate_before_write(buf.len());
         let file = self.ensure_file()?;
         let written = file.write(buf)?;
@@ -429,6 +506,84 @@ mod tests {
             .expect("rotated file name");
         assert!(rotated_name.starts_with("control_trace."));
         assert!(rotated_name.ends_with(".jsonl"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_writers_create_and_repair_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_log_dir("private-files");
+        let active = dir.join("requests_debug.jsonl");
+        write_test_file(&active, 0);
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o644))
+            .expect("make legacy log too broad");
+
+        append_line(&active, LogRetention::new(1024, 2), "{}").expect("append private log line");
+
+        let mode = fs::metadata(&active)
+            .expect("private log metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_line_secures_existing_file_before_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_log_dir("private-jsonl-rotation");
+        let active = dir.join("requests_debug.jsonl");
+        write_test_file(&active, 24);
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o644))
+            .expect("make legacy log too broad");
+
+        append_line(&active, LogRetention::new(16, 2), "{}")
+            .expect("rotate and append private log line");
+
+        let rotated = collect_rotated_logs(&active);
+        assert_eq!(rotated.len(), 1);
+        for path in [&active, &rotated[0].path] {
+            let mode = fs::metadata(path)
+                .expect("private log metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "unexpected mode for {}", path.display());
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotating_writer_secures_existing_file_before_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_log_dir("private-writer-rotation");
+        let active = dir.join("runtime.log");
+        write_test_file(&active, 24);
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o644))
+            .expect("make legacy log too broad");
+
+        let mut writer = RotatingLogWriter::new(active.clone(), LogRetention::new(16, 2));
+        writer.write_all(b"next\n").expect("rotate private log");
+        writer.flush().expect("flush private log");
+        drop(writer);
+
+        let rotated = collect_rotated_logs(&active);
+        assert_eq!(rotated.len(), 1);
+        for path in [&active, &rotated[0].path] {
+            let mode = fs::metadata(path)
+                .expect("private log metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "unexpected mode for {}", path.display());
+        }
         let _ = fs::remove_dir_all(dir);
     }
 }

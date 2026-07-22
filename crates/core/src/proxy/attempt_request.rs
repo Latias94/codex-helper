@@ -10,7 +10,7 @@ use crate::codex_switch::CODEX_CLIENT_FACADE_ACTOR_HEADER;
 #[cfg(test)]
 use crate::config::UpstreamAuth;
 use crate::credentials::CapturedUpstreamCredential;
-use crate::logging::{BodyPreview, HeaderEntry, upstream_origin};
+use crate::logging::{BodyPreview, HeaderEntry, upstream_origin, upstream_uri_for_log};
 use crate::provider_catalog::AccountFingerprint;
 
 use super::headers::{
@@ -43,6 +43,7 @@ pub(super) struct AttemptRequestIdentityParams<'a> {
 }
 
 struct HttpDebugBaseParams<'a> {
+    route_attempt_index: u32,
     client_headers: &'a HeaderMap,
     client_headers_entries_cache: &'a OnceLock<Vec<HeaderEntry>>,
     upstream_request_headers: &'a HeaderMap,
@@ -77,6 +78,7 @@ pub(super) struct AttemptRequestSetupParams<'a> {
 }
 
 pub(super) struct FrozenAttemptRequestSetupParams<'a> {
+    pub(super) route_attempt_index: u32,
     pub(super) identity: &'a AttemptRequestIdentity,
     pub(super) client_headers: &'a HeaderMap,
     pub(super) client_headers_entries_cache: &'a OnceLock<Vec<HeaderEntry>>,
@@ -165,6 +167,7 @@ pub(super) fn prepare_attempt_request(
 
     Ok(prepare_attempt_request_with_identity(
         FrozenAttemptRequestSetupParams {
+            route_attempt_index: 0,
             identity: &identity,
             client_headers,
             client_headers_entries_cache,
@@ -186,6 +189,7 @@ pub(super) fn prepare_attempt_request_with_identity(
     params: FrozenAttemptRequestSetupParams<'_>,
 ) -> AttemptRequestSetup {
     let FrozenAttemptRequestSetupParams {
+        route_attempt_index,
         identity,
         client_headers,
         client_headers_entries_cache,
@@ -202,6 +206,7 @@ pub(super) fn prepare_attempt_request_with_identity(
     } = params;
 
     let debug_base = build_http_debug_base(HttpDebugBaseParams {
+        route_attempt_index,
         client_headers,
         client_headers_entries_cache,
         upstream_request_headers: &identity.headers,
@@ -329,6 +334,7 @@ fn strip_codex_client_account_headers(headers: &mut HeaderMap) {
 
 fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBase> {
     let HttpDebugBaseParams {
+        route_attempt_index,
         client_headers,
         client_headers_entries_cache,
         upstream_request_headers,
@@ -349,12 +355,14 @@ fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBas
     }
 
     Some(HttpDebugBase {
+        route_attempt_index,
         debug_max_body_bytes: debug_max,
         warn_max_body_bytes: warn_max,
         request_body_len,
         upstream_request_body_len,
-        client_uri: client_uri.to_string(),
+        client_uri: crate::logging::client_uri_for_log(client_uri),
         upstream_origin: upstream_origin(target_url),
+        upstream_uri: upstream_uri_for_log(target_url),
         client_headers: client_headers_entries_cache
             .get_or_init(|| header_map_to_entries(client_headers))
             .clone(),
@@ -1002,6 +1010,10 @@ mod tests {
         assert_eq!(
             debug_base.upstream_origin.as_deref(),
             Some("https://example.com:8443")
+        );
+        assert_eq!(
+            debug_base.upstream_uri.as_deref(),
+            Some("/private/secret-path")
         );
         assert_eq!(debug_base.request_body_len, 18);
         assert_eq!(debug_base.upstream_request_body_len, 22);

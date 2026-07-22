@@ -11,7 +11,10 @@ pub use crate::balance::{
     BalanceSnapshotStatus, ProviderBalanceSnapshot, ProviderRoutingBalanceSummary,
 };
 use crate::config::ServiceRouteConfig;
-use crate::endpoint_health::{COOLDOWN_SECS, CooldownBackoff, FAILURE_THRESHOLD};
+use crate::endpoint_health::{
+    COOLDOWN_SECS, CooldownBackoff, FAILURE_THRESHOLD, RouteCapability, RuntimeHealthDomain,
+    RuntimeHealthHalfOpenTerminal,
+};
 use crate::policy_actions::PolicyActionProjection;
 #[cfg(test)]
 use crate::pricing::capture_operator_model_price_catalog;
@@ -92,11 +95,12 @@ pub(crate) use self::session_identity::SessionRouteAffinitySuccess;
 pub use self::session_identity::{
     AccountingPoolMembership, AccountingPriceCoverage, ActiveRequest, FinishRequestParams,
     FinishedRequest, RequestAccountingFacts, RequestObservability, ResolvedRouteValue,
-    RouteDecisionProvenance, RouteValueSource, SessionBinding, SessionContinuityMode,
-    SessionIdentityCard, SessionIdentityCardBuildInputs, SessionIdentitySource,
-    SessionObservationScope, SessionRouteAffinity, SessionRouteAffinityTarget, SessionStats,
-    build_session_identity_cards_from_parts, classify_captured_cost,
-    enrich_session_identity_cards_with_host_transcripts,
+    RouteDecisionProvenance, RouteValueSource, SessionBinding, SessionBindingProjection,
+    SessionContinuityMode, SessionIdentityCard, SessionIdentityCardBuildInputs,
+    SessionIdentitySource, SessionObservationScope, SessionRouteAffinity,
+    SessionRouteAffinityTarget, SessionStats, build_session_identity_cards_from_parts,
+    classify_captured_cost, enrich_session_identity_cards_with_host_transcripts,
+    session_binding_revision,
 };
 pub use crate::sessions::{ProjectIdentity, ProjectIdentityKind};
 
@@ -154,18 +158,79 @@ pub(crate) fn is_logical_request_success_status(status_code: u16) -> bool {
     status_code == 101 || (200..300).contains(&status_code)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct ProviderEndpointRuntimeHealth {
     failure_count: u32,
     cooldown_until: Option<std::time::Instant>,
     penalty_streak: u32,
     last_good_at_ms: Option<u64>,
+    breaker_epoch: u64,
+    half_open_probe_attempted_epoch: Option<u64>,
+    half_open_probe_owner: Weak<()>,
+}
+
+impl Default for ProviderEndpointRuntimeHealth {
+    fn default() -> Self {
+        Self {
+            failure_count: 0,
+            cooldown_until: None,
+            penalty_streak: 0,
+            last_good_at_ms: None,
+            breaker_epoch: 0,
+            half_open_probe_attempted_epoch: None,
+            half_open_probe_owner: Weak::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProviderEndpointRuntimeHealthKey {
     provider_endpoint: ProviderEndpointKey,
     route_scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderEndpointRuntimeHealthBucketKey {
+    identity: ProviderEndpointRuntimeHealthKey,
+    domain: RuntimeHealthDomain,
+}
+
+impl ProviderEndpointRuntimeHealthBucketKey {
+    fn new(identity: ProviderEndpointRuntimeHealthKey, domain: RuntimeHealthDomain) -> Self {
+        Self { identity, domain }
+    }
+}
+
+struct RuntimeHealthHalfOpenProbeBucketLease {
+    key: ProviderEndpointRuntimeHealthBucketKey,
+    breaker_epoch: u64,
+}
+
+pub(crate) struct RuntimeHealthHalfOpenProbeLease {
+    identity: ProviderEndpointRuntimeHealthKey,
+    capability: RouteCapability,
+    owner: Arc<()>,
+    buckets: Vec<RuntimeHealthHalfOpenProbeBucketLease>,
+}
+
+pub(crate) struct DispatchedRuntimeHealthHalfOpenProbe {
+    identity: ProviderEndpointRuntimeHealthKey,
+    capability: RouteCapability,
+    buckets: Vec<RuntimeHealthHalfOpenProbeBucketLease>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeHealthHalfOpenProbeInvalidated;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeHealthHalfOpenSettlement {
+    Applied,
+    Stale,
+}
+
+struct RuntimeHealthHalfOpenProbeBucketSpec {
+    key: ProviderEndpointRuntimeHealthBucketKey,
+    breaker_epoch: u64,
 }
 
 impl ProviderEndpointRuntimeHealthKey {
@@ -185,34 +250,60 @@ struct ProviderEndpointRuntimeHealthState {
     active_revision: Option<u64>,
     identities_authoritative: bool,
     active_identities: HashSet<ProviderEndpointRuntimeHealthKey>,
-    health: HashMap<ProviderEndpointRuntimeHealthKey, ProviderEndpointRuntimeHealth>,
+    health: HashMap<ProviderEndpointRuntimeHealthBucketKey, ProviderEndpointRuntimeHealth>,
 }
 
 fn project_provider_endpoint_runtime_health(
     runtime: &mut RoutePlanRuntimeState,
     state: &mut ProviderEndpointRuntimeHealthState,
     identities: &[ProviderEndpointRuntimeHealthKey],
+    capability: Option<RouteCapability>,
     now: std::time::Instant,
 ) {
+    let Some(capability) = capability else {
+        return;
+    };
     let mut affinity: Option<(ProviderEndpointKey, u64)> = None;
     for identity in identities {
-        let Some(health) = state.health.get_mut(identity) else {
-            continue;
-        };
-        if health.cooldown_until.is_some_and(|until| now >= until) {
-            health.failure_count = 0;
-            health.cooldown_until = None;
+        let domains = [
+            RuntimeHealthDomain::EndpointTransport,
+            RuntimeHealthDomain::Credential,
+            RuntimeHealthDomain::Capability(capability),
+            RuntimeHealthDomain::Capacity(capability),
+        ];
+        let mut failure_count = 0;
+        let mut cooldown_until = None;
+        let mut projected = false;
+        let mut capability_last_good_at_ms = None;
+        for domain in domains {
+            let key = ProviderEndpointRuntimeHealthBucketKey::new(identity.clone(), domain);
+            let Some(health) = state.health.get_mut(&key) else {
+                continue;
+            };
+            projected = true;
+            reset_expired_runtime_health_breaker(health, now);
+            failure_count = failure_count.max(health.failure_count);
+            if let Some(until) = health.cooldown_until
+                && cooldown_until.is_none_or(|current| until > current)
+            {
+                cooldown_until = Some(until);
+            }
+            if domain == RuntimeHealthDomain::Capability(capability) {
+                capability_last_good_at_ms = health.last_good_at_ms;
+            }
         }
-        let cooldown_active = health.cooldown_until.is_some_and(|until| now < until);
-        let cooldown_remaining_secs = health
-            .cooldown_until
+        if !projected {
+            continue;
+        }
+        let cooldown_active = cooldown_until.is_some_and(|until| now < until);
+        let cooldown_remaining_secs = cooldown_until
             .and_then(|until| (now < until).then(|| until.duration_since(now).as_secs().max(1)));
         runtime.set_provider_endpoint(
             identity.provider_endpoint.clone(),
             RoutePlanUpstreamRuntimeState {
                 runtime_disabled: false,
                 draining: false,
-                failure_count: health.failure_count,
+                failure_count,
                 cooldown_active,
                 cooldown_remaining_secs,
                 usage_exhausted: false,
@@ -222,7 +313,7 @@ fn project_provider_endpoint_runtime_health(
                 concurrency_limit: None,
             },
         );
-        if let Some(last_good_at_ms) = health.last_good_at_ms
+        if let Some(last_good_at_ms) = capability_last_good_at_ms
             && affinity
                 .as_ref()
                 .is_none_or(|(_, current)| last_good_at_ms > *current)
@@ -233,6 +324,149 @@ fn project_provider_endpoint_runtime_health(
     if let Some((provider_endpoint, _)) = affinity {
         runtime.set_affinity_provider_endpoint(Some(provider_endpoint));
     }
+}
+
+fn reset_expired_runtime_health_breaker(
+    health: &mut ProviderEndpointRuntimeHealth,
+    now: std::time::Instant,
+) {
+    if health.cooldown_until.is_some_and(|until| now >= until) {
+        health.failure_count = 0;
+        health.cooldown_until = None;
+    }
+}
+
+fn runtime_health_breaker_is_open(
+    health: &ProviderEndpointRuntimeHealth,
+    now: std::time::Instant,
+) -> bool {
+    health.failure_count >= FAILURE_THRESHOLD
+        || health.cooldown_until.is_some_and(|until| now < until)
+}
+
+fn begin_runtime_health_breaker_epoch(health: &mut ProviderEndpointRuntimeHealth) {
+    health.breaker_epoch = health.breaker_epoch.saturating_add(1).max(1);
+    health.half_open_probe_attempted_epoch = None;
+    health.half_open_probe_owner = Weak::new();
+}
+
+fn record_runtime_health_success(
+    health: &mut ProviderEndpointRuntimeHealth,
+    domain: RuntimeHealthDomain,
+    capability: RouteCapability,
+    now_ms: u64,
+) {
+    health.failure_count = 0;
+    health.cooldown_until = None;
+    health.penalty_streak = 0;
+    health.half_open_probe_attempted_epoch = None;
+    health.half_open_probe_owner = Weak::new();
+    health.last_good_at_ms =
+        (domain == RuntimeHealthDomain::Capability(capability)).then_some(now_ms);
+}
+
+fn record_runtime_health_failure(
+    health: &mut ProviderEndpointRuntimeHealth,
+    failure_threshold_cooldown_secs: u64,
+    cooldown_backoff: CooldownBackoff,
+    now: std::time::Instant,
+) {
+    reset_expired_runtime_health_breaker(health, now);
+    let was_open = runtime_health_breaker_is_open(health, now);
+    health.failure_count = health.failure_count.saturating_add(1);
+    if health.failure_count < FAILURE_THRESHOLD {
+        return;
+    }
+
+    if !was_open {
+        begin_runtime_health_breaker_epoch(health);
+    }
+    let base_secs = if failure_threshold_cooldown_secs == 0 {
+        COOLDOWN_SECS
+    } else {
+        failure_threshold_cooldown_secs
+    };
+    let effective_secs = cooldown_backoff.effective_cooldown_secs(base_secs, health.penalty_streak);
+    let new_until = now + std::time::Duration::from_secs(effective_secs);
+    if health
+        .cooldown_until
+        .is_none_or(|existing| new_until > existing)
+    {
+        health.cooldown_until = Some(new_until);
+    }
+    health.penalty_streak = health.penalty_streak.saturating_add(1);
+    health.last_good_at_ms = None;
+}
+
+fn penalize_runtime_health(
+    health: &mut ProviderEndpointRuntimeHealth,
+    cooldown_secs: u64,
+    cooldown_backoff: CooldownBackoff,
+    now: std::time::Instant,
+) {
+    reset_expired_runtime_health_breaker(health, now);
+    if !runtime_health_breaker_is_open(health, now) {
+        begin_runtime_health_breaker_epoch(health);
+    }
+    let effective_secs =
+        cooldown_backoff.effective_cooldown_secs(cooldown_secs, health.penalty_streak);
+    health.failure_count = FAILURE_THRESHOLD;
+    health.cooldown_until = Some(now + std::time::Duration::from_secs(effective_secs));
+    health.penalty_streak = health.penalty_streak.saturating_add(1);
+    health.last_good_at_ms = None;
+}
+
+fn half_open_probe_bucket_specs(
+    state: &mut ProviderEndpointRuntimeHealthState,
+    identity: &ProviderEndpointRuntimeHealthKey,
+    capability: RouteCapability,
+    now: std::time::Instant,
+    expected_owner: Option<&Arc<()>>,
+) -> Option<Vec<RuntimeHealthHalfOpenProbeBucketSpec>> {
+    for domain in [
+        RuntimeHealthDomain::Credential,
+        RuntimeHealthDomain::Capacity(capability),
+    ] {
+        let key = ProviderEndpointRuntimeHealthBucketKey::new(identity.clone(), domain);
+        let Some(health) = state.health.get_mut(&key) else {
+            continue;
+        };
+        reset_expired_runtime_health_breaker(health, now);
+        if runtime_health_breaker_is_open(health, now) {
+            return None;
+        }
+    }
+
+    let mut specs = Vec::new();
+    for domain in [
+        RuntimeHealthDomain::EndpointTransport,
+        RuntimeHealthDomain::Capability(capability),
+    ] {
+        let key = ProviderEndpointRuntimeHealthBucketKey::new(identity.clone(), domain);
+        let Some(health) = state.health.get_mut(&key) else {
+            continue;
+        };
+        reset_expired_runtime_health_breaker(health, now);
+        if !runtime_health_breaker_is_open(health, now) {
+            continue;
+        }
+        if health.breaker_epoch == 0 {
+            health.breaker_epoch = 1;
+        }
+        if health.half_open_probe_attempted_epoch == Some(health.breaker_epoch) {
+            return None;
+        }
+        match (health.half_open_probe_owner.upgrade(), expected_owner) {
+            (Some(owner), Some(expected)) if Arc::ptr_eq(expected, &owner) => {}
+            (Some(_), _) | (None, Some(_)) => return None,
+            (None, None) => {}
+        }
+        specs.push(RuntimeHealthHalfOpenProbeBucketSpec {
+            key,
+            breaker_epoch: health.breaker_epoch,
+        });
+    }
+    (!specs.is_empty()).then_some(specs)
 }
 
 fn apply_provider_policy_to_route_runtime(
@@ -275,13 +509,21 @@ fn apply_provider_policy_to_route_runtime(
 fn active_provider_endpoint_runtime_health<'a>(
     service_name: &str,
     identity: &RuntimeUpstreamIdentity,
+    domain: RuntimeHealthDomain,
     state: &'a mut ProviderEndpointRuntimeHealthState,
 ) -> Option<&'a mut ProviderEndpointRuntimeHealth> {
-    let key = ProviderEndpointRuntimeHealthKey::for_service(service_name, identity)?;
-    if state.active_revision.is_some() && !state.active_identities.contains(&key) {
+    let identity = ProviderEndpointRuntimeHealthKey::for_service(service_name, identity)?;
+    if state.active_revision.is_some() && !state.active_identities.contains(&identity) {
         return None;
     }
-    Some(state.health.entry(key).or_default())
+    Some(
+        state
+            .health
+            .entry(ProviderEndpointRuntimeHealthBucketKey::new(
+                identity, domain,
+            ))
+            .or_default(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -875,7 +1117,7 @@ struct RequestLifecycleProjectionState {
     recent_finished: VecDeque<FinishedRequest>,
     usage_rollups: HashMap<String, UsageRollup>,
     operator_usage_summaries: OperatorUsageSummaryMap,
-    session_stats: HashMap<String, SessionStats>,
+    session_stats: HashMap<String, HashMap<String, SessionStats>>,
     attribution_index: AttributionIndex,
 }
 
@@ -885,6 +1127,7 @@ pub(crate) struct OperatorLifecycleSnapshot {
     pub(crate) ledger_revision: OperatorLedgerRevision,
     pub(crate) active_requests: Vec<ActiveRequest>,
     pub(crate) recent_finished: Vec<FinishedRequest>,
+    pub(crate) session_stats: HashMap<String, SessionStats>,
     usage_rollup: Option<UsageRollup>,
     usage_summaries: OperatorUsageSummaryServiceMap,
 }
@@ -1017,13 +1260,17 @@ fn usage_rollup_cutoff_ms(now_ms: u64) -> u64 {
 }
 
 fn hydrate_session_stats_newest_first(
-    stats: &mut HashMap<String, SessionStats>,
+    stats: &mut HashMap<String, HashMap<String, SessionStats>>,
     finished: &FinishedRequest,
 ) {
     let Some(session_id) = finished.session_id.as_deref() else {
         return;
     };
-    let entry = stats.entry(session_id.to_string()).or_default();
+    let entry = stats
+        .entry(finished.service.clone())
+        .or_default()
+        .entry(session_id.to_string())
+        .or_default();
     entry.turns_total = entry.turns_total.saturating_add(1);
     if entry.last_session_identity_source.is_none() {
         entry.last_session_identity_source = finished.session_identity_source;
@@ -1656,8 +1903,8 @@ impl ProxyState {
         let recent_finished = request_state
             .recent_finished
             .iter()
-            .take(recent_limit)
             .filter(|request| request.service == service_name)
+            .take(recent_limit)
             .cloned()
             .collect();
 
@@ -1669,6 +1916,11 @@ impl ProxyState {
             ),
             active_requests,
             recent_finished,
+            session_stats: request_state
+                .session_stats
+                .get(service_name)
+                .cloned()
+                .unwrap_or_default(),
             usage_rollup: request_state
                 .usage_rollups
                 .get(service_name)
@@ -1766,6 +2018,10 @@ impl ProxyState {
         self.state_version_tx.send_modify(|version| {
             *version = version.wrapping_add(1);
         });
+    }
+
+    pub(crate) fn notify_runtime_snapshot_changed(&self) {
+        self.notify_state_changed();
     }
 
     pub async fn get_session_binding(&self, session_id: &str) -> Option<SessionBinding> {
@@ -2204,11 +2460,18 @@ impl ProxyState {
         {
             let mut guard = self.provider_endpoint_runtime_health.write().await;
             if let Some(per_service) = guard.get_mut(service_name) {
-                let keys = per_service.health.keys().cloned().collect::<Vec<_>>();
+                let keys = per_service
+                    .health
+                    .keys()
+                    .map(|bucket| bucket.identity.clone())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 project_provider_endpoint_runtime_health(
                     &mut runtime,
                     per_service,
                     keys.as_slice(),
+                    Some(RouteCapability::Inference),
                     now,
                 );
             }
@@ -2228,6 +2491,24 @@ impl ProxyState {
         policy_snapshot: &ProviderPolicySnapshot,
         runtime_revision: u64,
         runtime_identities: &[RuntimeUpstreamIdentity],
+    ) -> RoutePlanRuntimeState {
+        self.route_plan_runtime_state_with_provider_policy_for_capability(
+            service_name,
+            policy_snapshot,
+            runtime_revision,
+            runtime_identities,
+            Some(RouteCapability::Inference),
+        )
+        .await
+    }
+
+    pub(crate) async fn route_plan_runtime_state_with_provider_policy_for_capability(
+        &self,
+        service_name: &str,
+        policy_snapshot: &ProviderPolicySnapshot,
+        runtime_revision: u64,
+        runtime_identities: &[RuntimeUpstreamIdentity],
+        capability: Option<RouteCapability>,
     ) -> RoutePlanRuntimeState {
         let projected_keys = runtime_identities
             .iter()
@@ -2260,7 +2541,7 @@ impl ProxyState {
                         per_service.active_identities = projected_keys.clone();
                         per_service
                             .health
-                            .retain(|identity, _| projected_keys.contains(identity));
+                            .retain(|bucket, _| projected_keys.contains(&bucket.identity));
                     }
                 }
             }
@@ -2273,6 +2554,7 @@ impl ProxyState {
                 &mut runtime,
                 per_service,
                 active_keys.as_slice(),
+                capability,
                 now,
             );
         }
@@ -2315,7 +2597,7 @@ impl ProxyState {
                 let before = per_service.health.len();
                 per_service
                     .health
-                    .retain(|identity, _| per_service.active_identities.contains(identity));
+                    .retain(|bucket, _| per_service.active_identities.contains(&bucket.identity));
                 changed |= before != per_service.health.len();
             }
         }
@@ -2491,7 +2773,7 @@ impl ProxyState {
             let before = state.health.len();
             state
                 .health
-                .retain(|identity, _| state.active_identities.contains(identity));
+                .retain(|bucket, _| state.active_identities.contains(&bucket.identity));
             changed |= before != state.health.len();
         }
         (next, changed)
@@ -2725,23 +3007,301 @@ impl ProxyState {
             .collect()
     }
 
+    pub(crate) async fn half_open_probe_eligible_provider_endpoints(
+        &self,
+        service_name: &str,
+        identities: &[RuntimeUpstreamIdentity],
+        capability: RouteCapability,
+    ) -> HashSet<ProviderEndpointKey> {
+        let mut guard = self.provider_endpoint_runtime_health.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return HashSet::new();
+        };
+        let now = std::time::Instant::now();
+        identities
+            .iter()
+            .filter_map(|identity| {
+                let identity_key =
+                    ProviderEndpointRuntimeHealthKey::for_service(service_name, identity)?;
+                if per_service.active_revision.is_some()
+                    && !per_service.active_identities.contains(&identity_key)
+                {
+                    return None;
+                }
+                half_open_probe_bucket_specs(per_service, &identity_key, capability, now, None)
+                    .is_some()
+                    .then(|| identity.provider_endpoint.clone())
+            })
+            .collect()
+    }
+
+    pub(crate) async fn try_acquire_runtime_half_open_probe(
+        &self,
+        service_name: &str,
+        identity: &RuntimeUpstreamIdentity,
+        capability: RouteCapability,
+    ) -> Option<RuntimeHealthHalfOpenProbeLease> {
+        let identity_key = ProviderEndpointRuntimeHealthKey::for_service(service_name, identity)?;
+        let owner = Arc::new(());
+        let mut guard = self.provider_endpoint_runtime_health.write().await;
+        let per_service = guard.get_mut(service_name)?;
+        if per_service.active_revision.is_some()
+            && !per_service.active_identities.contains(&identity_key)
+        {
+            return None;
+        }
+        let specs = half_open_probe_bucket_specs(
+            per_service,
+            &identity_key,
+            capability,
+            std::time::Instant::now(),
+            None,
+        )?;
+        for spec in &specs {
+            let health = per_service.health.get_mut(&spec.key)?;
+            health.half_open_probe_owner = Arc::downgrade(&owner);
+        }
+        let buckets = specs
+            .into_iter()
+            .map(|spec| RuntimeHealthHalfOpenProbeBucketLease {
+                key: spec.key,
+                breaker_epoch: spec.breaker_epoch,
+            })
+            .collect();
+        Some(RuntimeHealthHalfOpenProbeLease {
+            identity: identity_key,
+            capability,
+            owner,
+            buckets,
+        })
+    }
+
+    pub(crate) async fn validate_runtime_half_open_probe(
+        &self,
+        probe: &RuntimeHealthHalfOpenProbeLease,
+    ) -> bool {
+        let service_name = probe.identity.provider_endpoint.service_name.as_str();
+        let mut guard = self.provider_endpoint_runtime_health.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return false;
+        };
+        if per_service.active_revision.is_some()
+            && !per_service.active_identities.contains(&probe.identity)
+        {
+            return false;
+        }
+        let Some(specs) = half_open_probe_bucket_specs(
+            per_service,
+            &probe.identity,
+            probe.capability,
+            std::time::Instant::now(),
+            Some(&probe.owner),
+        ) else {
+            return false;
+        };
+        specs.len() == probe.buckets.len()
+            && probe.buckets.iter().all(|bucket| {
+                specs.iter().any(|spec| {
+                    spec.key == bucket.key && spec.breaker_epoch == bucket.breaker_epoch
+                })
+            })
+    }
+
+    pub(crate) async fn dispatch_runtime_half_open_probe(
+        &self,
+        probe: RuntimeHealthHalfOpenProbeLease,
+    ) -> Result<DispatchedRuntimeHealthHalfOpenProbe, RuntimeHealthHalfOpenProbeInvalidated> {
+        let service_name = probe.identity.provider_endpoint.service_name.as_str();
+        let mut guard = self.provider_endpoint_runtime_health.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return Err(RuntimeHealthHalfOpenProbeInvalidated);
+        };
+        if per_service.active_revision.is_some()
+            && !per_service.active_identities.contains(&probe.identity)
+        {
+            return Err(RuntimeHealthHalfOpenProbeInvalidated);
+        }
+        let Some(specs) = half_open_probe_bucket_specs(
+            per_service,
+            &probe.identity,
+            probe.capability,
+            std::time::Instant::now(),
+            Some(&probe.owner),
+        ) else {
+            return Err(RuntimeHealthHalfOpenProbeInvalidated);
+        };
+        if specs.len() != probe.buckets.len()
+            || probe.buckets.iter().any(|bucket| {
+                !specs.iter().any(|spec| {
+                    spec.key == bucket.key && spec.breaker_epoch == bucket.breaker_epoch
+                })
+            })
+        {
+            return Err(RuntimeHealthHalfOpenProbeInvalidated);
+        }
+
+        for bucket in &probe.buckets {
+            let Some(health) = per_service.health.get_mut(&bucket.key) else {
+                return Err(RuntimeHealthHalfOpenProbeInvalidated);
+            };
+            health.half_open_probe_attempted_epoch = Some(bucket.breaker_epoch);
+            health.half_open_probe_owner = Weak::new();
+        }
+        Ok(DispatchedRuntimeHealthHalfOpenProbe {
+            identity: probe.identity,
+            capability: probe.capability,
+            buckets: probe.buckets,
+        })
+    }
+
+    pub(crate) async fn validate_dispatched_runtime_half_open_probe(
+        &self,
+        probe: &DispatchedRuntimeHealthHalfOpenProbe,
+    ) -> bool {
+        let service_name = probe.identity.provider_endpoint.service_name.as_str();
+        let guard = self.provider_endpoint_runtime_health.read().await;
+        let Some(per_service) = guard.get(service_name) else {
+            return false;
+        };
+        if per_service.active_revision.is_some()
+            && !per_service.active_identities.contains(&probe.identity)
+        {
+            return false;
+        }
+        !probe.buckets.is_empty()
+            && probe.buckets.iter().all(|bucket| {
+                bucket.key.identity == probe.identity
+                    && per_service.health.get(&bucket.key).is_some_and(|health| {
+                        health.breaker_epoch == bucket.breaker_epoch
+                            && health.half_open_probe_attempted_epoch == Some(bucket.breaker_epoch)
+                    })
+            })
+    }
+
+    pub(crate) async fn settle_runtime_half_open_probe(
+        &self,
+        probe: DispatchedRuntimeHealthHalfOpenProbe,
+        terminal: RuntimeHealthHalfOpenTerminal,
+    ) -> RuntimeHealthHalfOpenSettlement {
+        let service_name = probe.identity.provider_endpoint.service_name.as_str();
+        let mut guard = self.provider_endpoint_runtime_health.write().await;
+        let Some(per_service) = guard.get_mut(service_name) else {
+            return RuntimeHealthHalfOpenSettlement::Stale;
+        };
+        if per_service.active_revision.is_some()
+            && !per_service.active_identities.contains(&probe.identity)
+        {
+            return RuntimeHealthHalfOpenSettlement::Stale;
+        }
+        let current = !probe.buckets.is_empty()
+            && probe.buckets.iter().all(|bucket| {
+                bucket.key.identity == probe.identity
+                    && per_service.health.get(&bucket.key).is_some_and(|health| {
+                        health.breaker_epoch == bucket.breaker_epoch
+                            && health.half_open_probe_attempted_epoch == Some(bucket.breaker_epoch)
+                    })
+            });
+        if !current {
+            return RuntimeHealthHalfOpenSettlement::Stale;
+        }
+
+        match terminal {
+            RuntimeHealthHalfOpenTerminal::Success { now_ms } => {
+                for bucket in &probe.buckets {
+                    let Some(health) = per_service.health.get_mut(&bucket.key) else {
+                        return RuntimeHealthHalfOpenSettlement::Stale;
+                    };
+                    record_runtime_health_success(
+                        health,
+                        bucket.key.domain,
+                        probe.capability,
+                        now_ms,
+                    );
+                }
+            }
+            RuntimeHealthHalfOpenTerminal::CountedFailure {
+                domain,
+                failure_threshold_cooldown_secs,
+                cooldown_backoff,
+            } => {
+                let health = per_service
+                    .health
+                    .entry(ProviderEndpointRuntimeHealthBucketKey::new(
+                        probe.identity,
+                        domain,
+                    ))
+                    .or_default();
+                record_runtime_health_failure(
+                    health,
+                    failure_threshold_cooldown_secs,
+                    cooldown_backoff,
+                    std::time::Instant::now(),
+                );
+            }
+            RuntimeHealthHalfOpenTerminal::Penalty {
+                domain,
+                cooldown_secs,
+                cooldown_backoff,
+            } => {
+                let health = per_service
+                    .health
+                    .entry(ProviderEndpointRuntimeHealthBucketKey::new(
+                        probe.identity,
+                        domain,
+                    ))
+                    .or_default();
+                penalize_runtime_health(
+                    health,
+                    cooldown_secs,
+                    cooldown_backoff,
+                    std::time::Instant::now(),
+                );
+            }
+            RuntimeHealthHalfOpenTerminal::Neutral => {}
+        }
+        RuntimeHealthHalfOpenSettlement::Applied
+    }
+
     pub async fn record_runtime_upstream_attempt_success(
         &self,
         service_name: &str,
         identity: &RuntimeUpstreamIdentity,
         now_ms: u64,
     ) {
+        self.record_runtime_upstream_attempt_success_for_capability(
+            service_name,
+            identity,
+            RouteCapability::Inference,
+            now_ms,
+        )
+        .await;
+    }
+
+    pub(crate) async fn record_runtime_upstream_attempt_success_for_capability(
+        &self,
+        service_name: &str,
+        identity: &RuntimeUpstreamIdentity,
+        capability: RouteCapability,
+        now_ms: u64,
+    ) {
         let mut guard = self.provider_endpoint_runtime_health.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
-        let Some(entry) =
-            active_provider_endpoint_runtime_health(service_name, identity, per_service)
-        else {
-            return;
-        };
-        entry.failure_count = 0;
-        entry.cooldown_until = None;
-        entry.penalty_streak = 0;
-        entry.last_good_at_ms = Some(now_ms);
+        for domain in [
+            RuntimeHealthDomain::EndpointTransport,
+            RuntimeHealthDomain::Credential,
+            RuntimeHealthDomain::Capability(capability),
+            RuntimeHealthDomain::Capacity(capability),
+        ] {
+            let Some(entry) = active_provider_endpoint_runtime_health(
+                service_name,
+                identity,
+                domain,
+                per_service,
+            ) else {
+                return;
+            };
+            record_runtime_health_success(entry, domain, capability, now_ms);
+        }
     }
 
     pub async fn record_runtime_upstream_attempt_failure(
@@ -2751,34 +3311,38 @@ impl ProxyState {
         failure_threshold_cooldown_secs: u64,
         cooldown_backoff: CooldownBackoff,
     ) {
+        self.record_runtime_upstream_attempt_failure_for_domain(
+            service_name,
+            identity,
+            RuntimeHealthDomain::Capability(RouteCapability::Inference),
+            failure_threshold_cooldown_secs,
+            cooldown_backoff,
+        )
+        .await;
+    }
+
+    pub(crate) async fn record_runtime_upstream_attempt_failure_for_domain(
+        &self,
+        service_name: &str,
+        identity: &RuntimeUpstreamIdentity,
+        domain: RuntimeHealthDomain,
+        failure_threshold_cooldown_secs: u64,
+        cooldown_backoff: CooldownBackoff,
+    ) {
         let mut guard = self.provider_endpoint_runtime_health.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
         let Some(entry) =
-            active_provider_endpoint_runtime_health(service_name, identity, per_service)
+            active_provider_endpoint_runtime_health(service_name, identity, domain, per_service)
         else {
             return;
         };
 
-        entry.failure_count = entry.failure_count.saturating_add(1);
-        if entry.failure_count >= FAILURE_THRESHOLD {
-            let base_secs = if failure_threshold_cooldown_secs == 0 {
-                COOLDOWN_SECS
-            } else {
-                failure_threshold_cooldown_secs
-            };
-            let effective_secs =
-                cooldown_backoff.effective_cooldown_secs(base_secs, entry.penalty_streak);
-            let now = std::time::Instant::now();
-            let new_until = now + std::time::Duration::from_secs(effective_secs);
-            if entry
-                .cooldown_until
-                .is_none_or(|existing| new_until > existing)
-            {
-                entry.cooldown_until = Some(new_until);
-            }
-            entry.penalty_streak = entry.penalty_streak.saturating_add(1);
-            entry.last_good_at_ms = None;
-        }
+        record_runtime_health_failure(
+            entry,
+            failure_threshold_cooldown_secs,
+            cooldown_backoff,
+            std::time::Instant::now(),
+        );
     }
 
     pub async fn penalize_runtime_upstream_attempt(
@@ -2788,20 +3352,37 @@ impl ProxyState {
         cooldown_secs: u64,
         cooldown_backoff: CooldownBackoff,
     ) {
+        self.penalize_runtime_upstream_attempt_for_domain(
+            service_name,
+            identity,
+            RuntimeHealthDomain::Capability(RouteCapability::Inference),
+            cooldown_secs,
+            cooldown_backoff,
+        )
+        .await;
+    }
+
+    pub(crate) async fn penalize_runtime_upstream_attempt_for_domain(
+        &self,
+        service_name: &str,
+        identity: &RuntimeUpstreamIdentity,
+        domain: RuntimeHealthDomain,
+        cooldown_secs: u64,
+        cooldown_backoff: CooldownBackoff,
+    ) {
         let mut guard = self.provider_endpoint_runtime_health.write().await;
         let per_service = guard.entry(service_name.to_string()).or_default();
         let Some(entry) =
-            active_provider_endpoint_runtime_health(service_name, identity, per_service)
+            active_provider_endpoint_runtime_health(service_name, identity, domain, per_service)
         else {
             return;
         };
-        let effective_secs =
-            cooldown_backoff.effective_cooldown_secs(cooldown_secs, entry.penalty_streak);
-        entry.failure_count = FAILURE_THRESHOLD;
-        entry.cooldown_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(effective_secs));
-        entry.penalty_streak = entry.penalty_streak.saturating_add(1);
-        entry.last_good_at_ms = None;
+        penalize_runtime_health(
+            entry,
+            cooldown_secs,
+            cooldown_backoff,
+            std::time::Instant::now(),
+        );
     }
 
     #[cfg(test)]
@@ -2884,8 +3465,8 @@ impl ProxyState {
                 per_service.active_identities.retain(|identity| {
                     active_provider_endpoint_keys.contains(&identity.provider_endpoint)
                 });
-                per_service.health.retain(|identity, _| {
-                    active_provider_endpoint_keys.contains(&identity.provider_endpoint)
+                per_service.health.retain(|bucket, _| {
+                    active_provider_endpoint_keys.contains(&bucket.identity.provider_endpoint)
                 });
                 if !per_service.identities_authoritative
                     && per_service.active_identities.is_empty()
@@ -4257,6 +4838,7 @@ impl ProxyState {
             provider_endpoint,
             pool_membership,
             price_coverage: classify_captured_cost(&finished.cost),
+            cache_accounting_convention,
         };
         finished.refresh_observability();
 
@@ -4404,6 +4986,8 @@ impl ProxyState {
         if include_in_economics && let Some(sid) = finished.session_id.as_deref() {
             let entry = request_state
                 .session_stats
+                .entry(finished.service.clone())
+                .or_default()
                 .entry(sid.to_string())
                 .or_default();
             entry.turns_total = entry.turns_total.saturating_add(1);
@@ -4493,26 +5077,38 @@ impl ProxyState {
             .collect()
     }
 
-    pub async fn list_session_stats(&self) -> HashMap<String, SessionStats> {
+    pub async fn list_session_stats(&self, service_name: &str) -> HashMap<String, SessionStats> {
         self.request_lifecycle_projection
             .read()
             .await
             .session_stats
-            .clone()
+            .get(service_name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub async fn list_session_identity_cards(
         &self,
+        service_name: &str,
         recent_limit: usize,
     ) -> Vec<SessionIdentityCard> {
         let recent_limit = recent_limit.clamp(1, recent_finished_max());
         let (active, recent, bindings, route_affinities, stats) = tokio::join!(
             self.list_active_requests(),
-            self.list_recent_finished(recent_limit),
+            self.list_recent_finished(recent_finished_max()),
             self.list_session_bindings(),
             self.list_session_route_affinities(),
-            self.list_session_stats(),
+            self.list_session_stats(service_name),
         );
+        let active = active
+            .into_iter()
+            .filter(|request| request.service == service_name)
+            .collect::<Vec<_>>();
+        let recent = recent
+            .into_iter()
+            .filter(|request| request.service == service_name)
+            .take(recent_limit)
+            .collect::<Vec<_>>();
         build_session_identity_cards_from_parts(SessionIdentityCardBuildInputs {
             active: &active,
             recent: &recent,
@@ -4627,9 +5223,12 @@ impl ProxyState {
 
     pub async fn list_session_identity_cards_with_host_transcripts(
         &self,
+        service_name: &str,
         recent_limit: usize,
     ) -> Vec<SessionIdentityCard> {
-        let mut cards = self.list_session_identity_cards(recent_limit).await;
+        let mut cards = self
+            .list_session_identity_cards(service_name, recent_limit)
+            .await;
         self.enrich_session_identity_cards_with_cached_host_transcripts(&mut cards)
             .await;
         cards
@@ -4655,21 +5254,28 @@ impl ProxyState {
             .unwrap_or(0);
 
         // Collect active session_ids to avoid clearing overrides for currently running requests.
-        let active_sessions = {
+        let (active_sessions, active_service_sessions) = {
             let request_state = self.request_lifecycle_projection.read().await;
-            request_state
-                .active_requests
-                .values()
-                .filter_map(|request| request.session_id.as_ref())
-                .map(|session_id| (session_id.clone(), ()))
-                .collect::<HashMap<_, _>>()
+            let mut sessions = HashSet::new();
+            let mut service_sessions = HashMap::<String, HashSet<String>>::new();
+            for request in request_state.active_requests.values() {
+                let Some(session_id) = request.session_id.as_ref() else {
+                    continue;
+                };
+                sessions.insert(session_id.clone());
+                service_sessions
+                    .entry(request.service.clone())
+                    .or_default()
+                    .insert(session_id.clone());
+            }
+            (sessions, service_sessions)
         };
 
         if self.session_binding_ttl_ms > 0 && now_ms >= self.session_binding_ttl_ms {
             let cutoff_binding = now_ms - self.session_binding_ttl_ms;
             let mut bindings = self.session_bindings.write().await;
             bindings.retain(|sid, entry| {
-                if active_sessions.contains_key(sid) {
+                if active_sessions.contains(sid) {
                     return true;
                 }
                 entry.binding.last_seen_ms >= cutoff_binding
@@ -4680,7 +5286,7 @@ impl ProxyState {
             if bindings.len() > self.session_binding_max_entries {
                 let mut removable = bindings
                     .iter()
-                    .filter(|(sid, _)| !active_sessions.contains_key(*sid))
+                    .filter(|(sid, _)| !active_sessions.contains(*sid))
                     .map(|(sid, entry)| (sid.clone(), entry.binding.last_seen_ms))
                     .collect::<Vec<_>>();
                 removable.sort_by_key(|(_, last_seen_ms)| *last_seen_ms);
@@ -4733,8 +5339,14 @@ impl ProxyState {
 
         if self.session_stats_ttl_ms > 0 && now_ms >= self.session_stats_ttl_ms {
             let cutoff_stats = now_ms - self.session_stats_ttl_ms;
-            request_state.session_stats.retain(|sid, stats| {
-                active_sessions.contains_key(sid) || stats.last_seen_ms >= cutoff_stats
+            request_state.session_stats.retain(|service, stats| {
+                stats.retain(|sid, stats| {
+                    active_service_sessions
+                        .get(service)
+                        .is_some_and(|sessions| sessions.contains(sid))
+                        || stats.last_seen_ms >= cutoff_stats
+                });
+                !stats.is_empty()
             });
         }
     }
@@ -4889,6 +5501,46 @@ mod tests {
             endpoint_id: Some(endpoint_id.to_string()),
             route_path: vec![provider_id.to_string(), endpoint_id.to_string()],
             ..RouteDecisionProvenance::default()
+        }
+    }
+
+    fn finished_request_for_operator_snapshot(
+        id: u64,
+        service: &str,
+        session_id: &str,
+    ) -> FinishedRequest {
+        FinishedRequest {
+            id,
+            trace_id: Some(format!("{service}-{id}")),
+            session_id: Some(session_id.to_string()),
+            session_identity_source: Some(SessionIdentitySource::Header),
+            client_name: None,
+            client_addr: None,
+            cwd: None,
+            model: Some("gpt-test".to_string()),
+            reasoning_effort: None,
+            service_tier: None,
+            provider_id: None,
+            route_decision: None,
+            usage: Some(UsageMetrics {
+                input_tokens: 1,
+                total_tokens: 1,
+                ..UsageMetrics::default()
+            }),
+            cost: CostBreakdown::default(),
+            accounting: RequestAccountingFacts::default(),
+            retry: None,
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
+            observability: RequestObservability::default(),
+            service: service.to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 10,
+            ttfb_ms: None,
+            streaming: false,
+            ended_at_ms: id,
         }
     }
 
@@ -5541,7 +6193,7 @@ mod tests {
                     .usage_rollups
                     .is_empty()
             );
-            assert!(state.list_session_stats().await.is_empty());
+            assert!(state.list_session_stats("codex").await.is_empty());
         });
     }
 
@@ -5610,6 +6262,71 @@ mod tests {
                 1
             );
         });
+    }
+
+    #[tokio::test]
+    async fn operator_capture_filters_service_before_limit_and_keeps_full_session_stats() {
+        let state = ProxyState::new();
+        {
+            let mut request_state = state.request_lifecycle_projection.write().await;
+            for id in 1..=200 {
+                request_state
+                    .recent_finished
+                    .push_back(finished_request_for_operator_snapshot(
+                        id,
+                        "claude",
+                        "claude-session",
+                    ));
+            }
+            request_state
+                .recent_finished
+                .push_back(finished_request_for_operator_snapshot(
+                    201,
+                    "codex",
+                    "codex-session",
+                ));
+            request_state.session_stats.insert(
+                "codex".to_string(),
+                HashMap::from([(
+                    "codex-session".to_string(),
+                    SessionStats {
+                        turns_total: 999,
+                        turns_with_usage: 998,
+                        total_usage: UsageMetrics {
+                            input_tokens: 50_000,
+                            total_tokens: 50_000,
+                            ..UsageMetrics::default()
+                        },
+                        last_seen_ms: 201,
+                        ..SessionStats::default()
+                    },
+                )]),
+            );
+            request_state.session_stats.insert(
+                "claude".to_string(),
+                HashMap::from([(
+                    "claude-session".to_string(),
+                    SessionStats {
+                        turns_total: 200,
+                        last_seen_ms: 200,
+                        ..SessionStats::default()
+                    },
+                )]),
+            );
+        }
+
+        let snapshot = state
+            .capture_operator_lifecycle_snapshot("codex", 200)
+            .await;
+
+        assert_eq!(snapshot.recent_finished.len(), 1);
+        assert_eq!(snapshot.recent_finished[0].service, "codex");
+        let stats = snapshot
+            .session_stats
+            .get("codex-session")
+            .expect("full session stats");
+        assert_eq!(stats.turns_total, 999);
+        assert_eq!(stats.total_usage.input_tokens, 50_000);
     }
 
     #[test]
@@ -5691,7 +6408,7 @@ confidence = "exact"
                     .usage_rollups
                     .is_empty()
             );
-            assert!(state.list_session_stats().await.is_empty());
+            assert!(state.list_session_stats("codex").await.is_empty());
             let committed_revision = store
                 .operator_ledger_revision()
                 .expect("read post-commit operator revision");
@@ -5753,7 +6470,7 @@ confidence = "exact"
                 assert_eq!(rollup.loaded.cost.total_cost_usd.as_deref(), Some("1"));
                 assert_eq!(rollup.loaded.cost.priced_requests, 1);
                 assert_eq!(rollup.loaded.cost.unpriced_requests, 0);
-                let sessions = reopened.list_session_stats().await;
+                let sessions = reopened.list_session_stats("codex").await;
                 assert_eq!(sessions.len(), 1);
                 assert_eq!(sessions["sid-after-commit-abort"].turns_total, 1);
 
@@ -5876,7 +6593,7 @@ confidence = "exact"
                     .coverage_source,
                 "runtime_store"
             );
-            let stats = reopened.list_session_stats().await;
+            let stats = reopened.list_session_stats("codex").await;
             assert_eq!(stats["sid-economic"].turns_total, 1);
             assert!(!stats.contains_key("sid-non-economic"));
 
@@ -5985,8 +6702,12 @@ confidence = "exact"
                 .expect("hydrated provider usage summary");
             assert_eq!(hydrated_provider_summary.coverage.requests, 1);
             assert_eq!(hydrated_provider_summary.rows[0].aggregate.requests, 1);
-            assert!(!hydrated.session_stats.contains_key("sid-expired"));
-            assert!(hydrated.session_stats.contains_key("sid-current"));
+            let hydrated_stats = hydrated
+                .session_stats
+                .get("codex")
+                .expect("hydrated Codex session stats");
+            assert!(!hydrated_stats.contains_key("sid-expired"));
+            assert!(hydrated_stats.contains_key("sid-current"));
         });
     }
 
@@ -6177,12 +6898,12 @@ confidence = "exact"
                 })
                 .await;
 
-            let stats = state.list_session_stats().await;
+            let stats = state.list_session_stats("codex").await;
             let stats = stats.get("sid-speed").expect("session stats");
             assert_eq!(stats.last_output_tokens_per_second, Some(150.0));
             assert_eq!(stats.avg_output_tokens_per_second, Some(500.0 / 3.0));
 
-            let cards = state.list_session_identity_cards(16).await;
+            let cards = state.list_session_identity_cards("codex", 16).await;
             let card = cards
                 .iter()
                 .find(|card| card.session_id.as_deref() == Some("sid-speed"))
@@ -7803,7 +8524,582 @@ confidence = "exact"
             assert_eq!(per_service.active_identities.len(), 1);
             assert!(per_service.active_identities.contains(&identity_b_key));
             assert_eq!(per_service.health.len(), 1);
-            assert!(per_service.health.contains_key(&identity_b_key));
+            assert!(
+                per_service
+                    .health
+                    .contains_key(&ProviderEndpointRuntimeHealthBucketKey::new(
+                        identity_b_key,
+                        RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                    ))
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_health_is_scoped_to_the_requested_capability() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "relay", "default");
+            let identity =
+                RuntimeUpstreamIdentity::new(endpoint.clone(), "https://relay.example/v1");
+            let policy = state.capture_provider_policy_snapshot().await;
+            let cooldown_backoff = CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            };
+
+            state
+                .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity), 1)
+                .await
+                .expect("publish runtime identity");
+            state
+                .penalize_runtime_upstream_attempt_for_domain(
+                    "codex",
+                    &identity,
+                    RuntimeHealthDomain::Capability(RouteCapability::HostedImageGeneration),
+                    30,
+                    cooldown_backoff,
+                )
+                .await;
+
+            let inference = state
+                .route_plan_runtime_state_with_provider_policy_for_capability(
+                    "codex",
+                    policy.as_ref(),
+                    1,
+                    std::slice::from_ref(&identity),
+                    Some(RouteCapability::Inference),
+                )
+                .await;
+            assert!(!inference.provider_endpoint(&endpoint).cooldown_active);
+
+            let image = state
+                .route_plan_runtime_state_with_provider_policy_for_capability(
+                    "codex",
+                    policy.as_ref(),
+                    1,
+                    std::slice::from_ref(&identity),
+                    Some(RouteCapability::HostedImageGeneration),
+                )
+                .await;
+            assert!(image.provider_endpoint(&endpoint).cooldown_active);
+
+            let request_local = state
+                .route_plan_runtime_state_with_provider_policy_for_capability(
+                    "codex",
+                    policy.as_ref(),
+                    1,
+                    std::slice::from_ref(&identity),
+                    None,
+                )
+                .await;
+            assert!(!request_local.provider_endpoint(&endpoint).cooldown_active);
+        });
+    }
+
+    #[test]
+    fn half_open_probe_is_singleflight_and_once_per_breaker_epoch() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "relay", "default");
+            let identity =
+                RuntimeUpstreamIdentity::new(endpoint.clone(), "https://relay.example/v1");
+            let cooldown_backoff = CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            };
+            state
+                .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity), 1)
+                .await
+                .expect("publish runtime identity");
+            state
+                .penalize_runtime_upstream_attempt_for_domain(
+                    "codex",
+                    &identity,
+                    RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                    30,
+                    cooldown_backoff,
+                )
+                .await;
+
+            let abandoned = state
+                .try_acquire_runtime_half_open_probe("codex", &identity, RouteCapability::Inference)
+                .await
+                .expect("pre-dispatch half-open owner");
+            drop(abandoned);
+            let replacement = state
+                .try_acquire_runtime_half_open_probe("codex", &identity, RouteCapability::Inference)
+                .await
+                .expect("an undispatched probe must release ownership on drop");
+            drop(replacement);
+
+            let start = Arc::new(tokio::sync::Barrier::new(17));
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let state = Arc::clone(&state);
+                let identity = identity.clone();
+                let start = Arc::clone(&start);
+                tasks.spawn(async move {
+                    start.wait().await;
+                    let Some(probe) = state
+                        .try_acquire_runtime_half_open_probe(
+                            "codex",
+                            &identity,
+                            RouteCapability::Inference,
+                        )
+                        .await
+                    else {
+                        return 0;
+                    };
+                    assert!(state.dispatch_runtime_half_open_probe(probe).await.is_ok());
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    1
+                });
+            }
+            start.wait().await;
+
+            let mut acquired = 0;
+            while let Some(result) = tasks.join_next().await {
+                acquired += result.expect("half-open task");
+            }
+            assert_eq!(acquired, 1);
+            assert!(
+                state
+                    .try_acquire_runtime_half_open_probe(
+                        "codex",
+                        &identity,
+                        RouteCapability::Inference,
+                    )
+                    .await
+                    .is_none(),
+                "a dispatched probe must not repeat within the same breaker epoch"
+            );
+
+            state
+                .record_runtime_upstream_attempt_success_for_capability(
+                    "codex",
+                    &identity,
+                    RouteCapability::Inference,
+                    10,
+                )
+                .await;
+            state
+                .penalize_runtime_upstream_attempt_for_domain(
+                    "codex",
+                    &identity,
+                    RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                    30,
+                    cooldown_backoff,
+                )
+                .await;
+            assert!(
+                state
+                    .try_acquire_runtime_half_open_probe(
+                        "codex",
+                        &identity,
+                        RouteCapability::Inference,
+                    )
+                    .await
+                    .is_some(),
+                "a recovered endpoint may probe again after a new breaker epoch opens"
+            );
+        });
+    }
+
+    #[test]
+    fn stale_half_open_success_does_not_clear_a_new_breaker_epoch() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "relay", "default");
+            let identity =
+                RuntimeUpstreamIdentity::new(endpoint.clone(), "https://relay.example/v1");
+            let cooldown_backoff = CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            };
+            state
+                .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity), 1)
+                .await
+                .expect("publish runtime identity");
+            state
+                .penalize_runtime_upstream_attempt_for_domain(
+                    "codex",
+                    &identity,
+                    RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                    30,
+                    cooldown_backoff,
+                )
+                .await;
+            let acquired = state
+                .try_acquire_runtime_half_open_probe("codex", &identity, RouteCapability::Inference)
+                .await
+                .expect("acquire old half-open probe");
+            let dispatched = state
+                .dispatch_runtime_half_open_probe(acquired)
+                .await
+                .expect("dispatch old half-open probe");
+            assert!(
+                state
+                    .validate_dispatched_runtime_half_open_probe(&dispatched)
+                    .await,
+                "the current dispatched probe must validate before a newer breaker epoch opens"
+            );
+
+            state
+                .record_runtime_upstream_attempt_success_for_capability(
+                    "codex",
+                    &identity,
+                    RouteCapability::Inference,
+                    10,
+                )
+                .await;
+            state
+                .penalize_runtime_upstream_attempt_for_domain(
+                    "codex",
+                    &identity,
+                    RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                    30,
+                    cooldown_backoff,
+                )
+                .await;
+
+            assert!(
+                !state
+                    .validate_dispatched_runtime_half_open_probe(&dispatched)
+                    .await,
+                "an old dispatched probe must not be allowed to settle a newer breaker epoch"
+            );
+
+            assert_eq!(
+                state
+                    .settle_runtime_half_open_probe(
+                        dispatched,
+                        RuntimeHealthHalfOpenTerminal::Success { now_ms: 20 },
+                    )
+                    .await,
+                RuntimeHealthHalfOpenSettlement::Stale
+            );
+            let projected = state
+                .route_plan_runtime_state_for_provider_endpoints("codex")
+                .await
+                .provider_endpoint(&endpoint);
+            assert!(projected.cooldown_active);
+            assert_eq!(projected.failure_count, FAILURE_THRESHOLD);
+        });
+    }
+
+    #[test]
+    fn half_open_success_only_clears_its_leased_transient_buckets() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "relay", "default");
+            let identity = RuntimeUpstreamIdentity::new(endpoint, "https://relay.example/v1");
+            let cooldown_backoff = CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            };
+            state
+                .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity), 1)
+                .await
+                .expect("publish runtime identity");
+            state
+                .penalize_runtime_upstream_attempt_for_domain(
+                    "codex",
+                    &identity,
+                    RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                    30,
+                    cooldown_backoff,
+                )
+                .await;
+            let acquired = state
+                .try_acquire_runtime_half_open_probe("codex", &identity, RouteCapability::Inference)
+                .await
+                .expect("acquire half-open probe");
+            let dispatched = state
+                .dispatch_runtime_half_open_probe(acquired)
+                .await
+                .expect("dispatch half-open probe");
+
+            for domain in [
+                RuntimeHealthDomain::Credential,
+                RuntimeHealthDomain::Capacity(RouteCapability::Inference),
+            ] {
+                state
+                    .penalize_runtime_upstream_attempt_for_domain(
+                        "codex",
+                        &identity,
+                        domain,
+                        30,
+                        cooldown_backoff,
+                    )
+                    .await;
+            }
+            assert_eq!(
+                state
+                    .settle_runtime_half_open_probe(
+                        dispatched,
+                        RuntimeHealthHalfOpenTerminal::Success { now_ms: 20 },
+                    )
+                    .await,
+                RuntimeHealthHalfOpenSettlement::Applied
+            );
+
+            let identity_key = ProviderEndpointRuntimeHealthKey::for_service("codex", &identity)
+                .expect("runtime health identity");
+            let guard = state.provider_endpoint_runtime_health.read().await;
+            let service = guard.get("codex").expect("codex health state");
+            let capability = service
+                .health
+                .get(&ProviderEndpointRuntimeHealthBucketKey::new(
+                    identity_key.clone(),
+                    RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                ))
+                .expect("capability health");
+            assert_eq!(capability.failure_count, 0);
+            assert!(capability.cooldown_until.is_none());
+            for domain in [
+                RuntimeHealthDomain::Credential,
+                RuntimeHealthDomain::Capacity(RouteCapability::Inference),
+            ] {
+                let health = service
+                    .health
+                    .get(&ProviderEndpointRuntimeHealthBucketKey::new(
+                        identity_key.clone(),
+                        domain,
+                    ))
+                    .expect("new health domain");
+                assert_eq!(health.failure_count, FAILURE_THRESHOLD);
+                assert!(health.cooldown_until.is_some());
+            }
+        });
+    }
+
+    #[test]
+    fn half_open_probe_rejects_credential_and_capacity_domains() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let cooldown_backoff = CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            };
+            for (case, domains) in [
+                ("credential_only", vec![RuntimeHealthDomain::Credential]),
+                (
+                    "capacity_only",
+                    vec![RuntimeHealthDomain::Capacity(RouteCapability::Inference)],
+                ),
+                (
+                    "transport_plus_credential",
+                    vec![
+                        RuntimeHealthDomain::EndpointTransport,
+                        RuntimeHealthDomain::Credential,
+                    ],
+                ),
+                (
+                    "capability_plus_capacity",
+                    vec![
+                        RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                        RuntimeHealthDomain::Capacity(RouteCapability::Inference),
+                    ],
+                ),
+            ] {
+                let state = ProxyState::new();
+                let endpoint = ProviderEndpointKey::new("codex", case, "default");
+                let identity =
+                    RuntimeUpstreamIdentity::new(endpoint, format!("https://{case}.example/v1"));
+                state
+                    .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity), 1)
+                    .await
+                    .expect("publish runtime identity");
+                for domain in domains {
+                    state
+                        .penalize_runtime_upstream_attempt_for_domain(
+                            "codex",
+                            &identity,
+                            domain,
+                            30,
+                            cooldown_backoff,
+                        )
+                        .await;
+                }
+
+                assert!(
+                    state
+                        .try_acquire_runtime_half_open_probe(
+                            "codex",
+                            &identity,
+                            RouteCapability::Inference,
+                        )
+                        .await
+                        .is_none(),
+                    "{case} must not be bypassed by half-open probing"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn credential_rotation_invalidates_an_unpublished_half_open_probe() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "relay", "default");
+            let identity_a = RuntimeUpstreamIdentity::new_with_credential_scope(
+                endpoint.clone(),
+                "https://relay.example/v1",
+                None,
+                Some("credential-a".to_string()),
+            );
+            let identity_b = RuntimeUpstreamIdentity::new_with_credential_scope(
+                endpoint,
+                "https://relay.example/v1",
+                None,
+                Some("credential-b".to_string()),
+            );
+            let cooldown_backoff = CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            };
+            state
+                .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity_a), 1)
+                .await
+                .expect("publish credential A identity");
+            state
+                .penalize_runtime_upstream_attempt_for_domain(
+                    "codex",
+                    &identity_a,
+                    RuntimeHealthDomain::EndpointTransport,
+                    30,
+                    cooldown_backoff,
+                )
+                .await;
+            let probe = state
+                .try_acquire_runtime_half_open_probe(
+                    "codex",
+                    &identity_a,
+                    RouteCapability::Inference,
+                )
+                .await
+                .expect("credential A half-open probe");
+
+            state
+                .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity_b), 2)
+                .await
+                .expect("publish credential B identity");
+
+            assert!(
+                state.dispatch_runtime_half_open_probe(probe).await.is_err(),
+                "a probe captured from the replaced credential generation must not dispatch"
+            );
+            assert!(
+                state
+                    .try_acquire_runtime_half_open_probe(
+                        "codex",
+                        &identity_b,
+                        RouteCapability::Inference,
+                    )
+                    .await
+                    .is_none(),
+                "the replacement credential must not inherit the old cooldown"
+            );
+        });
+    }
+
+    #[test]
+    fn capacity_health_requires_repeated_failures_and_clears_on_success() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let state = ProxyState::new();
+            let endpoint = ProviderEndpointKey::new("codex", "relay", "default");
+            let identity =
+                RuntimeUpstreamIdentity::new(endpoint.clone(), "https://relay.example/v1");
+            let policy = state.capture_provider_policy_snapshot().await;
+            let cooldown_backoff = CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            };
+            state
+                .reconcile_runtime_upstream_identities(std::slice::from_ref(&identity), 1)
+                .await
+                .expect("publish runtime identity");
+
+            for expected_failures in 1..FAILURE_THRESHOLD {
+                state
+                    .record_runtime_upstream_attempt_failure_for_domain(
+                        "codex",
+                        &identity,
+                        RuntimeHealthDomain::Capacity(RouteCapability::Inference),
+                        30,
+                        cooldown_backoff,
+                    )
+                    .await;
+                let runtime = state
+                    .route_plan_runtime_state_with_provider_policy_for_capability(
+                        "codex",
+                        policy.as_ref(),
+                        1,
+                        std::slice::from_ref(&identity),
+                        Some(RouteCapability::Inference),
+                    )
+                    .await;
+                let projected = runtime.provider_endpoint(&endpoint);
+                assert_eq!(projected.failure_count, expected_failures);
+                assert!(!projected.cooldown_active);
+            }
+
+            state
+                .record_runtime_upstream_attempt_failure_for_domain(
+                    "codex",
+                    &identity,
+                    RuntimeHealthDomain::Capacity(RouteCapability::Inference),
+                    30,
+                    cooldown_backoff,
+                )
+                .await;
+            let inference = state
+                .route_plan_runtime_state_with_provider_policy_for_capability(
+                    "codex",
+                    policy.as_ref(),
+                    1,
+                    std::slice::from_ref(&identity),
+                    Some(RouteCapability::Inference),
+                )
+                .await;
+            assert!(inference.provider_endpoint(&endpoint).cooldown_active);
+
+            let image = state
+                .route_plan_runtime_state_with_provider_policy_for_capability(
+                    "codex",
+                    policy.as_ref(),
+                    1,
+                    std::slice::from_ref(&identity),
+                    Some(RouteCapability::HostedImageGeneration),
+                )
+                .await;
+            assert!(!image.provider_endpoint(&endpoint).cooldown_active);
+
+            state
+                .record_runtime_upstream_attempt_success_for_capability(
+                    "codex",
+                    &identity,
+                    RouteCapability::Inference,
+                    10,
+                )
+                .await;
+            let recovered = state
+                .route_plan_runtime_state_with_provider_policy_for_capability(
+                    "codex",
+                    policy.as_ref(),
+                    1,
+                    std::slice::from_ref(&identity),
+                    Some(RouteCapability::Inference),
+                )
+                .await;
+            assert!(!recovered.provider_endpoint(&endpoint).cooldown_active);
         });
     }
 

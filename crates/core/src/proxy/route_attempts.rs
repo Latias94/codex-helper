@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use axum::http::StatusCode;
 
-use crate::logging::RouteAttemptLog;
+use crate::logging::{HttpDebugLog, RouteAttemptLog};
 use crate::policy_actions::PolicyAction;
 use crate::provider_signals::ProviderSignal;
 
@@ -144,6 +144,7 @@ impl AttemptOutcome {
 #[derive(Clone, Copy)]
 pub(super) enum RouteAttemptErrorKind {
     Lifecycle,
+    HalfOpenInvalidated,
     TargetBuild,
     Transport,
     BodyRead,
@@ -154,6 +155,7 @@ impl RouteAttemptErrorKind {
     fn decision(self) -> &'static str {
         match self {
             RouteAttemptErrorKind::Lifecycle => "failed_lifecycle_store",
+            RouteAttemptErrorKind::HalfOpenInvalidated => "skipped_half_open_invalidated",
             RouteAttemptErrorKind::TargetBuild => "failed_target_build",
             RouteAttemptErrorKind::Transport => "failed_transport",
             RouteAttemptErrorKind::BodyRead => "failed_body_read",
@@ -164,6 +166,7 @@ impl RouteAttemptErrorKind {
     fn error_class(self) -> &'static str {
         match self {
             RouteAttemptErrorKind::Lifecycle => "lifecycle_store_error",
+            RouteAttemptErrorKind::HalfOpenInvalidated => "transient_half_open_invalidated",
             RouteAttemptErrorKind::TargetBuild => "target_build_error",
             RouteAttemptErrorKind::Transport => "upstream_transport_error",
             RouteAttemptErrorKind::BodyRead => "upstream_body_read_error",
@@ -262,6 +265,18 @@ pub(super) fn record_error_route_attempt(
     fill_attempt_identity(&mut attempt, params.target);
     apply_attempt_outcome(&mut attempt, outcome);
     route_attempts.push(attempt);
+}
+
+pub(super) fn record_http_debug_route_attempt(
+    route_attempts: &mut [RouteAttemptLog],
+    route_attempt_index: usize,
+    http_debug: Option<&HttpDebugLog>,
+) {
+    if let (Some(attempt), Some(http_debug)) =
+        (route_attempts.get_mut(route_attempt_index), http_debug)
+    {
+        attempt.http_debug = Some(http_debug.clone());
+    }
 }
 
 fn fill_attempt_identity(attempt: &mut RouteAttemptLog, target: &CapturedRouteCandidate) {

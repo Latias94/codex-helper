@@ -1,28 +1,33 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
 
 use crate::config::HelperConfig;
-use crate::dashboard_core::OperatorReadModel;
+use crate::dashboard_core::{OperatorLocalSessionMetadata, OperatorReadModel};
 use codex_helper_core::fleet::merge::merge_fleet_snapshots;
 use codex_helper_core::fleet::poller::{node_snapshot_from_poll_result, poll_fleet_node};
 use codex_helper_core::fleet::{
     FleetNodeKind, FleetSnapshot, build_fleet_snapshot_from_operator_read_model,
-    build_local_fleet_snapshot_from_operator_read_model, now_ms,
+    build_local_fleet_snapshot_from_operator_read_model,
+    enrich_local_fleet_snapshot_session_metadata, now_ms,
 };
 
-use super::state::UiState;
+use super::state::{RuntimeConnectionKind, UiState};
 
 #[derive(Debug, Clone)]
 pub(super) enum FleetRefreshSource {
     Integrated {
         model: Box<OperatorReadModel>,
+        local_sessions: HashMap<String, OperatorLocalSessionMetadata>,
         cfg: Arc<HelperConfig>,
     },
     Attached {
         model: Box<OperatorReadModel>,
+        local_sessions: HashMap<String, OperatorLocalSessionMetadata>,
         admin_base_url: String,
+        connection_kind: RuntimeConnectionKind,
     },
 }
 
@@ -33,6 +38,16 @@ pub(super) struct FleetRefreshResult {
 }
 
 pub(super) type FleetRefreshSender = mpsc::UnboundedSender<FleetRefreshResult>;
+
+pub(super) fn local_session_metadata_for_fleet(
+    ui: &UiState,
+) -> HashMap<String, OperatorLocalSessionMetadata> {
+    if ui.runtime_connection.is_remote_observer() {
+        HashMap::new()
+    } else {
+        ui.host_local_sessions.clone()
+    }
+}
 
 pub(super) fn start_fleet_refresh(
     ui: &mut UiState,
@@ -88,29 +103,46 @@ async fn load_fleet_snapshot(
     previous: Option<FleetSnapshot>,
 ) -> anyhow::Result<FleetSnapshot> {
     match source {
-        FleetRefreshSource::Integrated { model, cfg } => {
-            load_integrated_fleet_snapshot(model, cfg, previous).await
-        }
+        FleetRefreshSource::Integrated {
+            model,
+            local_sessions,
+            cfg,
+        } => load_integrated_fleet_snapshot(model, local_sessions, cfg, previous).await,
         FleetRefreshSource::Attached {
             model,
+            local_sessions,
             admin_base_url,
-        } => Ok(build_fleet_snapshot_from_operator_read_model(
-            &model,
-            "local",
-            "local",
-            FleetNodeKind::Local,
-            Some(admin_base_url),
-        )),
+            connection_kind,
+        } => {
+            let (node_id, label, kind) = match connection_kind {
+                RuntimeConnectionKind::LocalAttached => ("local", "local", FleetNodeKind::Local),
+                RuntimeConnectionKind::RemoteObserver => {
+                    ("remote", admin_base_url.as_str(), FleetNodeKind::Remote)
+                }
+                RuntimeConnectionKind::Integrated => ("local", "local", FleetNodeKind::Local),
+            };
+            let mut snapshot = build_fleet_snapshot_from_operator_read_model(
+                &model,
+                node_id,
+                label,
+                kind,
+                Some(admin_base_url.clone()),
+            );
+            enrich_local_fleet_snapshot_session_metadata(&mut snapshot, &local_sessions);
+            Ok(snapshot)
+        }
     }
 }
 
 async fn load_integrated_fleet_snapshot(
     model: Box<OperatorReadModel>,
+    local_sessions: HashMap<String, OperatorLocalSessionMetadata>,
     cfg: Arc<HelperConfig>,
     previous: Option<FleetSnapshot>,
 ) -> anyhow::Result<FleetSnapshot> {
     let service_name = model.service_name.clone();
-    let local = build_local_fleet_snapshot_from_operator_read_model(&model, "local", "local");
+    let mut local = build_local_fleet_snapshot_from_operator_read_model(&model, "local", "local");
+    enrich_local_fleet_snapshot_session_metadata(&mut local, &local_sessions);
     let mut snapshots = vec![local];
     let mut remote_nodes = Vec::new();
     let previous_nodes = previous
@@ -202,6 +234,44 @@ mod tests {
         }
     }
 
+    fn local_session_metadata() -> OperatorLocalSessionMetadata {
+        OperatorLocalSessionMetadata {
+            raw_session_id: "019f-local-session".to_string(),
+            cwd: Some("/workspace/codex-helper".to_string()),
+            last_client_name: None,
+            last_client_addr: None,
+            host_local_transcript_path: None,
+        }
+    }
+
+    #[test]
+    fn fleet_local_metadata_is_available_only_to_local_connection_modes() {
+        for connection_kind in [
+            RuntimeConnectionKind::Integrated,
+            RuntimeConnectionKind::LocalAttached,
+        ] {
+            let ui = UiState {
+                runtime_connection: connection_kind,
+                host_local_sessions: HashMap::from([(
+                    "session:sha256:local".to_string(),
+                    local_session_metadata(),
+                )]),
+                ..UiState::default()
+            };
+            assert_eq!(local_session_metadata_for_fleet(&ui).len(), 1);
+        }
+
+        let remote = UiState {
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
+            host_local_sessions: HashMap::from([(
+                "session:sha256:must-not-leak".to_string(),
+                local_session_metadata(),
+            )]),
+            ..UiState::default()
+        };
+        assert!(local_session_metadata_for_fleet(&remote).is_empty());
+    }
+
     #[test]
     fn non_current_poll_result_keeps_previous_snapshot_stale() {
         let previous = FleetNodeSnapshot {
@@ -264,11 +334,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attached_fleet_refresh_projects_the_current_operator_bundle() {
+    async fn local_attached_fleet_refresh_projects_the_current_operator_bundle() {
         let snapshot = load_fleet_snapshot(
             FleetRefreshSource::Attached {
                 model: Box::new(OperatorReadModel::auth_required("codex")),
+                local_sessions: HashMap::new(),
                 admin_base_url: "https://admin.example".to_string(),
+                connection_kind: RuntimeConnectionKind::LocalAttached,
             },
             None,
         )
@@ -277,8 +349,30 @@ mod tests {
 
         assert_eq!(snapshot.service_name, "codex");
         assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].node_id, "local");
+        assert_eq!(snapshot.nodes[0].kind, FleetNodeKind::Local);
         assert_eq!(snapshot.nodes[0].health, FleetNodeHealth::AuthFailed);
         assert!(snapshot.nodes[0].work_units.is_empty());
         assert!(snapshot.nodes[0].active_endpoint.is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_observer_fleet_refresh_preserves_remote_identity() {
+        let snapshot = load_fleet_snapshot(
+            FleetRefreshSource::Attached {
+                model: Box::new(OperatorReadModel::auth_required("codex")),
+                local_sessions: HashMap::new(),
+                admin_base_url: "https://admin.example".to_string(),
+                connection_kind: RuntimeConnectionKind::RemoteObserver,
+            },
+            None,
+        )
+        .await
+        .expect("remote fleet snapshot");
+
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].node_id, "remote");
+        assert_eq!(snapshot.nodes[0].label, "https://admin.example");
+        assert_eq!(snapshot.nodes[0].kind, FleetNodeKind::Remote);
     }
 }

@@ -557,7 +557,7 @@ async fn proxy_route_graph_route_graph_affinity_is_session_scoped() {
         "failover_after_status_502"
     );
 
-    let cards = state.list_session_identity_cards(20).await;
+    let cards = state.list_session_identity_cards("codex", 20).await;
     let right_card = cards
         .iter()
         .find(|card| card.session_id.as_deref() == Some("sid-right"))

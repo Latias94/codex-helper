@@ -6,7 +6,7 @@ Some Codex features do not appear just because `/responses` can be forwarded. Pr
 
 codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, provider-owned capability diagnostics, balance visibility, and fallback policy.
 
-Current release: `v0.20.2`
+Current release: `v0.21.0`
 
 中文说明: [README.md](README.md)
 
@@ -36,6 +36,7 @@ It is probably unnecessary if you only use one official account and do not need 
 - **Provider / routing config**: `version = 6` route graph schema. Define providers once, then use routing entry/routes for order, pinning, grouping, or tag preference.
 - **Session affinity and failover**: each Codex session tries to keep using the selected provider, then falls through to other route candidates when requests fail, upstreams are unavailable, or trusted balance snapshots are exhausted.
 - **Provider signal control loop**: rate limits, quota responses, transport failures, and exhausted balances are first recorded as provider signals, then converted into helper-owned temporary policy actions projected into routing. Manual disables have higher precedence, and automatic actions never mutate Codex auth or third-party account files.
+- **Request-scope isolation**: conversation inference, remote compact, Responses WebSocket, and hosted-image compatibility requests are economic, route-facing traffic. `/models`, the files/uploads/batches/containers resource families, unknown endpoints, and non-POST inference-like HTTP requests may fall back only within the current request; they do not affect shared cooldown or session affinity and do not enter economic summaries.
 - **Balance and plan visibility**: probes common Sub2API, New API, and `/user/balance` endpoints; lookup failures are not treated as exhausted.
 - **Outbound proxy compatibility**: the local proxy and outbound network proxy are separate layers; outbound requests currently follow system/environment proxy variables, with no first-class `config.toml` proxy section yet.
 - **Request observability**: provider, model, tokens, cache tokens, cache hit rate, TTFB, duration, output rate, retry chain, provider signal / policy action evidence, and estimated cost.
@@ -50,13 +51,13 @@ Recommended: install prebuilt binaries with the release installer scripts. Rust 
 macOS / Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/download/v0.20.2/codex-helper-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/latest/download/codex-helper-installer.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.20.2/codex-helper-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/latest/download/codex-helper-installer.ps1 | iex"
 ```
 
 This installs `codex-helper` and the short alias `ch`. The old egui GUI entrypoint `codex-helper-gui` has been removed. The Tauri desktop client remains a source-tree preview and is not uploaded as a public release artifact; local validation can still build it from `apps/desktop` with `pnpm tauri:build`.
@@ -88,8 +89,11 @@ By default this will:
 
 - start the local proxy;
 - load the only supported `version = 6` `~/.codex-helper/config.toml`, automatically backing up and migrating an existing v5 file first;
+- on the first `ch` run, when the helper has no Codex provider or route, import only Codex's currently selected provider and persist only its base URL and credential-reference name;
 - open the TUI in interactive terminals;
 - stop the proxy started by the current foreground console on exit.
+
+Both entrypoints use the same runtime but have different client-switch contracts. `codex-helper` never changes the Codex client automatically. `ch` is the compatibility entrypoint and performs journaled `switch on` only after a local Codex runtime is verified ready. First-run onboarding never persists a credential value; ambiguous authentication or an unsafe third-party origin fails closed, and existing helper providers/routes are left unchanged. A newly started foreground runtime owns an ephemeral lease and restores the helper-managed projection through CAS after `q` stops it while retaining other valid TOML edits made by Codex at runtime; `--resident` keeps the switch applied. When a matching native service is already running, `ch` authorizes attachment through the install receipt, signed runtime identity, helper/Codex homes, ports, and install generation. The owner marker is advisory: a missing or corrupt marker does not block attachment, while a present, parseable marker must agree with the service identity or attachment is rejected before switching. Exiting that TUI neither stops the service nor restores the switch. An arbitrary process occupying the same port is never adopted.
 
 Automatic configuration migration only converts supported legacy syntax into version 6 and
 preserves the exact source backup. It never copies, deletes, or reinterprets a credential value.
@@ -112,7 +116,7 @@ codex-helper tui --codex
 codex-helper service stop
 ```
 
-By default, the built-in `codex-helper serve` TUI follows “the console owns the proxy”: exiting the UI stops the proxy it started but never runs `switch on/off`. `daemon status` is read-only; manage an installed local service with `service start/stop/restart`. There is no remote HTTP shutdown command. The `tui` subcommand attaches to an existing resident proxy. On the daemon host, a locally signed operator capability can perform the balance refresh, routing, and session actions explicitly advertised by that daemon; it falls back to read-only when local signing is unavailable. `RemoteObserver` is always read-only and never sends operator mutations. Exiting an attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
+By default, the built-in `codex-helper serve` TUI follows “the console owns the proxy”: exiting the UI stops the proxy it started but never runs `switch on/off`. `daemon status` is read-only; manage an installed local service with `service start/stop/restart`. An explicit `service stop` first restores a matching helper-managed Codex switch, while `service restart` preserves it for the same returning target. A same-identity `service install --no-start` also restores the switch before replacing a running service with a stopped installation. Missing or legacy receipts are never guessed over an existing platform registration. There is no remote HTTP shutdown command. The `tui` subcommand attaches to an existing resident proxy. On the daemon host, a locally signed operator capability can perform the balance refresh, routing, and session actions explicitly advertised by that daemon; it falls back to read-only when local signing is unavailable. `RemoteObserver` is always read-only and never sends operator mutations. Exiting an attached TUI does not stop the proxy. For automatic restart after child crashes, run `codex-helper daemon supervise --codex`; the supervisor records lightweight crash markers under `~/.codex-helper/run/`.
 
 `daemon status` best-effort shows the resident proxy owner marker (manual CLI, supervisor, or a future desktop/tray owner). The marker is only observability metadata: read or cleanup failures never block proxy startup or shutdown. A hidden managed sidecar mode is reserved for the future desktop shell, so ordinary users do not need to choose it manually.
 
@@ -126,7 +130,6 @@ codex-helper switch on --port 4321
 codex-helper switch on --base-url https://relay.example/v1
 codex-helper switch on --preset imagegen-bridge
 codex-helper switch on --preset official-imagegen --compaction remote-v2 --responses-websocket
-codex-helper switch on --client-facade openai-tools
 codex-helper switch status
 codex-helper switch off
 ```
@@ -137,7 +140,9 @@ NAS / remote relay targets:
 ch relay add nas \
   --proxy-url http://nas.local:3211 \
   --admin-url https://nas.example.com:4211 \
-  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN
+  --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN \
+  --preset official-relay \
+  --responses-websocket
 
 ch relay list
 ch relay status nas
@@ -147,13 +152,13 @@ ch relay nas --attach-only
 ch relay off
 ```
 
-Plain `ch` still starts the local foreground helper. `ch relay local` is the explicit target form for the same local flow. `ch relay <name>` only starts or attaches to the target runtime and opens a read-only TUI; it never changes local Codex configuration. `--no-tui` is valid only when starting the built-in local target, while `--attach-only` requires an existing runtime. Remote targets always attach through the read-only TUI. Point Codex at that target separately with `codex-helper switch on --base-url <PROXY_URL>`. Admin tokens are read from the environment variable named by `--admin-token-env`; token values are not written to `~/.codex-helper/config.toml`. Remote admin URLs must use HTTPS; HTTP is accepted only for loopback, including a trusted tunnel terminated on the client. A remote target must provide its trusted `--admin-url` explicitly when it is added; proxy responses and redirects cannot replace that authority.
+Plain `ch` is the local compatibility entrypoint, and `ch relay local` is the explicit target form of the same automatic-switch flow. For a named Codex target, `ch relay <name>` applies a journaled local Codex switch to that target before opening its read-only TUI. `--no-tui` performs only the switch; `--attach-only` performs observation only and explicitly leaves the client unchanged. A named Codex target can override selected global client-patch fields through `relay add`; omitted fields continue to inherit `[codex.client_patch]`. `ch relay off` restores the journaled helper-owned projection while retaining other valid runtime edits. Claude targets have no Codex client-switch action and reject Codex client patches. Admin tokens are read from the environment variable named by `--admin-token-env`; token values are not written to `~/.codex-helper/config.toml`. Remote admin URLs must use HTTPS; HTTP is accepted only for loopback, including a trusted tunnel terminated on the client. A remote target must provide its trusted `--admin-url` explicitly when it is added; proxy responses and redirects cannot replace that authority.
 
 Container and server runtimes do not provide access to a client's local transcript/session files. Local `session` commands read only the Codex session files on the machine where the command runs.
 
-The client switch points Codex at one helper URL and applies the complete `[codex.client_patch]`. `--preset default|chatgpt-bridge|imagegen-bridge|official-relay|official-imagegen` temporarily overrides the preset; `--compaction`, `--responses-websocket[=false]`, `--translate-models[=false]`, and `--hosted-image-generation` override the other fields. Without overrides, all five fields come from `~/.codex-helper/config.toml`. `--client-facade compatible|openai|openai-tools` remains a compatibility shortcut for the earlier reduced surface. A client patch controls which capabilities Codex exposes and sends; it cannot make a relay implement those protocols, so runtime decisions still use the provider/catalog contract.
+The client switch points Codex at one helper URL and applies the complete `[codex.client_patch]`. `--preset default|chatgpt-bridge|imagegen-bridge|official-relay|official-imagegen` temporarily overrides the preset; `--compaction`, `--responses-websocket[=false]`, `--translate-models[=false]`, and `--hosted-image-generation` override the other fields. Without overrides, all five fields come from `~/.codex-helper/config.toml`. A client patch controls which capabilities Codex exposes and sends; it cannot make a relay implement those protocols, so runtime decisions still use the provider/catalog contract.
 
-`switch on` records the original Codex selector, helper stanza, relevant feature flags, and an auth facade when required. `chatgpt-bridge` accepts only a complete, verifiable existing ChatGPT login and preserves its tokens. Image-generation presets may temporarily present a semantic empty `{}` auth facade to satisfy Codex hosted-tool gating. Original auth bytes never enter the JSON journal: they live in a private helper-state backup, while the journal stores only its random filename and fingerprints. `switch off` restores exact bytes through no-replace CAS. After an auth-bearing patch is off, status remains `Off` while the private backup/journal is retained, so another `switch off` can repair a semantically equivalent facade that Codex writes later; the next `switch on` safely adopts that recovery point. Unattributable external edits, a missing backup, or a fingerprint mismatch produce `recovery_required` without replacing a competing file. The helper capability marker never reaches an upstream, while real actor authorization can pass only to an official OpenAI origin without configured helper credentials.
+`switch on` records the original Codex selector, helper stanza, relevant feature flags, and an auth facade when required. `chatgpt-bridge` accepts only a complete, verifiable existing ChatGPT login and preserves its tokens. Image-generation presets may temporarily present a semantic empty `{}` auth facade for Codex versions from the 0.20.3 era. Current Codex image/web extension gating instead comes from `requires_openai_auth = false` plus a non-empty helper actor marker; `{}` is not that gate. Original auth bytes and any sensitive headers or comments in an inactive `codex_proxy` stanza never enter the JSON journal: each lives in a private helper-state backup, while the journal stores only random filenames and fingerprints. `switch off` restores helper-owned selector/stanza/feature keys in the current valid TOML while retaining unrelated provider, feature, project, and other runtime edits; `auth.json` is restored byte-for-byte through no-replace CAS. After an auth-bearing patch is off, status remains `Off` while the private backup/journal is retained, so another `switch off` can repair a semantically equivalent facade that Codex writes later; the next `switch on` safely adopts that recovery point. Managed-field conflicts, unattributable auth edits, or a missing/mismatched backup after the original projection was replaced produce `recovery_required` without replacing a competing file. The helper capability marker is consumed locally and never reaches an upstream, while real actor authorization can pass only to an official OpenAI origin without configured helper credentials.
 
 Client patching never reads or changes `models_cache.json` or Codex SQLite and does not restore the retired `remote-control` SQL hack. It manages only the recorded `config.toml` sections and optional `auth.json` facade during an explicit `switch on/off` lifecycle.
 
@@ -391,9 +396,9 @@ Useful pages:
 - `Usage`: remote shared quota-pool used/remaining, 15/60-minute rates, required rate until reset, pace, ETA, plus local-day requests, tokens, estimated cost, and project attribution.
 - `Requests`: committed request/attempt facts, recent endpoint samples, tokens, cache tokens, latency, retries, request chains, and cost.
 
-TUI and desktop consume the same typed, redacted `OperatorReadModel` and use only `GET` / `HEAD` against a remote runtime control plane. The model distinguishes `ready`, `stale`, `disconnected`, and `auth_required`; connection or authentication failures never synthesize a fallback view from local config, SQLite, or an empty runtime. Remote operator clients and the control plane are read-only: an attached TUI neither handles `n` / `o` nor inspects or changes local Codex configuration. Edit durable provider/routing intent with local CLI commands or `config.toml`. In terminal workflows, switch the Codex client only through a separate explicit local `switch on/off` CLI action or `n` / `o` on the integrated local TUI Settings page; neither path is a remote control-plane operation.
+TUI and desktop consume the same typed, redacted `OperatorReadModel` and use only `GET` / `HEAD` against a remote runtime control plane. The model distinguishes `ready`, `stale`, `disconnected`, and `auth_required`; connection or authentication failures never synthesize a fallback view from local config, SQLite, or an empty runtime. Remote operator clients and `RemoteObserver` are read-only and never inspect or change Codex configuration on the observer machine. A daemon-host-local `LocalAttached` console may use signed local operator capabilities and may use `n` / `o` or preset shortcuts in Settings to change Codex client files on that same machine; those local file operations are not remote control-plane mutations. Edit durable provider/routing intent with local CLI commands or `config.toml`. Terminal client-switch paths include explicit `switch on/off`, `n` / `o` in integrated or LocalAttached TUI Settings, and the local `ch` / `ch relay` compatibility flows backed by the same journal/CAS contract.
 
-The target daemon exclusively owns its remote quota sampler. Attached clients neither start a second sampler nor force refreshes or mutations through the remote control plane. A remote pool counter may include other computers using the same account or key and is the source of truth for shared total burn; project attribution comes from request-ledger facts committed by that daemon to `state.sqlite` and never scales local prices to match a remote delta. See [Usage Page](docs/CONFIGURATION.md#usage-page) for source/scope/confidence, coverage, raw-unit, and conversion-generation limits.
+The target daemon exclusively owns its remote quota sampler, so attached clients never start a second sampler. A remote observer cannot force refreshes or mutations, while an authenticated local loopback-attached TUI may delegate a refresh to the daemon. A remote pool counter may include other computers using the same account or key and is the source of truth for shared total burn; project attribution comes from request-ledger facts committed by that daemon to `state.sqlite` and never scales local prices to match a remote delta. See [Usage Page](docs/CONFIGURATION.md#usage-page) for source/scope/confidence, coverage, raw-unit, and conversion-generation limits.
 
 ### Desktop Preview
 
@@ -406,8 +411,11 @@ The new Tauri desktop client lives under `apps/desktop` and uses React 19, Tailw
 - Balance adapters (optional and operator-owned; missing files use in-memory built-ins, and invalid input is never overwritten): `~/.codex-helper/usage_providers.json`
 - Pricing overrides: `~/.codex-helper/pricing_overrides.toml`
 - Request filter: `~/.codex-helper/filter.json`
-- Post-commit debug log: `~/.codex-helper/logs/requests.jsonl`
+- Post-commit request log: `~/.codex-helper/logs/requests.jsonl`
+- Optional full HTTP debug log: `~/.codex-helper/logs/requests_debug.jsonl`
 - Codex relay diagnostic evidence: `~/.codex-helper/logs/codex_relay_evidence.jsonl`
+
+Full HTTP request/response diagnostics are disabled by default. Read the [configuration reference for the environment variables and security boundary](docs/CONFIGURATION.md#full-http-request-and-response-diagnostics) before enabling them. Authentication headers and URI queries are sanitized, but explicitly captured request and response bodies do not receive field-level redaction.
 
 Codex files remain authoritative to Codex:
 

@@ -16,8 +16,15 @@ This deployment runs `codex-helper-server`, a container-first central relay runt
 Create an environment file from `deploy/compose/.env.example`, set a long `CODEX_HELPER_ADMIN_TOKEN`, and provide the provider credentials referenced by `deploy/container/config.toml`.
 
 ```bash
-docker compose --env-file deploy/compose/.env -f deploy/compose/codex-helper.yml up -d --build
+docker compose --env-file deploy/compose/.env \
+  -f deploy/compose/codex-helper.yml \
+  pull codex-helper
+docker compose --env-file deploy/compose/.env \
+  -f deploy/compose/codex-helper.yml \
+  up -d --no-build
 ```
+
+The example pins `CODEX_HELPER_VERSION` to a release instead of tracking `latest`. Change that value deliberately when upgrading. The commands above use the prebuilt multi-architecture GHCR image and do not compile Rust on the deployment host.
 
 The first start copies `/config/config.toml` into `/data/config.toml`. Later starts keep the existing `/data/config.toml`, so container updates do not overwrite runtime routing changes.
 
@@ -63,7 +70,11 @@ docker compose \
 docker compose \
   -f deploy/compose/codex-helper.yml \
   -f deploy/compose/codex-helper.secrets.yml \
-  up -d --build
+  pull codex-helper
+docker compose \
+  -f deploy/compose/codex-helper.yml \
+  -f deploy/compose/codex-helper.secrets.yml \
+  up -d --no-build
 ```
 
 The overlay mounts the source only at `/run/secrets/openai_api_key`, clears `OPENAI_API_KEY`, and uses a distinct `/data` volume so enabling it cannot overwrite an existing environment deployment's config. The secret value is read directly from the mount. It is never copied into `/data`, config, SQLite/WAL/SHM, logs, or operator JSON. One terminal LF or CRLF is accepted; empty, over-64-KiB, non-regular, unreadable, or malformed values are rejected with a stable category and the configured path only.
@@ -105,6 +116,18 @@ Then rerun `--check`. Do not claim a rotation completed from process state alone
 
 Native credential references are deliberately unsupported by `codex-helper-server`, including builds where Cargo feature unification compiled a desktop native backend into another workspace package. Use `*_env` or an absolute `secret_file` reference for server deployments.
 
+## Source Development
+
+Use a local image build only when testing changes from this checkout:
+
+```bash
+docker compose --env-file deploy/compose/.env \
+  -f deploy/compose/codex-helper.yml \
+  up -d --build
+```
+
+This path runs `cargo-chef` and compiles the workspace. It is intentionally separate from the prebuilt-image production workflow above.
+
 ## Client Configuration
 
 On each client machine that should use the NAS relay, prefer saving a relay target:
@@ -120,14 +143,14 @@ ch relay add nas \
 ch relay nas
 ```
 
-`ch relay nas` only starts or attaches to the target runtime and opens a local read-only TUI backed by the NAS admin API; it never changes that client machine's Codex configuration. Use `ch relay nas --no-tui` to omit the console, or `ch relay nas --attach-only` to require an already-running runtime. Point Codex at the NAS proxy explicitly, and restore the recorded local configuration explicitly:
+`ch relay nas` applies the client machine's journaled Codex switch to the saved `proxy_url`, then opens a local read-only TUI backed by the NAS admin API. Use `ch relay nas --no-tui` to perform only the client switch, or `ch relay nas --attach-only` to inspect the runtime without changing Codex. The equivalent long-form switch and the restore command are:
 
 ```bash
 codex-helper switch on --base-url http://NAS_IP_OR_TAILSCALE_IP:3211
 codex-helper switch off
 ```
 
-`ch relay off` does not restore Codex configuration; it only reports the explicit switch command to run.
+`ch relay off` runs the same journaled restore as `codex-helper switch off`. Neither command runs inside the container; both operate on the client machine's Codex files.
 
 Manual Codex config is still possible, but it does not give you target status or attached TUI:
 

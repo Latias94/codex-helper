@@ -93,6 +93,63 @@ fn migrated_provider_order(plan: &ConfigMigrationPlan) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn lossless_transform_keeps_an_explicit_empty_parent_after_removing_its_only_child() {
+    let source = r#"version = 5
+
+[claude.compaction]
+remote_v2_downgrade = true
+"#;
+    let before = toml::from_str::<TomlValue>(source).expect("parse source TOML");
+    let mut after = before.clone();
+    after
+        .as_table_mut()
+        .expect("root table")
+        .insert("version".to_string(), TomlValue::Integer(6));
+    assert!(remove_toml_path(&mut after, &["claude", "compaction"]));
+
+    let rendered = render_lossless_toml_value_transform(source, &before, &after, "test")
+        .expect("render lossless transform");
+
+    assert!(rendered.contains("[claude]"));
+    assert!(!rendered.contains("compaction"));
+    assert_eq!(
+        toml::from_str::<TomlValue>(&rendered).expect("reparse rendered TOML"),
+        after
+    );
+}
+
+#[test]
+fn lossless_transform_preserves_unknown_siblings_and_comments_while_removing_a_child() {
+    let source = r#"version = 5
+
+[claude]
+# operator-owned comment
+future_setting = "keep-me"
+
+[claude.compaction]
+remote_v2_downgrade = true
+"#;
+    let before = toml::from_str::<TomlValue>(source).expect("parse source TOML");
+    let mut after = before.clone();
+    after
+        .as_table_mut()
+        .expect("root table")
+        .insert("version".to_string(), TomlValue::Integer(6));
+    assert!(remove_toml_path(&mut after, &["claude", "compaction"]));
+
+    let rendered = render_lossless_toml_value_transform(source, &before, &after, "test")
+        .expect("render lossless transform");
+
+    assert!(rendered.contains("# operator-owned comment"));
+    assert!(rendered.contains("future_setting = \"keep-me\""));
+    assert!(!rendered.contains("compaction"));
+    assert_eq!(
+        toml::from_str::<TomlValue>(&rendered).expect("reparse rendered TOML"),
+        after
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn migration_preserves_a_linux_posix_acl() {
@@ -246,6 +303,76 @@ hosted_image_generation = ""
             .iter()
             .any(|notice| notice.contains("legacy empty"))
     );
+}
+
+#[tokio::test]
+async fn migration_preserves_v0203_hosted_image_overrides_independently_from_preset() {
+    for (fixture_name, patch, expected_preset, expected_hosted) in [
+        (
+            "default-enabled",
+            "preset = \"default\"\nhosted_image_generation = \"enabled\"",
+            crate::config::CodexClientPreset::Default,
+            crate::config::CodexHostedImageGenerationMode::Enabled,
+        ),
+        (
+            "official-relay-enabled",
+            "preset = \"official-relay\"\nhosted_image_generation = \"enabled\"",
+            crate::config::CodexClientPreset::OfficialRelay,
+            crate::config::CodexHostedImageGenerationMode::Enabled,
+        ),
+        (
+            "legacy-mode-and-hosted-alias",
+            "mode = \"official-relay-bridge\"\nhosted_image_generation = \"on\"",
+            crate::config::CodexClientPreset::OfficialRelay,
+            crate::config::CodexHostedImageGenerationMode::Enabled,
+        ),
+        (
+            "official-relay-disabled",
+            "preset = \"official-relay\"\nhosted_image_generation = \"disabled\"",
+            crate::config::CodexClientPreset::OfficialRelay,
+            crate::config::CodexHostedImageGenerationMode::Disabled,
+        ),
+    ] {
+        let temp = TempConfigDir::new();
+        write(
+            &temp.0.join("config.toml"),
+            &format!("version = 5\n\n[codex.client_patch]\n{patch}\n"),
+        );
+
+        let plan = build_config_migration_plan(&temp.paths())
+            .await
+            .unwrap_or_else(|error| panic!("migrate {fixture_name}: {error:#}"));
+        let migrated = toml::from_str::<HelperConfig>(&plan.rendered)
+            .unwrap_or_else(|error| panic!("parse {fixture_name}: {error:#}"));
+        let client_patch = migrated
+            .codex
+            .client_patch
+            .unwrap_or_else(|| panic!("retain client patch for {fixture_name}"));
+
+        assert_eq!(client_patch.preset, expected_preset, "{fixture_name}");
+        assert_eq!(
+            client_patch.hosted_image_generation, expected_hosted,
+            "{fixture_name}"
+        );
+        client_patch
+            .compile()
+            .unwrap_or_else(|error| panic!("compile {fixture_name}: {error:#}"));
+        assert!(
+            plan.rendered
+                .contains(&format!("preset = \"{}\"", expected_preset.as_str())),
+            "{fixture_name}: {}",
+            plan.rendered
+        );
+        assert!(
+            plan.rendered.contains(&format!(
+                "hosted_image_generation = \"{}\"",
+                expected_hosted.as_str()
+            )),
+            "{fixture_name}: {}",
+            plan.rendered
+        );
+        assert!(!plan.rendered.contains("mode ="), "{fixture_name}");
+    }
 }
 
 #[tokio::test]

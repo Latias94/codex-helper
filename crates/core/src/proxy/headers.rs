@@ -32,6 +32,30 @@ fn is_request_header_to_strip(name_lower: &str) -> bool {
     ) || is_hop_by_hop_header(name_lower)
 }
 
+fn is_sensitive_header_name(name_lower: &str) -> bool {
+    matches!(
+        name_lower,
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "api-key"
+            | "x-api-key"
+            | "x-auth-token"
+            | "x-codex-helper-admin-token"
+            | "x-forwarded-api-key"
+            | "x-goog-api-key"
+            | "x-oai-attestation"
+    ) || name_lower.starts_with("x-auth-")
+        || name_lower.ends_with("-api-key")
+        || name_lower.ends_with("-access-token")
+        || name_lower.ends_with("-auth-token")
+        || name_lower.ends_with("-token")
+        || name_lower.ends_with("-secret")
+        || name_lower.ends_with("-password")
+        || name_lower.ends_with("-private-key")
+}
+
 fn hop_by_hop_connection_tokens(headers: &HeaderMap) -> Vec<String> {
     let mut out = Vec::new();
     for value in headers.get_all("connection").iter() {
@@ -110,24 +134,11 @@ pub(super) fn filter_response_headers(src: &HeaderMap) -> HeaderMap {
 }
 
 pub(super) fn header_map_to_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
-    fn is_sensitive(name_lower: &str) -> bool {
-        matches!(
-            name_lower,
-            "authorization"
-                | "proxy-authorization"
-                | "cookie"
-                | "set-cookie"
-                | "x-api-key"
-                | "x-codex-helper-admin-token"
-                | "x-forwarded-api-key"
-                | "x-goog-api-key"
-        )
-    }
-
     let mut out = Vec::new();
     for (name, value) in headers.iter() {
         let name_lower = name.as_str().to_ascii_lowercase();
-        let value = if is_sensitive(name_lower.as_str())
+        let value = if value.is_sensitive()
+            || is_sensitive_header_name(name_lower.as_str())
             || name_lower == CODEX_CLIENT_FACADE_ACTOR_HEADER
         {
             "[REDACTED]".to_string()
@@ -240,6 +251,26 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
         headers.insert("x-api-key", HeaderValue::from_static("secret-key"));
+        headers.insert("api-key", HeaderValue::from_static("legacy-secret-key"));
+        headers.insert(
+            "x-auth-token",
+            HeaderValue::from_static("custom-auth-token"),
+        );
+        headers.insert(
+            "cf-access-client-secret",
+            HeaderValue::from_static("access-secret"),
+        );
+        headers.insert(
+            "x-provider-private-key",
+            HeaderValue::from_static("private-key"),
+        );
+        headers.insert(
+            "x-oai-attestation",
+            HeaderValue::from_static("device-attestation"),
+        );
+        let mut marked_sensitive = HeaderValue::from_static("library-marked-secret");
+        marked_sensitive.set_sensitive(true);
+        headers.insert("x-custom-credential", marked_sensitive);
         headers.insert(
             "x-codex-helper-admin-token",
             HeaderValue::from_static("admin-secret"),
@@ -264,6 +295,18 @@ mod tests {
         assert!(entries.iter().any(|entry| {
             entry.name.eq_ignore_ascii_case("x-api-key") && entry.value == "[REDACTED]"
         }));
+        for name in [
+            "api-key",
+            "x-auth-token",
+            "cf-access-client-secret",
+            "x-provider-private-key",
+            "x-oai-attestation",
+            "x-custom-credential",
+        ] {
+            assert!(entries.iter().any(|entry| {
+                entry.name.eq_ignore_ascii_case(name) && entry.value == "[REDACTED]"
+            }));
+        }
         assert!(entries.iter().any(|entry| {
             entry
                 .name

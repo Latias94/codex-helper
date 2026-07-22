@@ -41,6 +41,95 @@ pub(in crate::tui) enum Overlay {
     RoutingConfirmation,
     SessionAffinityActions,
     SessionAffinityConfirmation,
+    SessionProfileMenu,
+    SessionModelMenu,
+    SessionEffortMenu,
+    SessionServiceTierMenu,
+    SessionBindingInput,
+    ConfiguredDefaultProfileMenu,
+    RuntimeDefaultProfileMenu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum SessionBindingInputKind {
+    Model,
+    ServiceTier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum SessionEffortChoice {
+    Clear,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+impl SessionEffortChoice {
+    pub(in crate::tui) const ALL: [Self; 6] = [
+        Self::Clear,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+    ];
+
+    pub(in crate::tui) fn value(self) -> Option<&'static str> {
+        match self {
+            Self::Clear => None,
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+        }
+    }
+
+    pub(in crate::tui) fn label(self, lang: Language) -> &'static str {
+        match (lang, self) {
+            (Language::Zh, Self::Clear) => "清除（使用请求值）",
+            (Language::En, Self::Clear) => "Clear (use request value)",
+            (_, Self::Minimal) => "minimal",
+            (_, Self::Low) => "low",
+            (_, Self::Medium) => "medium",
+            (_, Self::High) => "high",
+            (_, Self::XHigh) => "xhigh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum SessionServiceTierChoice {
+    Clear,
+    Default,
+    Fast,
+    Flex,
+}
+
+impl SessionServiceTierChoice {
+    pub(in crate::tui) const ALL: [Self; 4] = [Self::Clear, Self::Default, Self::Fast, Self::Flex];
+
+    pub(in crate::tui) fn value(self) -> Option<&'static str> {
+        match self {
+            Self::Clear => None,
+            Self::Default => Some("default"),
+            Self::Fast => Some("fast"),
+            Self::Flex => Some("flex"),
+        }
+    }
+
+    pub(in crate::tui) fn label(self, lang: Language) -> &'static str {
+        match (lang, self) {
+            (Language::Zh, Self::Clear) => "清除（使用请求值）",
+            (Language::En, Self::Clear) => "Clear (use request value)",
+            (_, Self::Default) => "default",
+            (Language::Zh, Self::Fast) => "fast（上游 priority）",
+            (Language::En, Self::Fast) => "fast (upstream priority)",
+            (_, Self::Flex) => "flex",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

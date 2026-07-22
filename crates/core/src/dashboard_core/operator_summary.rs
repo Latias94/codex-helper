@@ -8,7 +8,9 @@ use crate::balance::{
     ProviderUsageRateSnapshot, ProviderUsageWindow,
 };
 use crate::config::{
-    RetryProfileName, RouteAffinityPolicy, RouteGraphConfig, RouteStrategy, SchedulingPreset,
+    ReasoningGuardAction, ReasoningGuardRetryExhaustedAction, ReasoningGuardStreamMode,
+    ResolvedReasoningGuardConfig, ResolvedRetryConfig, ResolvedRetryLayerConfig, RetryProfileName,
+    RetryStrategy, RouteAffinityPolicy, RouteGraphConfig, RouteStrategy, SchedulingPreset,
     ServiceRouteConfig,
 };
 use crate::credentials::{
@@ -78,7 +80,33 @@ pub struct OperatorReadModel {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OperatorReadCapture {
     pub model: OperatorReadModel,
-    pub local_session_ids: HashMap<String, String>,
+    pub local_sessions: HashMap<String, OperatorLocalSessionMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorLocalSessionMetadata {
+    pub raw_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_client_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_local_transcript_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalOperatorSessionMetadataRequest {
+    pub session_keys: Vec<String>,
+}
+
+pub const LOCAL_OPERATOR_SESSION_METADATA_BATCH_MAX: usize = 256;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalOperatorSessionMetadataResponse {
+    pub service_name: String,
+    pub sessions: HashMap<String, OperatorLocalSessionMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -488,6 +516,8 @@ pub struct OperatorSessionSummary {
     pub binding_profile_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_continuity_mode: Option<SessionContinuityMode>,
+    #[serde(default)]
+    pub binding: crate::state::SessionBindingProjection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_route_decision: Option<RouteDecisionProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -555,6 +585,7 @@ impl OperatorSessionSummary {
             avg_output_tokens_per_second: card.avg_output_tokens_per_second,
             binding_profile_name: card.binding_profile_name.clone(),
             binding_continuity_mode: card.binding_continuity_mode,
+            binding: card.binding.clone(),
             last_route_decision: card
                 .last_route_decision
                 .as_ref()
@@ -776,6 +807,8 @@ pub struct OperatorProviderBalanceSummary {
     pub usage_model_stats: Vec<ProviderUsageModelStat>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alert_codes: Vec<ProviderUsageAlertKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl From<&ProviderBalanceSnapshot> for OperatorProviderBalanceSummary {
@@ -821,6 +854,10 @@ impl From<&ProviderBalanceSnapshot> for OperatorProviderBalanceSummary {
                 .iter()
                 .map(|alert| alert.kind)
                 .collect(),
+            error: snapshot
+                .error
+                .as_deref()
+                .map(|error| crate::balance::safe_provider_balance_error(error).to_string()),
         }
     }
 }
@@ -828,6 +865,8 @@ impl From<&ProviderBalanceSnapshot> for OperatorProviderBalanceSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OperatorRequestSummary {
     pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -848,6 +887,8 @@ pub struct OperatorRequestSummary {
     pub upstream_origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
+    #[serde(default)]
+    pub cache_accounting_convention: crate::usage::CacheAccountingConvention,
     #[serde(default, skip_serializing_if = "CostBreakdown::is_unknown")]
     pub cost: CostBreakdown,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -975,6 +1016,7 @@ impl OperatorRequestSummary {
         );
         Self {
             id: request.id,
+            trace_key: request.trace_id.as_deref().map(operator_request_trace_key),
             session_key: request.session_id.as_deref().map(operator_session_key),
             model: request.model.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
@@ -985,6 +1027,7 @@ impl OperatorRequestSummary {
             route_path: route.route_path,
             upstream_origin: route.upstream_origin,
             usage: request.usage.clone(),
+            cache_accounting_convention: request.accounting.cache_accounting_convention,
             cost: redact_operator_cost_breakdown(request.cost.clone()),
             retry: request
                 .retry
@@ -1154,7 +1197,15 @@ fn opaque_operator_key(namespace: &str, value: &str) -> String {
     format!("{namespace}:sha256:{:x}", digest.finalize())
 }
 
-pub(crate) fn operator_session_key(session_id: &str) -> String {
+fn operator_request_trace_key(trace_id: &str) -> String {
+    if crate::logging::is_versioned_request_trace_id(trace_id) {
+        trace_id.to_string()
+    } else {
+        opaque_operator_key("trace", trace_id)
+    }
+}
+
+pub fn operator_session_key(session_id: &str) -> String {
     opaque_operator_key("session", session_id)
 }
 
@@ -1247,9 +1298,26 @@ pub struct OperatorRuntimeSummary {
     #[serde(default)]
     pub default_profile: Option<String>,
     #[serde(default)]
+    pub runtime_default_profile_override: Option<String>,
+    #[serde(default)]
+    pub default_profile_source: EffectiveDefaultProfileSource,
+    #[serde(default)]
+    pub default_profile_control_revision: u64,
+    #[serde(default)]
+    pub profile_catalog_key: String,
+    #[serde(default)]
     pub default_profile_summary: Option<OperatorProfileSummary>,
     #[serde(default, skip_serializing_if = "OperatorActionCapabilities::is_empty")]
     pub operator_actions: OperatorActionCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveDefaultProfileSource {
+    #[default]
+    None,
+    Configured,
+    RuntimeOverride,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1260,11 +1328,28 @@ pub struct OperatorActionCapabilities {
     pub mutate_routing: bool,
     #[serde(default)]
     pub mutate_session_affinity: bool,
+    #[serde(default)]
+    pub mutate_session_binding: bool,
+    #[serde(default)]
+    pub reload_runtime: bool,
+    #[serde(default)]
+    pub mutate_default_profile: bool,
+    #[serde(default)]
+    pub inspect_relay_capabilities: bool,
+    #[serde(default)]
+    pub run_relay_live_smoke: bool,
 }
 
 impl OperatorActionCapabilities {
     pub fn is_empty(&self) -> bool {
-        !self.refresh_provider_balances && !self.mutate_routing && !self.mutate_session_affinity
+        !self.refresh_provider_balances
+            && !self.mutate_routing
+            && !self.mutate_session_affinity
+            && !self.mutate_session_binding
+            && !self.reload_runtime
+            && !self.mutate_default_profile
+            && !self.inspect_relay_capabilities
+            && !self.run_relay_live_smoke
     }
 }
 
@@ -1282,11 +1367,105 @@ pub struct OperatorProfileSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct OperatorRetryLayerSummary {
+    pub max_attempts: u32,
+    pub backoff_ms: u64,
+    pub backoff_max_ms: u64,
+    pub jitter_ms: u64,
+    pub on_status: String,
+    #[serde(default)]
+    pub on_class: Vec<String>,
+    pub strategy: RetryStrategy,
+}
+
+impl From<&ResolvedRetryLayerConfig> for OperatorRetryLayerSummary {
+    fn from(layer: &ResolvedRetryLayerConfig) -> Self {
+        Self {
+            max_attempts: layer.max_attempts,
+            backoff_ms: layer.backoff_ms,
+            backoff_max_ms: layer.backoff_max_ms,
+            jitter_ms: layer.jitter_ms,
+            on_status: layer.on_status.clone(),
+            on_class: layer.on_class.clone(),
+            strategy: layer.strategy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct OperatorReasoningGuardSummary {
+    pub enabled: bool,
+    #[serde(default)]
+    pub reasoning_equals: Vec<i64>,
+    pub boundary_sequence_max_n: u32,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    pub action: ReasoningGuardAction,
+    pub stream_mode: ReasoningGuardStreamMode,
+    pub max_guard_retries: u32,
+    pub on_retry_exhausted: ReasoningGuardRetryExhaustedAction,
+    pub log_matches: bool,
+}
+
+impl From<&ResolvedReasoningGuardConfig> for OperatorReasoningGuardSummary {
+    fn from(guard: &ResolvedReasoningGuardConfig) -> Self {
+        Self {
+            enabled: guard.enabled,
+            reasoning_equals: guard.reasoning_equals.clone(),
+            boundary_sequence_max_n: guard.boundary_sequence_max_n,
+            paths: guard.paths.clone(),
+            action: guard.action,
+            stream_mode: guard.stream_mode,
+            max_guard_retries: guard.max_guard_retries,
+            on_retry_exhausted: guard.on_retry_exhausted,
+            log_matches: guard.log_matches,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct OperatorRetryPolicySummary {
+    pub upstream: OperatorRetryLayerSummary,
+    pub provider: OperatorRetryLayerSummary,
+    pub never_on_status: String,
+    #[serde(default)]
+    pub never_on_class: Vec<String>,
+    pub cloudflare_challenge_cooldown_secs: u64,
+    pub cloudflare_timeout_cooldown_secs: u64,
+    pub transport_cooldown_secs: u64,
+    pub cooldown_backoff_factor: u64,
+    pub cooldown_backoff_max_secs: u64,
+    pub reasoning_guard: OperatorReasoningGuardSummary,
+}
+
+impl From<&ResolvedRetryConfig> for OperatorRetryPolicySummary {
+    fn from(retry: &ResolvedRetryConfig) -> Self {
+        Self {
+            upstream: (&retry.upstream).into(),
+            provider: (&retry.route).into(),
+            never_on_status: retry.never_on_status.clone(),
+            never_on_class: retry.never_on_class.clone(),
+            cloudflare_challenge_cooldown_secs: retry.cloudflare_challenge_cooldown_secs,
+            cloudflare_timeout_cooldown_secs: retry.cloudflare_timeout_cooldown_secs,
+            transport_cooldown_secs: retry.transport_cooldown_secs,
+            cooldown_backoff_factor: retry.cooldown_backoff_factor,
+            cooldown_backoff_max_secs: retry.cooldown_backoff_max_secs,
+            reasoning_guard: (&retry.reasoning_guard).into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct OperatorRetrySummary {
     #[serde(default)]
     pub configured_profile: Option<RetryProfileName>,
     pub upstream_max_attempts: u32,
     pub provider_max_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<OperatorRetryPolicySummary>,
     #[serde(default)]
     pub recent_retried_requests: usize,
     #[serde(default)]
@@ -1363,6 +1542,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_balance_projection_keeps_only_a_safe_error_category() {
+        const CANARY: &str = "provider-error-secret-canary";
+        let snapshot = ProviderBalanceSnapshot {
+            error: Some(format!("HTTP 401 Authorization: Bearer {CANARY}")),
+            ..ProviderBalanceSnapshot::default()
+        };
+
+        let projected = OperatorProviderBalanceSummary::from(&snapshot);
+
+        assert_eq!(projected.error.as_deref(), Some("authentication failed"));
+        assert!(!format!("{projected:?}").contains(CANARY));
+    }
+
     fn ready_operator_model() -> OperatorReadModel {
         OperatorReadModel::ready(
             "codex",
@@ -1419,6 +1612,48 @@ mod tests {
         assert_eq!(
             decoded.data.expect("operator data").quota_analytics.support,
             crate::quota_analytics::QuotaAnalyticsSupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn operator_retry_summary_accepts_legacy_payload_without_policy() {
+        let retry: OperatorRetrySummary = serde_json::from_value(serde_json::json!({
+            "configured_profile": "balanced",
+            "upstream_max_attempts": 2,
+            "provider_max_attempts": 3,
+            "recent_retried_requests": 4,
+            "recent_cross_provider_failovers": 1,
+            "recent_same_provider_retries": 2,
+            "recent_fast_mode_requests": 3
+        }))
+        .expect("deserialize legacy retry summary");
+
+        assert!(retry.policy.is_none());
+        assert_eq!(retry.upstream_max_attempts, 2);
+        assert_eq!(retry.provider_max_attempts, 3);
+        assert_eq!(retry.recent_retried_requests, 4);
+    }
+
+    #[test]
+    fn operator_retry_policy_projects_every_resolved_policy_group() {
+        let resolved = crate::config::RetryConfig::default().resolve();
+        let policy = OperatorRetryPolicySummary::from(&resolved);
+
+        assert_eq!(policy.upstream.max_attempts, resolved.upstream.max_attempts);
+        assert_eq!(policy.upstream.on_status, resolved.upstream.on_status);
+        assert_eq!(policy.provider.strategy, resolved.route.strategy);
+        assert_eq!(policy.never_on_class, resolved.never_on_class);
+        assert_eq!(
+            policy.cloudflare_challenge_cooldown_secs,
+            resolved.cloudflare_challenge_cooldown_secs
+        );
+        assert_eq!(
+            policy.reasoning_guard.stream_mode,
+            resolved.reasoning_guard.stream_mode
+        );
+        assert_eq!(
+            policy.reasoning_guard.on_retry_exhausted,
+            resolved.reasoning_guard.on_retry_exhausted
         );
     }
 
@@ -1552,6 +1787,19 @@ mod tests {
         .expect("finished request fixture");
         request.retry = retry;
         request
+    }
+
+    #[test]
+    fn operator_request_projection_preserves_helper_generated_trace_key() {
+        let boot_uuid =
+            uuid::Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("boot UUID");
+        let trace_key = crate::logging::request_trace_id_for_boot(&boot_uuid, "codex", 17);
+        let mut request = finished_request(None, None, None);
+        request.trace_id = Some(trace_key.clone());
+
+        let projected = OperatorRequestSummary::from_finished_request(&request);
+
+        assert_eq!(projected.trace_key.as_deref(), Some(trace_key.as_str()));
     }
 
     fn assert_canonical_request_route(
@@ -1843,6 +2091,7 @@ mod tests {
         assert!(request_json.contains("quota"));
         assert!(request_json.contains("cooldown"));
         assert!(request_json.contains("\"code\":\"unknown\""));
+        assert!(request_json.contains("trace:sha256:"));
 
         let card: SessionIdentityCard = serde_json::from_value(serde_json::json!({
             "session_id": "session-card-secret",

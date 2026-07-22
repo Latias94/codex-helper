@@ -81,6 +81,10 @@ const operatorSummary: ApiOperatorSummary = {
     runtime_source_mtime_ms: null,
     configured_default_profile: "chatgpt-bridge",
     default_profile: "chatgpt-bridge",
+    runtime_default_profile_override: null,
+    default_profile_source: "configured",
+    default_profile_control_revision: 0,
+    profile_catalog_key: "profile-catalog:test",
     default_profile_summary: {
       name: "chatgpt-bridge",
       model: null,
@@ -167,6 +171,10 @@ const finishedRequest: ApiOperatorRequestSummary = {
     total_tokens: 1500,
     cached_input_tokens: 200,
   }),
+  cache_accounting_convention: {
+    cache_read: "unknown",
+    cache_write: "unknown",
+  },
   cost: {
     input_cost_usd: "0.001",
     output_cost_usd: "0.002",

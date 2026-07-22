@@ -4,16 +4,16 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, Uri};
 
 use crate::config::{CODEX_CLIENT_RUNTIME_PATCH_HEADER, CodexClientRuntimePatch};
-use crate::endpoint_health::CooldownBackoff;
+use crate::endpoint_health::{CooldownBackoff, RouteCapability};
 use crate::logging::{BodyPreview, CodexBridgeLog, ServiceTierLog, make_body_preview};
 use crate::routing_ir::RouteRequestContext;
+use crate::runtime_store::RequestAccountingScope;
 use crate::state::{
     SessionBinding, SessionContinuityMode, SessionIdentitySource, SessionRouteControlGuard,
 };
 
 use super::ProxyService;
 use super::client_identity::ClientSessionIdentity;
-use super::models_compat::codex_path_is_models;
 use super::request_body::{
     ReasoningOrchestrationIntent, RequestDialect, apply_model_override_value,
     apply_reasoning_effort_override_value, apply_service_tier_override_value,
@@ -34,6 +34,79 @@ pub(super) enum SharedRouteStateImpact {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RequestReplayPolicy {
+    RouteFacing,
+    SafeRead,
+    NeverAfterDispatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamTerminalPolicy {
+    ProtocolEvent,
+    EndOfBody,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointSurface {
+    Inference,
+    RemoteCompaction,
+    ModelCatalog,
+    RequestLocalResource,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EndpointSurfaceMatcher {
+    ExactSuffix(&'static str),
+    SegmentFamily(&'static str),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EndpointSurfaceRule {
+    matcher: EndpointSurfaceMatcher,
+    surface: EndpointSurface,
+}
+
+const ENDPOINT_SURFACE_CATALOG: &[EndpointSurfaceRule] = &[
+    EndpointSurfaceRule {
+        matcher: EndpointSurfaceMatcher::ExactSuffix("/responses/compact"),
+        surface: EndpointSurface::RemoteCompaction,
+    },
+    EndpointSurfaceRule {
+        matcher: EndpointSurfaceMatcher::ExactSuffix("/responses"),
+        surface: EndpointSurface::Inference,
+    },
+    EndpointSurfaceRule {
+        matcher: EndpointSurfaceMatcher::ExactSuffix("/chat/completions"),
+        surface: EndpointSurface::Inference,
+    },
+    EndpointSurfaceRule {
+        matcher: EndpointSurfaceMatcher::ExactSuffix("/messages"),
+        surface: EndpointSurface::Inference,
+    },
+    EndpointSurfaceRule {
+        matcher: EndpointSurfaceMatcher::SegmentFamily("models"),
+        surface: EndpointSurface::ModelCatalog,
+    },
+    EndpointSurfaceRule {
+        matcher: EndpointSurfaceMatcher::SegmentFamily("files"),
+        surface: EndpointSurface::RequestLocalResource,
+    },
+    EndpointSurfaceRule {
+        matcher: EndpointSurfaceMatcher::SegmentFamily("uploads"),
+        surface: EndpointSurface::RequestLocalResource,
+    },
+    EndpointSurfaceRule {
+        matcher: EndpointSurfaceMatcher::SegmentFamily("batches"),
+        surface: EndpointSurface::RequestLocalResource,
+    },
+    EndpointSurfaceRule {
+        matcher: EndpointSurfaceMatcher::SegmentFamily("containers"),
+        surface: EndpointSurface::RequestLocalResource,
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestOrigin {
     Client,
     ImagesCompatibility,
@@ -45,6 +118,108 @@ impl SharedRouteStateImpact {
     }
 }
 
+impl RequestReplayPolicy {
+    pub(super) fn allows_after_dispatch(self) -> bool {
+        self != Self::NeverAfterDispatch
+    }
+
+    pub(super) fn allows_credential_failover(self) -> bool {
+        self == Self::SafeRead
+    }
+}
+
+impl EndpointSurfaceMatcher {
+    fn matches(self, normalized_path: &str) -> bool {
+        match self {
+            Self::ExactSuffix(suffix) => normalized_path.ends_with(suffix),
+            Self::SegmentFamily(family) => {
+                normalized_path.split('/').any(|segment| segment == family)
+            }
+        }
+    }
+}
+
+impl EndpointSurface {
+    fn shared_route_state_impact(self) -> SharedRouteStateImpact {
+        match self {
+            Self::Inference | Self::RemoteCompaction => SharedRouteStateImpact::RouteFacing,
+            Self::ModelCatalog | Self::RequestLocalResource | Self::Unknown => {
+                SharedRouteStateImpact::RequestLocalOnly
+            }
+        }
+    }
+
+    fn route_capability(self) -> RouteCapability {
+        match self {
+            Self::Inference => RouteCapability::Inference,
+            Self::RemoteCompaction => RouteCapability::RemoteCompaction,
+            // Request-local surfaces never project or update shared health. ModelCatalog is an
+            // inert capability value for the concrete field carried through an HTTP attempt.
+            Self::ModelCatalog | Self::RequestLocalResource | Self::Unknown => {
+                RouteCapability::ModelCatalog
+            }
+        }
+    }
+
+    fn terminal_accounting(self) -> RequestAccountingScope {
+        match self {
+            Self::Inference | Self::RemoteCompaction => RequestAccountingScope::Economic,
+            Self::ModelCatalog | Self::RequestLocalResource | Self::Unknown => {
+                RequestAccountingScope::NonEconomic
+            }
+        }
+    }
+
+    fn stream_terminal_policy(self) -> StreamTerminalPolicy {
+        match self {
+            Self::Inference | Self::RemoteCompaction => StreamTerminalPolicy::ProtocolEvent,
+            Self::ModelCatalog | Self::RequestLocalResource | Self::Unknown => {
+                StreamTerminalPolicy::EndOfBody
+            }
+        }
+    }
+
+    fn replay_policy(self, method: &Method) -> RequestReplayPolicy {
+        if self.shared_route_state_impact().allows_shared_updates() {
+            RequestReplayPolicy::RouteFacing
+        } else if method == Method::GET || method == Method::HEAD {
+            RequestReplayPolicy::SafeRead
+        } else {
+            RequestReplayPolicy::NeverAfterDispatch
+        }
+    }
+}
+
+fn endpoint_surface(method: &Method, path: &str) -> EndpointSurface {
+    let normalized_path = path.trim_end_matches('/');
+    let surface = ENDPOINT_SURFACE_CATALOG
+        .iter()
+        .find(|rule| {
+            matches!(rule.matcher, EndpointSurfaceMatcher::SegmentFamily(_))
+                && rule.matcher.matches(normalized_path)
+        })
+        .or_else(|| {
+            ENDPOINT_SURFACE_CATALOG
+                .iter()
+                .find(|rule| rule.matcher.matches(normalized_path))
+        })
+        .map(|rule| rule.surface)
+        .unwrap_or(EndpointSurface::Unknown);
+
+    // Responses WebSocket GET upgrades are handled by the dedicated router before this HTTP
+    // forwarding path. Other methods must not create inference or compaction route evidence.
+    if *method != Method::POST
+        && matches!(
+            surface,
+            EndpointSurface::Inference | EndpointSurface::RemoteCompaction
+        )
+    {
+        EndpointSurface::Unknown
+    } else {
+        surface
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct RequestFlavor {
     pub client_content_type: Option<String>,
@@ -52,15 +227,25 @@ pub(super) struct RequestFlavor {
     pub is_user_turn: bool,
     pub is_remote_compaction_v1_request: bool,
     pub is_remote_compaction_v2_request: bool,
+    pub remote_v2_downgrade_enabled: bool,
     pub remote_compaction_requires_affinity: bool,
     pub is_codex_service: bool,
     pub shared_route_state_impact: SharedRouteStateImpact,
+    pub terminal_accounting: RequestAccountingScope,
+    pub route_capability: RouteCapability,
+    pub stream_terminal_policy: StreamTerminalPolicy,
+    pub replay_policy: RequestReplayPolicy,
     pub codex_bridge_log: Option<CodexBridgeLog>,
 }
 
 impl RequestFlavor {
     pub(super) fn is_remote_compaction_request(&self) -> bool {
         self.is_remote_compaction_v1_request || self.is_remote_compaction_v2_request
+    }
+
+    pub(super) fn with_remote_v2_downgrade_enabled(mut self, enabled: bool) -> Self {
+        self.remote_v2_downgrade_enabled = enabled;
+        self
     }
 
     pub(super) fn route_state_session_id<'a>(
@@ -85,17 +270,38 @@ impl RequestFlavor {
         self.is_remote_compaction_v1_request = continuity.is_remote_compaction_v1_request;
         self.is_remote_compaction_v2_request = continuity.is_remote_compaction_v2_request;
         self.remote_compaction_requires_affinity = continuity.remote_compaction_requires_affinity;
+        if self.is_remote_compaction_request() {
+            self.route_capability = RouteCapability::RemoteCompaction;
+        }
         if continuity.is_remote_compaction_v2_request {
             let bridge = self.codex_bridge_log.get_or_insert(CodexBridgeLog {
                 patch_mode: "request-dialect".to_string(),
                 remote_compaction_v1_request: false,
                 remote_compaction_v2_request: false,
+                downgraded_to_responses_compact: false,
                 responses_websocket_request: false,
                 strips_client_auth: false,
             });
             bridge.remote_compaction_v2_request = true;
         }
         self
+    }
+
+    pub(super) fn with_hosted_image_generation(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.route_capability = RouteCapability::HostedImageGeneration;
+        }
+        self
+    }
+
+    pub(super) fn transient_health_capability(&self) -> Option<RouteCapability> {
+        self.shared_route_state_impact
+            .allows_shared_updates()
+            .then_some(self.route_capability)
+    }
+
+    pub(super) fn allows_request_body_transforms(&self) -> bool {
+        self.shared_route_state_impact.allows_shared_updates()
     }
 
     pub(super) fn with_responses_stream_from_body(self, raw_body: &[u8]) -> Self {
@@ -217,6 +423,27 @@ pub(super) async fn prepare_common_request(
     prepare_common_request_inner(params, true).await
 }
 
+pub(super) async fn prepare_http_request(
+    params: CommonRequestPreparationParams<'_>,
+    client_body: &Bytes,
+) -> Result<CommonPreparedRequest, CommonRequestPreparationError> {
+    let client_content_type = params.client_content_type;
+    let request_body_previews = params.request_body_previews;
+    let mut prepared = prepare_common_request_inner(params, true).await?;
+    let client_body_previews = build_body_previews(
+        client_body,
+        client_content_type,
+        request_body_previews,
+        prepared.debug_max,
+        prepared.warn_max,
+    );
+
+    prepared.request_body_len = client_body.len();
+    prepared.client_body_debug = client_body_previews.debug;
+    prepared.client_body_warn = client_body_previews.warn;
+    Ok(prepared)
+}
+
 #[cfg(test)]
 pub(super) async fn prepare_common_request_without_route_plan(
     params: CommonRequestPreparationParams<'_>,
@@ -253,7 +480,7 @@ async fn prepare_common_request_inner(
     let session_identity_source = config.session_identity_source;
     let session_binding = if let Some(id) = session_id.as_deref() {
         proxy
-            .ensure_default_session_binding(view, id, started_at_ms)
+            .ensure_default_session_binding(config.runtime_snapshot.as_ref(), id, started_at_ms)
             .await
     } else {
         None
@@ -284,14 +511,23 @@ async fn prepare_common_request_inner(
                     .map(|patch| patch.translate_models)
             })
             .unwrap_or(false);
-    let prepared_request = prepare_request_body(PrepareRequestBodyParams {
-        raw_body,
-        dialect: request_dialect,
-        binding_effort,
-        binding_model,
-        binding_service_tier,
-        filter_hosted_image_generation_tools,
-    });
+    let body_transforms_allowed = request_origin == RequestOrigin::ImagesCompatibility
+        || request_dialect == RequestDialect::ResponsesWebSocket
+        || endpoint_surface(method, uri.path())
+            .shared_route_state_impact()
+            .allows_shared_updates();
+    let prepared_request = if body_transforms_allowed {
+        prepare_request_body(PrepareRequestBodyParams {
+            raw_body,
+            dialect: request_dialect,
+            binding_effort,
+            binding_model,
+            binding_service_tier,
+            filter_hosted_image_generation_tools,
+        })
+    } else {
+        inspect_passthrough_request_body(raw_body, request_dialect)
+    };
     let body_for_upstream = prepared_request.body_for_upstream.clone();
     let request_model = prepared_request.request_model.clone();
     let effective_effort = prepared_request.effective_effort.clone();
@@ -302,12 +538,12 @@ async fn prepare_common_request_inner(
 
     let debug_opt = crate::logging::http_debug_options();
     let warn_opt = crate::logging::http_warn_options();
-    let debug_max = if request_body_previews && debug_opt.enabled {
+    let debug_max = if debug_opt.enabled {
         debug_opt.max_body_bytes
     } else {
         0
     };
-    let warn_max = if request_body_previews && warn_opt.enabled {
+    let warn_max = if warn_opt.enabled {
         warn_opt.max_body_bytes
     } else {
         0
@@ -446,27 +682,24 @@ pub(super) fn detect_request_flavor(
         .map(str::to_owned);
 
     let is_codex_service = service_name == "codex";
-    let shared_route_state_impact =
-        if is_codex_service && *method == Method::GET && codex_path_is_models(path) {
-            SharedRouteStateImpact::RequestLocalOnly
-        } else {
-            SharedRouteStateImpact::RouteFacing
-        };
-    let is_stream = shared_route_state_impact.allows_shared_updates()
-        && headers
-            .get("accept")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
-            .unwrap_or(false);
+    let endpoint_surface = endpoint_surface(method, path);
+    let shared_route_state_impact = endpoint_surface.shared_route_state_impact();
+    let is_stream = headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false);
 
     let is_responses_path = codex_path_is_responses(path);
-    let is_remote_compaction_v1_request = codex_path_is_responses_compact(path);
+    let is_remote_compaction_v1_request =
+        *method == Method::POST && codex_path_is_responses_compact(path);
     let is_user_turn = *method == Method::POST && is_responses_path;
     let codex_bridge_log =
         (is_codex_service && is_remote_compaction_v1_request).then(|| CodexBridgeLog {
             patch_mode: "request-dialect".to_string(),
             remote_compaction_v1_request: is_remote_compaction_v1_request,
             remote_compaction_v2_request: false,
+            downgraded_to_responses_compact: false,
             responses_websocket_request: false,
             strips_client_auth: false,
         });
@@ -477,9 +710,14 @@ pub(super) fn detect_request_flavor(
         is_user_turn,
         is_remote_compaction_v1_request,
         is_remote_compaction_v2_request: false,
+        remote_v2_downgrade_enabled: false,
         remote_compaction_requires_affinity: false,
         is_codex_service,
         shared_route_state_impact,
+        terminal_accounting: endpoint_surface.terminal_accounting(),
+        route_capability: endpoint_surface.route_capability(),
+        stream_terminal_policy: endpoint_surface.stream_terminal_policy(),
+        replay_policy: endpoint_surface.replay_policy(method),
         codex_bridge_log,
     }
 }
@@ -676,6 +914,34 @@ pub(super) fn prepare_request_body(params: PrepareRequestBodyParams<'_>) -> Prep
     }
 }
 
+fn inspect_passthrough_request_body(
+    raw_body: &Bytes,
+    dialect: RequestDialect,
+) -> PreparedRequestBody {
+    let request_json = serde_json::from_slice::<serde_json::Value>(raw_body).ok();
+    let request_model = request_json.as_ref().and_then(extract_model_from_value);
+    let effective_effort = request_json
+        .as_ref()
+        .and_then(|value| extract_reasoning_effort_from_value(value, dialect));
+    let service_tier = request_json
+        .as_ref()
+        .and_then(extract_service_tier_from_value);
+
+    PreparedRequestBody {
+        body_for_upstream: raw_body.clone(),
+        request_model: request_model.clone(),
+        requested_model: request_model,
+        effective_effort,
+        deferred_reasoning_intent: None,
+        base_service_tier: ServiceTierLog {
+            requested: service_tier.clone(),
+            effective: service_tier,
+            actual: None,
+        },
+        request_body_len: raw_body.len(),
+    }
+}
+
 pub(super) fn build_body_previews(
     body: &[u8],
     content_type: Option<&str>,
@@ -766,31 +1032,163 @@ mod tests {
             flavor.shared_route_state_impact,
             SharedRouteStateImpact::RouteFacing
         );
+        assert_eq!(flavor.route_capability, RouteCapability::Inference);
+        assert_eq!(
+            flavor.transient_health_capability(),
+            Some(RouteCapability::Inference)
+        );
     }
 
     #[test]
-    fn codex_models_get_is_request_local_even_with_session_and_sse_headers() {
+    fn resource_endpoint_catalog_is_request_local_for_all_services_and_methods() {
         let mut headers = HeaderMap::new();
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
 
-        for path in ["/models", "/v1/models/", "/backend-api/codex/models"] {
-            let flavor = detect_request_flavor("codex", &Method::GET, &headers, path);
+        for (service, method, path, expected_surface) in [
+            (
+                "codex",
+                Method::GET,
+                "/models",
+                EndpointSurface::ModelCatalog,
+            ),
+            (
+                "codex",
+                Method::POST,
+                "/v1/models/",
+                EndpointSurface::ModelCatalog,
+            ),
+            (
+                "claude",
+                Method::GET,
+                "/backend-api/codex/models/gpt-5.6-sol",
+                EndpointSurface::ModelCatalog,
+            ),
+            (
+                "codex",
+                Method::GET,
+                "/files",
+                EndpointSurface::RequestLocalResource,
+            ),
+            (
+                "codex",
+                Method::DELETE,
+                "/v1/files/file-1",
+                EndpointSurface::RequestLocalResource,
+            ),
+            (
+                "codex",
+                Method::POST,
+                "/v1/files/responses",
+                EndpointSurface::RequestLocalResource,
+            ),
+            (
+                "codex",
+                Method::POST,
+                "/v1/models/messages",
+                EndpointSurface::ModelCatalog,
+            ),
+            (
+                "codex",
+                Method::POST,
+                "/v1/uploads/upload-1/complete",
+                EndpointSurface::RequestLocalResource,
+            ),
+            (
+                "codex",
+                Method::POST,
+                "/v1/batches/batch-1/cancel",
+                EndpointSurface::RequestLocalResource,
+            ),
+            (
+                "codex",
+                Method::GET,
+                "/v1/containers/container-1/files",
+                EndpointSurface::RequestLocalResource,
+            ),
+        ] {
+            assert_eq!(endpoint_surface(&method, path), expected_surface, "{path}");
+            let flavor = detect_request_flavor(service, &method, &headers, path);
             assert_eq!(
                 flavor.shared_route_state_impact,
                 SharedRouteStateImpact::RequestLocalOnly,
                 "{path}"
             );
-            assert!(!flavor.is_stream, "{path}");
+            assert!(flavor.is_stream, "{path}");
+            assert_eq!(
+                flavor.stream_terminal_policy,
+                StreamTerminalPolicy::EndOfBody,
+                "{path}"
+            );
             assert_eq!(flavor.route_state_session_id(Some("session-a")), None);
+            assert_eq!(flavor.transient_health_capability(), None, "{path}");
+            assert_eq!(
+                flavor.terminal_accounting,
+                RequestAccountingScope::NonEconomic,
+                "{path}"
+            );
         }
     }
 
     #[test]
-    fn models_like_requests_outside_codex_get_remain_route_facing() {
-        for (service, method, path) in [
-            ("codex", Method::POST, "/models"),
-            ("claude", Method::GET, "/models"),
-            ("codex", Method::GET, "/models/detail"),
+    fn endpoint_replay_policy_distinguishes_safe_reads_from_mutations() {
+        for (method, path) in [
+            (Method::GET, "/v1/models"),
+            (Method::HEAD, "/v1/files/file-1"),
+            (Method::GET, "/v1/future-resource"),
+        ] {
+            let flavor = detect_request_flavor("codex", &method, &HeaderMap::new(), path);
+            assert_eq!(
+                flavor.replay_policy,
+                RequestReplayPolicy::SafeRead,
+                "{path}"
+            );
+        }
+
+        for (method, path) in [
+            (Method::POST, "/v1/files"),
+            (Method::DELETE, "/v1/files/file-1"),
+            (Method::POST, "/v1/future-resource"),
+        ] {
+            let flavor = detect_request_flavor("codex", &method, &HeaderMap::new(), path);
+            assert_eq!(
+                flavor.replay_policy,
+                RequestReplayPolicy::NeverAfterDispatch,
+                "{path}"
+            );
+        }
+
+        let inference =
+            detect_request_flavor("codex", &Method::POST, &HeaderMap::new(), "/v1/responses");
+        assert_eq!(inference.replay_policy, RequestReplayPolicy::RouteFacing);
+    }
+
+    #[test]
+    fn conversation_endpoint_catalog_keeps_existing_capabilities() {
+        for (service, method, path, capability) in [
+            (
+                "codex",
+                Method::POST,
+                "/v1/responses",
+                RouteCapability::Inference,
+            ),
+            (
+                "codex",
+                Method::POST,
+                "/v1/chat/completions/",
+                RouteCapability::Inference,
+            ),
+            (
+                "claude",
+                Method::POST,
+                "/v1/messages",
+                RouteCapability::Inference,
+            ),
+            (
+                "codex",
+                Method::POST,
+                "/v1/responses/compact",
+                RouteCapability::RemoteCompaction,
+            ),
         ] {
             let flavor = detect_request_flavor(service, &method, &HeaderMap::new(), path);
             assert_eq!(
@@ -798,11 +1196,93 @@ mod tests {
                 SharedRouteStateImpact::RouteFacing,
                 "{service} {method} {path}"
             );
+            assert_eq!(flavor.route_capability, capability, "{path}");
+            assert_eq!(
+                flavor.stream_terminal_policy,
+                StreamTerminalPolicy::ProtocolEvent,
+                "{path}"
+            );
+            assert_eq!(flavor.transient_health_capability(), Some(capability));
+            assert_eq!(
+                flavor.terminal_accounting,
+                RequestAccountingScope::Economic,
+                "{path}"
+            );
             assert_eq!(
                 flavor.route_state_session_id(Some("session-a")),
                 Some("session-a")
             );
         }
+    }
+
+    #[test]
+    fn non_post_conversation_endpoints_are_request_local() {
+        for (method, path) in [
+            (Method::GET, "/v1/responses"),
+            (Method::DELETE, "/v1/chat/completions"),
+            (Method::GET, "/v1/messages"),
+            (Method::PUT, "/v1/responses/compact"),
+        ] {
+            assert_eq!(endpoint_surface(&method, path), EndpointSurface::Unknown);
+            let flavor = detect_request_flavor("codex", &method, &HeaderMap::new(), path);
+            assert_eq!(
+                flavor.shared_route_state_impact,
+                SharedRouteStateImpact::RequestLocalOnly,
+                "{method} {path}"
+            );
+            assert_eq!(flavor.route_state_session_id(Some("session-a")), None);
+            assert_eq!(
+                flavor.transient_health_capability(),
+                None,
+                "{method} {path}"
+            );
+            assert!(!flavor.is_remote_compaction_request(), "{method} {path}");
+            assert_eq!(
+                flavor.terminal_accounting,
+                RequestAccountingScope::NonEconomic,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_endpoint_is_request_local_instead_of_inference_scoped() {
+        for path in ["/", "/v1/future-resource", "/vendor/custom/action/"] {
+            assert_eq!(
+                endpoint_surface(&Method::POST, path),
+                EndpointSurface::Unknown,
+                "{path}"
+            );
+            let flavor = detect_request_flavor("codex", &Method::POST, &HeaderMap::new(), path);
+            assert_eq!(
+                flavor.shared_route_state_impact,
+                SharedRouteStateImpact::RequestLocalOnly,
+                "{path}"
+            );
+            assert_eq!(flavor.route_state_session_id(Some("session-a")), None);
+            assert_eq!(flavor.transient_health_capability(), None, "{path}");
+            assert_eq!(
+                flavor.terminal_accounting,
+                RequestAccountingScope::NonEconomic,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_image_bridge_keeps_its_dedicated_capability() {
+        let flavor =
+            detect_request_flavor("codex", &Method::POST, &HeaderMap::new(), "/v1/responses")
+                .with_hosted_image_generation(true);
+
+        assert_eq!(
+            flavor.shared_route_state_impact,
+            SharedRouteStateImpact::RouteFacing
+        );
+        assert_eq!(
+            flavor.transient_health_capability(),
+            Some(RouteCapability::HostedImageGeneration)
+        );
     }
 
     #[test]
@@ -814,6 +1294,10 @@ mod tests {
 
         assert!(!flavor.is_user_turn);
         assert!(flavor.is_remote_compaction_v1_request);
+        assert_eq!(
+            flavor.transient_health_capability(),
+            Some(RouteCapability::RemoteCompaction)
+        );
         let bridge = flavor.codex_bridge_log.expect("bridge log");
         assert_eq!(bridge.patch_mode, "request-dialect");
         assert!(bridge.remote_compaction_v1_request);
@@ -864,6 +1348,10 @@ mod tests {
         assert!(flavor.is_remote_compaction_v2_request);
         assert!(flavor.is_remote_compaction_request());
         assert!(flavor.remote_compaction_requires_affinity);
+        assert_eq!(
+            flavor.transient_health_capability(),
+            Some(RouteCapability::RemoteCompaction)
+        );
         let bridge = flavor.codex_bridge_log.expect("bridge log");
         assert_eq!(bridge.patch_mode, "request-dialect");
         assert!(!bridge.remote_compaction_v1_request);
@@ -1160,6 +1648,7 @@ mod tests {
         HelperConfig {
             codex: ServiceRouteConfig {
                 client_patch: None,
+                compaction: None,
                 default_profile: Some("default".to_string()),
                 profiles: std::collections::BTreeMap::from([(
                     "default".to_string(),

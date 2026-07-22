@@ -7,13 +7,17 @@ use crate::local_operator::{
     local_operator_request_signature, new_local_operator_nonce, unix_time_ms,
     verify_local_operator_server_proof,
 };
-use crate::proxy::tests::harness::{TestProxyServer, proxy_service};
+use crate::proxy::tests::harness::{
+    TestProxyServer, post_responses_json, proxy_service, spawn_proxy_service, spawn_test_upstream,
+};
 use crate::proxy::{
     LOCAL_OPERATOR_NONCE_HEADER, LOCAL_OPERATOR_SESSION_HEADER, LOCAL_OPERATOR_SIGNATURE_HEADER,
     LOCAL_OPERATOR_TIMESTAMP_HEADER, LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH,
     LOCAL_V1_OPERATOR_SESSION, OperatorEndpointMode, OperatorRoutingCommand,
     OperatorRoutingMutationRequest, OperatorRoutingMutationStatus, OperatorSessionAffinityCommand,
     OperatorSessionAffinityMutationRequest, OperatorSessionAffinityMutationStatus,
+    OperatorSessionBindingCommand, OperatorSessionBindingMutationRequest,
+    OperatorSessionBindingMutationStatus,
 };
 use crate::service_target::{
     LocalCredentialRefreshAction, LocalCredentialRefreshRequest, LocalCredentialRefreshStatus,
@@ -82,6 +86,38 @@ fn native_credential_proxy(
     .expect("build native credential proxy")
     .with_service_install_generation(generation);
     (proxy, control)
+}
+
+fn proxy_with_usage_provider_catalog(
+    config: HelperConfig,
+    usage_provider_catalog: crate::usage_providers::UsageProviderCredentialCatalog,
+) -> ProxyService {
+    let runtime_store = Arc::new(
+        crate::runtime_store::RuntimeStore::open_in_memory()
+            .expect("open isolated usage provider runtime store"),
+    );
+    let (runtime_config, state) =
+        crate::proxy::RuntimeConfig::new_with_usage_provider_catalog_for_test(
+            Arc::new(config),
+            runtime_store,
+            CredentialSourceCapabilities::server(),
+            usage_provider_catalog,
+        )
+        .expect("build proxy with captured usage provider catalog");
+    ProxyService {
+        client: crate::proxy::upstream_http_client_builder()
+            .build()
+            .expect("build test proxy client"),
+        config: Arc::new(runtime_config),
+        service_name: "codex",
+        concurrency_limiter: Arc::new(
+            crate::proxy::concurrency_limits::ConcurrencyLimiter::default(),
+        ),
+        filter: crate::filter::RequestFilter::new(),
+        state,
+        service_install_generation: None,
+        service_runtime_identity: None,
+    }
 }
 
 fn routing_proxy_config() -> HelperConfig {
@@ -346,6 +382,24 @@ async fn local_operator_http_protocol_enforces_proof_replay_and_admin_layers() {
     let token =
         crate::local_operator::ensure_local_operator_token().expect("create operator token");
     let proxy = proxy_service(empty_proxy_config());
+    let raw_session_id = "local-session-metadata-handle";
+    let _request_id = proxy
+        .state
+        .begin_request(
+            "codex",
+            "POST",
+            "/v1/responses",
+            Some(raw_session_id.to_string()),
+            None,
+            Some("codex-cli".to_string()),
+            Some("127.0.0.1:43123".to_string()),
+            Some("/workspace/project".to_string()),
+            Some("gpt-test".to_string()),
+            None,
+            None,
+            10,
+        )
+        .await;
     let server = spawn_admin_listener(proxy.clone());
 
     let endpoint = ControlPlaneEndpoint::new(format!("http://{}", server.addr), None::<String>)
@@ -356,6 +410,27 @@ async fn local_operator_http_protocol_enforces_proof_replay_and_admin_layers() {
         .await
         .expect("signed balance refresh");
     assert_eq!(response.service_name, "codex");
+    let session_key = crate::dashboard_core::operator_summary::operator_session_key(raw_session_id);
+    let local_sessions = operator
+        .read_operator_session_metadata(vec![
+            session_key.clone(),
+            "session:sha256:missing".to_string(),
+        ])
+        .await
+        .expect("signed local session metadata read");
+    assert_eq!(local_sessions.service_name, "codex");
+    assert_eq!(local_sessions.sessions.len(), 1);
+    let local_session = local_sessions
+        .sessions
+        .get(&session_key)
+        .expect("requested local session metadata");
+    assert_eq!(local_session.raw_session_id, raw_session_id);
+    assert_eq!(local_session.cwd.as_deref(), Some("/workspace/project"));
+    assert_eq!(local_session.last_client_name.as_deref(), Some("codex-cli"));
+    assert_eq!(
+        local_session.last_client_addr.as_deref(),
+        Some("127.0.0.1:43123")
+    );
 
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -444,6 +519,197 @@ async fn local_operator_http_protocol_enforces_proof_replay_and_admin_layers() {
         .await
         .expect("two-layer authenticated refresh");
     assert_eq!(response.service_name, "codex");
+
+    drop(server);
+    drop(scoped);
+    std::fs::remove_dir_all(home).expect("remove helper home");
+}
+
+#[tokio::test]
+async fn signed_balance_refresh_isolates_rejected_catalog_entries_and_publishes_balance() {
+    let _env_guard = env_lock().await;
+    let home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", &home);
+        scoped.set(ADMIN_TOKEN_ENV_VAR, "");
+    }
+    let token =
+        crate::local_operator::ensure_local_operator_token().expect("create operator token");
+
+    let usage_hits = Arc::new(AtomicUsize::new(0));
+    let handler_hits = Arc::clone(&usage_hits);
+    let usage_app = axum::Router::new().route(
+        "/usage",
+        get(move || {
+            let handler_hits = Arc::clone(&handler_hits);
+            async move {
+                handler_hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "balance": "7.25" }))
+            }
+        }),
+    );
+    let usage_server = spawn_test_upstream(usage_app);
+
+    let usage_provider_catalog =
+        crate::usage_providers::usage_provider_credential_catalog_from_value_for_test(
+            serde_json::json!({
+                "providers": [
+                    {
+                        "id": "loopback-usage",
+                        "kind": "openai_balance_http_json",
+                        "domains": ["127.0.0.1"],
+                        "endpoint": "/usage"
+                    },
+                    {
+                        "id": "rejected-template",
+                        "kind": "openai_balance_http_json",
+                        "domains": ["invalid.example"],
+                        "endpoint": "https://invalid.example/usage?token={{token}}"
+                    }
+                ]
+            }),
+        )
+        .expect("build partially valid usage provider catalog");
+    let config = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([(
+                "loopback".to_string(),
+                ProviderConfig {
+                    base_url: Some(usage_server.base_url()),
+                    inline_auth: UpstreamAuth {
+                        auth_token: Some("loopback-usage-token".to_string().into()),
+                        ..UpstreamAuth::default()
+                    },
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "loopback".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let proxy = proxy_with_usage_provider_catalog(config, usage_provider_catalog);
+    let server = spawn_admin_listener(proxy);
+    let endpoint = ControlPlaneEndpoint::new(format!("http://{}", server.addr), None::<String>)
+        .expect("loopback endpoint");
+    let operator = LocalOperatorClient::new(endpoint, &token).expect("local operator client");
+
+    let response = operator
+        .refresh_provider_balances(true)
+        .await
+        .expect("signed provider balance refresh");
+
+    assert_eq!(response.service_name, "codex");
+    assert_eq!(response.refresh.providers_configured, 1);
+    assert_eq!(response.refresh.providers_rejected, 1);
+    assert_eq!(response.refresh.providers_matched, 1);
+    assert_eq!(response.refresh.upstreams_matched, 1);
+    assert_eq!(response.refresh.attempted, 1);
+    assert_eq!(response.refresh.refreshed, 1);
+    assert_eq!(response.refresh.failed, 0);
+    assert_eq!(response.refresh.missing_token, 0);
+    assert_eq!(response.refresh.auto_attempted, 0);
+    assert_eq!(usage_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(response.refresh.rejected_providers.len(), 1);
+    assert_eq!(
+        response.refresh.rejected_providers[0].provider_id,
+        "rejected-template"
+    );
+    assert_eq!(
+        response.refresh.rejected_providers[0].code,
+        "invalid_config"
+    );
+    assert_eq!(
+        response
+            .provider_balances
+            .first()
+            .expect("refreshed provider balance")
+            .total_balance_usd
+            .as_deref(),
+        Some("7.25")
+    );
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build local client");
+    let operator_model = read_operator_model(&client, &server).await;
+    let published = operator_model
+        .data
+        .as_ref()
+        .expect("ready operator data")
+        .provider_balances
+        .iter()
+        .find(|balance| {
+            balance.observation_provider_id == "loopback-usage"
+                && balance.provider_id == "loopback"
+                && balance.endpoint_id == "default"
+        })
+        .expect("published loopback provider balance");
+    assert_eq!(published.total_balance_usd.as_deref(), Some("7.25"));
+
+    drop(server);
+    drop(usage_server);
+    drop(scoped);
+    std::fs::remove_dir_all(home).expect("remove helper home");
+}
+
+#[tokio::test]
+async fn local_operator_client_batches_session_metadata_above_the_wire_limit() {
+    let _env_guard = env_lock().await;
+    let home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", &home);
+        scoped.set(ADMIN_TOKEN_ENV_VAR, "");
+    }
+    let token =
+        crate::local_operator::ensure_local_operator_token().expect("create operator token");
+    let proxy = proxy_service(empty_proxy_config());
+    let request_count = crate::dashboard_core::LOCAL_OPERATOR_SESSION_METADATA_BATCH_MAX + 1;
+    let mut session_keys = Vec::with_capacity(request_count);
+    for index in 0..request_count {
+        let raw_session_id = format!("batched-local-session-{index}");
+        proxy
+            .state
+            .begin_request(
+                "codex",
+                "POST",
+                "/v1/responses",
+                Some(raw_session_id.clone()),
+                None,
+                Some("codex-cli".to_string()),
+                Some("127.0.0.1:43123".to_string()),
+                Some(format!("/workspace/project-{index}")),
+                Some("gpt-test".to_string()),
+                None,
+                None,
+                u64::try_from(index).expect("session index"),
+            )
+            .await;
+        session_keys
+            .push(crate::dashboard_core::operator_summary::operator_session_key(&raw_session_id));
+    }
+    let server = spawn_admin_listener(proxy);
+    let endpoint = ControlPlaneEndpoint::new(format!("http://{}", server.addr), None::<String>)
+        .expect("loopback endpoint");
+    let operator = LocalOperatorClient::new(endpoint, &token).expect("local operator client");
+
+    let response = operator
+        .read_operator_session_metadata(session_keys.clone())
+        .await
+        .expect("read all session metadata in bounded batches");
+
+    assert_eq!(response.service_name, "codex");
+    assert_eq!(response.sessions.len(), request_count);
+    assert!(
+        session_keys
+            .iter()
+            .all(|session_key| response.sessions.contains_key(session_key))
+    );
 
     drop(server);
     drop(scoped);
@@ -1083,6 +1349,156 @@ async fn signed_local_operator_session_affinity_mutations_enforce_cas_and_update
     assert!(refreshed_session.route_affinity.is_none());
 
     drop(server);
+    drop(scoped);
+    std::fs::remove_dir_all(home).expect("remove helper home");
+}
+
+#[tokio::test]
+async fn signed_session_binding_mutation_is_cas_guarded_and_applies_to_the_next_request() {
+    let _env_guard = env_lock().await;
+    let home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", &home);
+        scoped.set(ADMIN_TOKEN_ENV_VAR, "");
+    }
+    let token =
+        crate::local_operator::ensure_local_operator_token().expect("create local operator token");
+    let (upstream_body_tx, mut upstream_body_rx) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = spawn_test_upstream(axum::Router::new().route(
+        "/v1/responses",
+        post(move |Json(body): Json<serde_json::Value>| {
+            let upstream_body_tx = upstream_body_tx.clone();
+            async move {
+                upstream_body_tx.send(body).expect("capture upstream body");
+                Json(serde_json::json!({"id":"resp_test","status":"completed"}))
+            }
+        }),
+    ));
+    let mut config = HelperConfig {
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([(
+                "input".to_string(),
+                ProviderConfig {
+                    base_url: Some(upstream.base_url()),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "input".to_string(),
+            ])),
+            profiles: std::collections::BTreeMap::from([(
+                "daily".to_string(),
+                ServiceControlProfile {
+                    model: Some("gpt-5.4".to_string()),
+                    reasoning_effort: Some("high".to_string()),
+                    service_tier: Some("fast".to_string()),
+                    ..ServiceControlProfile::default()
+                },
+            )]),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    config.codex.default_profile = None;
+    let proxy = proxy_service(config);
+    let public_server = spawn_proxy_service(proxy.clone());
+    let admin_server = spawn_admin_listener(proxy);
+    let endpoint =
+        ControlPlaneEndpoint::new(format!("http://{}", admin_server.addr), None::<String>)
+            .expect("loopback endpoint");
+    let operator = LocalOperatorClient::new(endpoint, &token).expect("local operator client");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build local client");
+    let raw_session_id = "session-binding-next-request-secret";
+
+    let initial = post_responses_json(
+        &client,
+        &public_server,
+        serde_json::json!({
+            "model": "gpt-5",
+            "prompt_cache_key": raw_session_id,
+            "stream": false
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial_body = upstream_body_rx
+        .recv()
+        .await
+        .expect("initial upstream body");
+    assert_eq!(initial_body["model"].as_str(), Some("gpt-5"));
+
+    let initial_model = read_operator_model(&client, &admin_server).await;
+    let session = initial_model
+        .data
+        .as_ref()
+        .expect("operator data")
+        .summary
+        .sessions
+        .iter()
+        .find(|session| session.last_model.as_deref() == Some("gpt-5"))
+        .expect("observed session")
+        .clone();
+    assert!(!session.binding.revision.is_empty());
+    assert!(
+        !serde_json::to_string(&initial_model)
+            .expect("serialize read model")
+            .contains(raw_session_id)
+    );
+
+    let applied = operator
+        .mutate_operator_session_binding(&OperatorSessionBindingMutationRequest {
+            session_key: session.session_key.clone(),
+            expected_binding_revision: session.binding.revision.clone(),
+            command: OperatorSessionBindingCommand::SetProfile {
+                profile_name: Some("daily".to_string()),
+            },
+        })
+        .await
+        .expect("apply session profile");
+    assert_eq!(
+        applied.status,
+        OperatorSessionBindingMutationStatus::Applied
+    );
+    assert_eq!(applied.binding.profile_name.as_deref(), Some("daily"));
+    assert_eq!(applied.binding.service_tier.as_deref(), Some("priority"));
+
+    let stale = operator
+        .mutate_operator_session_binding(&OperatorSessionBindingMutationRequest {
+            session_key: session.session_key.clone(),
+            expected_binding_revision: session.binding.revision.clone(),
+            command: OperatorSessionBindingCommand::ResetManualOverrides,
+        })
+        .await
+        .expect("stale binding mutation response");
+    assert_eq!(stale.status, OperatorSessionBindingMutationStatus::Conflict);
+
+    let next = post_responses_json(
+        &client,
+        &public_server,
+        serde_json::json!({
+            "model": "gpt-5",
+            "prompt_cache_key": raw_session_id,
+            "reasoning": {"effort":"low"},
+            "service_tier": "default",
+            "stream": false
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(next.status(), StatusCode::OK);
+    let next_body = upstream_body_rx.recv().await.expect("next upstream body");
+    assert_eq!(next_body["model"].as_str(), Some("gpt-5.4"));
+    assert_eq!(next_body["reasoning"]["effort"].as_str(), Some("high"));
+    assert_eq!(next_body["service_tier"].as_str(), Some("priority"));
+
+    drop(admin_server);
+    drop(public_server);
+    drop(upstream);
     drop(scoped);
     std::fs::remove_dir_all(home).expect("remove helper home");
 }

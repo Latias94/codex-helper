@@ -9,6 +9,25 @@ use crate::provider_catalog::ProviderAdapter;
 
 const CLIENT_CREDENTIAL_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexAuthModeMetadata {
+    ApiKey,
+    ChatGpt,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CodexAuthMetadata {
+    pub(crate) mode: Option<CodexAuthModeMetadata>,
+    pub(crate) non_empty_api_key_fields: Vec<String>,
+}
+
+impl CodexAuthMetadata {
+    pub(crate) fn unique_api_key_field(&self) -> Option<&str> {
+        (self.non_empty_api_key_fields.len() == 1)
+            .then(|| self.non_empty_api_key_fields[0].as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CredentialSource {
     Inline,
@@ -130,6 +149,62 @@ fn read_json_file(path: &Path) -> Option<SensitiveJsonValue> {
         .map(SensitiveJsonValue)
 }
 
+fn codex_auth_metadata_from_value(value: &serde_json::Value) -> CodexAuthMetadata {
+    let Some(object) = value.as_object() else {
+        return CodexAuthMetadata::default();
+    };
+    let mode = object
+        .get("auth_mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|mode| {
+            let normalized = mode
+                .bytes()
+                .filter(|byte| byte.is_ascii_alphanumeric())
+                .map(|byte| byte.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            match normalized.as_slice() {
+                b"apikey" => Some(CodexAuthModeMetadata::ApiKey),
+                b"chatgpt"
+                | b"chatgptauthtokens"
+                | b"headers"
+                | b"agentidentity"
+                | b"personalaccesstoken" => Some(CodexAuthModeMetadata::ChatGpt),
+                _ => None,
+            }
+        });
+    let mut non_empty_api_key_fields = object
+        .iter()
+        .filter(|(field, value)| {
+            field.ends_with("_API_KEY")
+                && value.as_str().is_some_and(|value| !value.trim().is_empty())
+        })
+        .map(|(field, _)| field.clone())
+        .collect::<Vec<_>>();
+    non_empty_api_key_fields.sort_unstable();
+    non_empty_api_key_fields.dedup();
+    CodexAuthMetadata {
+        mode,
+        non_empty_api_key_fields,
+    }
+}
+
+pub(crate) fn codex_auth_metadata_from_json(text: Option<&str>) -> CodexAuthMetadata {
+    let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
+        return CodexAuthMetadata::default();
+    };
+    let Some(value) = serde_json::from_str(text).ok().map(SensitiveJsonValue) else {
+        return CodexAuthMetadata::default();
+    };
+    codex_auth_metadata_from_value(&value.0)
+}
+
+pub(crate) fn read_codex_auth_metadata() -> CodexAuthMetadata {
+    let path = crate::config::codex_home().join("auth.json");
+    read_json_file(path.as_path())
+        .map(|value| codex_auth_metadata_from_value(&value.0))
+        .unwrap_or_default()
+}
+
 fn codex_auth_json_value(key: &str) -> Option<String> {
     let path = crate::config::codex_home().join("auth.json");
     let value = read_json_file(&path)?;
@@ -244,7 +319,24 @@ pub(crate) fn trusted_codex_passthrough_origin(target_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(target_url) else {
         return false;
     };
-    url.scheme() == "https" && ProviderAdapter::for_endpoint(&url) == ProviderAdapter::OpenAiCodex
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("api.openai.com") {
+        return ProviderAdapter::for_endpoint(&url) == ProviderAdapter::OpenAiCodex;
+    }
+    if !host.eq_ignore_ascii_case("chatgpt.com") {
+        return false;
+    }
+    let path = url.path().trim_end_matches('/');
+    path == "/backend-api/codex" || path.starts_with("/backend-api/codex/")
 }
 
 fn target_is_loopback(target_url: &str) -> bool {
@@ -324,6 +416,40 @@ mod tests {
         )
         .expect("write oversized auth file");
         assert!(read_json_file(&path).is_none());
+    }
+
+    #[test]
+    fn codex_auth_metadata_retains_only_mode_and_non_empty_api_key_field_names() {
+        const SECRET_CANARY: &str = "sk-onboarding-secret-canary";
+        let json = format!(
+            r#"{{"auth_mode":"apikey","RELAY_API_KEY":"{SECRET_CANARY}","EMPTY_API_KEY":"","tokens":{{"access_token":"nested-secret"}}}}"#
+        );
+        let metadata = codex_auth_metadata_from_json(Some(json.as_str()));
+
+        assert_eq!(metadata.mode, Some(CodexAuthModeMetadata::ApiKey));
+        assert_eq!(
+            metadata.non_empty_api_key_fields,
+            vec!["RELAY_API_KEY".to_string()]
+        );
+        let rendered = format!("{metadata:?}");
+        assert!(!rendered.contains(SECRET_CANARY));
+        assert!(!rendered.contains("nested-secret"));
+    }
+
+    #[test]
+    fn codex_auth_metadata_classifies_chatgpt_backed_modes_without_retaining_values() {
+        for mode in [
+            "chatgpt",
+            "chatgptAuthTokens",
+            "headers",
+            "agentIdentity",
+            "personalAccessToken",
+        ] {
+            let json = format!(r#"{{"auth_mode":"{mode}","tokens":{{"access_token":"secret"}}}}"#);
+            let metadata = codex_auth_metadata_from_json(Some(json.as_str()));
+            assert_eq!(metadata.mode, Some(CodexAuthModeMetadata::ChatGpt));
+            assert!(metadata.non_empty_api_key_fields.is_empty());
+        }
     }
 
     #[test]
@@ -429,6 +555,31 @@ mod tests {
             ),
             CredentialReadinessCode::Missing
         );
+    }
+
+    #[test]
+    fn official_chatgpt_codex_origin_allows_client_auth_passthrough() {
+        for target in [
+            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex/responses",
+            "https://chatgpt.com:443/backend-api/codex/responses/compact?trace=1",
+        ] {
+            assert!(trusted_codex_passthrough_origin(target), "{target}");
+        }
+    }
+
+    #[test]
+    fn official_passthrough_rejects_chatgpt_lookalikes_and_unsafe_url_shapes() {
+        for target in [
+            "http://chatgpt.com/backend-api/codex/responses",
+            "https://chatgpt.com.evil.example/backend-api/codex/responses",
+            "https://user@chatgpt.com/backend-api/codex/responses",
+            "https://chatgpt.com:8443/backend-api/codex/responses",
+            "https://chatgpt.com/backend-api/codex-evil/responses",
+            "https://chatgpt.com/backend-api/other",
+        ] {
+            assert!(!trusted_codex_passthrough_origin(target), "{target}");
+        }
     }
 
     #[test]

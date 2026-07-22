@@ -611,6 +611,8 @@ mod tests {
                     aggregation_eligible: true,
                 }),
                 price_coverage: AccountingPriceCoverage::Captured,
+                cache_accounting_convention:
+                    crate::usage::CacheAccountingConvention::INCLUDED_IN_INPUT,
             },
             retry: None,
             provider_signals: Vec::new(),

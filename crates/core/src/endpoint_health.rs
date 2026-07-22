@@ -1,6 +1,41 @@
 pub const FAILURE_THRESHOLD: u32 = 3;
 pub const COOLDOWN_SECS: u64 = 30;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RouteCapability {
+    Inference,
+    RemoteCompaction,
+    HostedImageGeneration,
+    ResponsesWebSocket,
+    ModelCatalog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RuntimeHealthDomain {
+    EndpointTransport,
+    Credential,
+    Capability(RouteCapability),
+    Capacity(RouteCapability),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RuntimeHealthHalfOpenTerminal {
+    Success {
+        now_ms: u64,
+    },
+    CountedFailure {
+        domain: RuntimeHealthDomain,
+        failure_threshold_cooldown_secs: u64,
+        cooldown_backoff: CooldownBackoff,
+    },
+    Penalty {
+        domain: RuntimeHealthDomain,
+        cooldown_secs: u64,
+        cooldown_backoff: CooldownBackoff,
+    },
+    Neutral,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CooldownBackoff {
     pub factor: u64,

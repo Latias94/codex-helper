@@ -80,19 +80,19 @@ define_messages! {
     OVERLAY_SESSION_TRANSCRIPT => { zh: "会话对话记录", en: "Session transcript" },
     OVERLAY_STARTUP_GUARDRAIL => { zh: "启动检查", en: "Startup guardrail" },
 
-    FOOTER_DASHBOARD => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  o/h navigate  ? help" },
+    FOOTER_DASHBOARD => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 移动  O/H 或 o/h 关联页  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ move  O/H or o/h related pages  ? help" },
     FOOTER_ROUTING => { zh: "1-9/0 页面  q 退出  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助", en: "1-9/0 pages  q quit  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  g refresh  i details  ? help" },
-    FOOTER_REQUESTS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  e 错误  s scope  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  e errors  s scope  o/h navigate  ? help" },
-    FOOTER_SESSIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  a/e/v 筛选  t 记录  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  a/e/v filters  t transcript  ? help" },
+    FOOTER_REQUESTS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  e/c/s 筛选  x 清焦点  o/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  e/c/s filters  x clear focus  o/h navigate  ? help" },
+    FOOTER_SESSIONS => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  a/e 筛选  r 重置  t 记录  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  a/e filters  r reset  t transcript  ? help" },
     FOOTER_STATS => { zh: "1-9/0 页面  q 退出  L 语言  Tab 池/项目/提供商/端点  ↑/↓ 选择  g 刷新  y 报告  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab pool/project/provider/endpoint  ↑/↓ select  g refresh  y report  ? help" },
     FOOTER_SETTINGS_CODEX => { zh: "1-9/0 页面  q 退出  L 语言  n/o 本地 Codex switch  ? 帮助", en: "1-9/0 pages  q quit  L language  n/o local Codex switch  ? help" },
     FOOTER_SETTINGS_OTHER => { zh: "1-9/0 页面  q 退出  L 语言  ? 帮助", en: "1-9/0 pages  q quit  L language  ? help" },
-    FOOTER_HISTORY => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  r 刷新  t/Enter 记录  s/f 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  r refresh  t/Enter transcript  s/f navigate  ? help" },
-    FOOTER_RECENT => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  [] 时间  Enter/y 复制  t 记录  s/f/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  [] window  Enter/y copy  t transcript  s/f/h navigate  ? help" },
-    FOOTER_FLEET => { zh: "1-9/0 页面  q 退出  L 语言  Tab 视图  ↑/↓ 选择  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab view  ↑/↓ select  ? help" },
-    FOOTER_SERVICE_STATUS => { zh: "1-9/0 页面  q 退出  L 语言  r 刷新状态  ? 帮助", en: "1-9/0 pages  q quit  L language  r refresh status  ? help" },
-    FOOTER_HELP => { zh: "Esc 关闭帮助  L 语言", en: "Esc close help  L language" },
-    FOOTER_PROVIDER_INFO => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  Esc close  L language" },
+    FOOTER_HISTORY => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  Pg 详情  r 刷新  t/Enter 记录  s/f 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  Pg details  r refresh  t/Enter transcript  s/f navigate  ? help" },
+    FOOTER_RECENT => { zh: "1-9/0 页面  q 退出  L 语言  ↑/↓ 选择  Pg 详情  [] 时间  Enter/y 复制  t 记录  s/f/h 跳转  ? 帮助", en: "1-9/0 pages  q quit  L language  ↑/↓ select  Pg details  [] window  Enter/y copy  t transcript  s/f/h navigate  ? help" },
+    FOOTER_FLEET => { zh: "1-9/0 页面  q 退出  L 语言  Tab 焦点  ↑/↓ 选择  r 刷新  t Tree/Flat  ? 帮助", en: "1-9/0 pages  q quit  L language  Tab focus  ↑/↓ select  r refresh  t Tree/Flat  ? help" },
+    FOOTER_SERVICE_STATUS => { zh: "1-9/0 页面  q 退出  ↑/↓/Pg 探针  Tab 详情  r 刷新  ? 帮助", en: "1-9/0 pages  q quit  ↑/↓/Pg probes  Tab details  r refresh  ? help" },
+    FOOTER_HELP => { zh: "↑/↓/Pg 滚动  g/G 顶/底  Esc 关闭帮助  L 语言", en: "↑/↓/Pg scroll  g/G top/bottom  Esc close help  L language" },
+    FOOTER_PROVIDER_INFO => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  Home/End 或 g/G 顶/底  Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  Home/End or g/G top/bottom  Esc close  L language" },
     FOOTER_SESSION_TRANSCRIPT => { zh: "↑/↓ 滚动  PgUp/PgDn 翻页  g/G 顶/底  A 全量/尾部  y 复制  t/Esc 关闭  L 语言", en: "↑/↓ scroll  PgUp/PgDn page  g/G top/bottom  A all/tail  y copy  t/Esc close  L language" },
     FOOTER_STARTUP_GUARDRAIL => { zh: "Esc/Enter 关闭启动检查  L 语言", en: "Esc/Enter close startup guardrail  L language" },
 
@@ -100,16 +100,16 @@ define_messages! {
     NO_TRANSCRIPT_MESSAGES => { zh: "未找到可展示的对话消息（可能该会话不在 ~/.codex/sessions，或格式发生变化）。", en: "No displayable transcript messages were found; the session may be outside ~/.codex/sessions or the format changed." },
 
     HISTORY_TITLE => { zh: "历史会话 (Codex 全局)", en: "History sessions (Codex global)" },
+    HISTORY_TITLE_OBSERVER_LOCAL => { zh: "历史会话 (观察端本机 Codex)", en: "History sessions (observer-local Codex)" },
     RECENT_TITLE => { zh: "最近会话 (Codex 全局)", en: "Recent sessions (Codex global)" },
+    RECENT_TITLE_OBSERVER_LOCAL => { zh: "最近会话 (观察端本机 Codex)", en: "Recent sessions (observer-local Codex)" },
     DETAILS_TITLE => { zh: "详情", en: "Details" },
     FIRST_USER_MESSAGE => { zh: "首条用户消息", en: "First user message" },
     BULLET_DASH => { zh: "  -", en: "  -" },
     HISTORY_EMPTY => { zh: "未找到历史会话。按 r 刷新；或确认 ~/.codex/sessions 存在。", en: "No history sessions found. Press r to refresh, or check that ~/.codex/sessions exists." },
-    HISTORY_KEYS => { zh: "  ↑/↓ 选择  r 刷新  t/Enter 打开对话记录  s 打开到 Sessions  f 打开到 Requests", en: "  ↑/↓ select  r refresh  t/Enter transcript  s open Sessions  f open Requests" },
     HISTORY_EXTERNAL_NO_TRANSCRIPT => { zh: "  当前条目来自外部桥接，没有本地 transcript 文件。", en: "  This entry came from an external bridge and has no local transcript file." },
     RECENT_EMPTY => { zh: "未加载最近会话。按 r 刷新；或确认 ~/.codex/sessions 存在。", en: "Recent sessions are not loaded. Press r to refresh, or check that ~/.codex/sessions exists." },
     RECENT_KEYS_PRIMARY => { zh: "  Enter 复制条目  y 复制可见列表  t 打开 transcript", en: "  Enter copy entry  y copy visible list  t open transcript" },
-    RECENT_KEYS_NAV => { zh: "  s 打开到 Sessions  f 打开到 Requests  h 打开到 History", en: "  s open Sessions  f open Requests  h open History" },
     NO_SELECTION => { zh: "未选中任何条目。", en: "No selection." },
 
     TUI_OPTIONS_TITLE => { zh: "TUI 选项", en: "TUI options" },
@@ -469,6 +469,7 @@ fn zh_label(en: &'static str) -> Option<&'static str> {
         "source" => "来源",
         "stale" => "过期",
         "provider mapping" => "提供商映射",
+        "request id" => "请求 ID",
         "status" => "状态",
         "strategy" => "策略",
         "stream" => "流式",
@@ -538,6 +539,34 @@ pub(crate) fn next_language(lang: Language) -> Language {
     match lang {
         Language::Zh => Language::En,
         Language::En => Language::Zh,
+    }
+}
+
+pub(crate) fn storage_code(lang: Language) -> &'static str {
+    match lang {
+        Language::Zh => "zh-CN",
+        Language::En => "en-US",
+    }
+}
+
+pub(crate) fn format_language_saved(current_lang: Language, selected_lang: Language) -> String {
+    match current_lang {
+        Language::Zh => format!("语言：{}（已保存）", language_name(selected_lang)),
+        Language::En => format!("language: {} (saved)", language_name(selected_lang)),
+    }
+}
+
+pub(crate) fn format_language_save_failed(
+    current_lang: Language,
+    selected_lang: Language,
+    err: &dyn std::fmt::Display,
+) -> String {
+    match current_lang {
+        Language::Zh => format!("语言：{}（保存失败：{err}）", language_name(selected_lang)),
+        Language::En => format!(
+            "language: {} (save failed: {err})",
+            language_name(selected_lang)
+        ),
     }
 }
 

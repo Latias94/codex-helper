@@ -1,22 +1,46 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, Wrap,
+};
 
 use crate::sessions::SessionSummarySource;
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{Palette, basename, short_sid, shorten, shorten_middle};
 use crate::tui::state::{CodexHistoryExternalFocusOrigin, UiState};
+use crate::tui::view::widgets::max_wrapped_vertical_scroll;
+
+const SIDE_BY_SIDE_MIN_WIDTH: u16 = 136;
 
 pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
     let lang = ui.language;
     let l = |text| i18n::label(lang, text);
+    let (direction, constraints) = if area.width >= SIDE_BY_SIDE_MIN_WIDTH {
+        (
+            Direction::Horizontal,
+            [Constraint::Percentage(65), Constraint::Percentage(35)],
+        )
+    } else {
+        (
+            Direction::Vertical,
+            [Constraint::Percentage(55), Constraint::Percentage(45)],
+        )
+    };
     let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .direction(direction)
+        .constraints(constraints)
         .split(area);
 
-    let title = i18n::text(lang, msg::HISTORY_TITLE);
+    let title = i18n::text(
+        lang,
+        if ui.runtime_connection.is_remote_observer() {
+            msg::HISTORY_TITLE_OBSERVER_LOCAL
+        } else {
+            msg::HISTORY_TITLE
+        },
+    );
     let left_block = Block::default()
         .title(Span::styled(
             title,
@@ -26,28 +50,32 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new([
-        l("Updated"),
-        l("Session"),
-        l("CWD"),
-        l("Rounds"),
-        l("First user message"),
-    ])
+    let compact_table = columns[0].width < 86;
+    let header = Row::new(if compact_table {
+        vec![l("Updated"), l("Session"), l("CWD"), l("Rounds")]
+    } else {
+        vec![
+            l("Updated"),
+            l("Session"),
+            l("CWD"),
+            l("Rounds"),
+            l("First user message"),
+        ]
+    })
     .style(Style::default().fg(p.muted))
     .height(1);
 
     let rows = ui
         .codex_history_sessions
         .iter()
-        .take(300)
         .map(|s| {
             let updated = s
                 .updated_at
                 .as_deref()
                 .or(s.created_at.as_deref())
-                .map(|t| shorten_middle(t, 20))
+                .map(|t| shorten_middle(t, if compact_table { 10 } else { 20 }))
                 .unwrap_or_else(|| "-".to_string());
-            let sid = short_sid(s.id.as_str(), 18);
+            let sid = short_sid(s.id.as_str(), if compact_table { 14 } else { 18 });
             let cwd = s
                 .cwd
                 .as_deref()
@@ -60,37 +88,47 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
                 .map(history_message_preview)
                 .unwrap_or_else(|| "-".to_string());
 
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(Span::styled(updated, Style::default().fg(p.muted))),
                 Cell::from(sid),
                 Cell::from(Span::styled(cwd, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(rounds, Style::default().fg(p.muted))),
-                Cell::from(msg),
-            ])
-            .style(Style::default().fg(p.text))
+            ];
+            if !compact_table {
+                cells.push(Cell::from(msg));
+            }
+
+            Row::new(cells).style(Style::default().fg(p.text))
         })
         .collect::<Vec<_>>();
 
-    let table = Table::new(
-        rows,
-        [
+    let widths = if compact_table {
+        vec![
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Min(12),
+            Constraint::Length(6),
+        ]
+    } else {
+        vec![
             Constraint::Length(20),
             Constraint::Length(18),
             Constraint::Length(16),
             Constraint::Length(6),
             Constraint::Min(20),
-        ],
-    )
-    .header(header)
-    .block(left_block)
-    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
-    .highlight_symbol("  ")
-    .highlight_spacing(HighlightSpacing::Always);
+        ]
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(left_block)
+        .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+        .highlight_symbol("  ")
+        .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, columns[0], &mut ui.codex_history_table);
 
     let right_block = Block::default()
         .title(Span::styled(
-            i18n::text(ui.language, msg::DETAILS_TITLE),
+            format!("{}  PgUp/PgDn", i18n::text(ui.language, msg::DETAILS_TITLE)),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -225,7 +263,20 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
             i18n::text(ui.language, msg::KEYS_LABEL),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(i18n::text(ui.language, msg::HISTORY_KEYS)));
+        lines.push(Line::from(
+            match (ui.language, ui.can_bridge_runtime_sessions_to_local_codex()) {
+                (crate::tui::Language::Zh, true) => {
+                    "  ↑/↓ 选择  r 刷新  t/Enter 打开对话记录  s 打开到 Sessions  f 打开到 Requests"
+                }
+                (crate::tui::Language::En, true) => {
+                    "  ↑/↓ select  r refresh  t/Enter transcript  s open Sessions  f open Requests"
+                }
+                (crate::tui::Language::Zh, false) => "  ↑/↓ 选择  r 刷新  t/Enter 打开本机对话记录",
+                (crate::tui::Language::En, false) => {
+                    "  ↑/↓ select  r refresh  t/Enter open local transcript"
+                }
+            },
+        ));
         if s.source == SessionSummarySource::ObservedOnly {
             lines.push(Line::from(i18n::text(
                 ui.language,
@@ -234,11 +285,22 @@ pub(super) fn render_history_page(f: &mut Frame<'_>, p: Palette, ui: &mut UiStat
         }
     }
 
+    let right_inner = right_block.inner(columns[1]);
+    let max_scroll = max_wrapped_vertical_scroll(&lines, right_inner.width, right_inner.height);
+    ui.codex_history_details_scroll = ui.codex_history_details_scroll.min(max_scroll);
     let content = Paragraph::new(Text::from(lines))
         .block(right_block)
         .style(Style::default().fg(p.text))
+        .scroll((ui.codex_history_details_scroll, 0))
         .wrap(Wrap { trim: false });
     f.render_widget(content, columns[1]);
+    if max_scroll > 0 {
+        let mut scrollbar = ScrollbarState::new(usize::from(max_scroll) + 1)
+            .position(usize::from(ui.codex_history_details_scroll));
+        let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(p.border));
+        f.render_stateful_widget(widget, columns[1], &mut scrollbar);
+    }
 }
 
 fn history_focus_origin_label(

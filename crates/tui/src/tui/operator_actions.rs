@@ -4,14 +4,22 @@ use tokio::sync::mpsc;
 
 use crate::control_plane_client::LocalOperatorClient;
 use crate::proxy::{
-    OperatorEndpointMode, OperatorRoutingCommand, OperatorRoutingMutationRequest,
-    OperatorRoutingMutationResponse, OperatorRoutingMutationStatus, OperatorSessionAffinityCommand,
+    OperatorDefaultProfileMutationRequest, OperatorDefaultProfileMutationResponse,
+    OperatorDefaultProfileMutationStatus, OperatorDefaultProfileScope, OperatorEndpointMode,
+    OperatorRoutingCommand, OperatorRoutingMutationRequest, OperatorRoutingMutationResponse,
+    OperatorRoutingMutationStatus, OperatorSessionAffinityCommand,
     OperatorSessionAffinityMutationRequest, OperatorSessionAffinityMutationResponse,
-    OperatorSessionAffinityMutationStatus, ProxyService,
+    OperatorSessionAffinityMutationStatus, OperatorSessionBindingCommand,
+    OperatorSessionBindingMutationRequest, OperatorSessionBindingMutationResponse,
+    OperatorSessionBindingMutationStatus, ProxyService,
 };
 use crate::usage_providers::UsageProviderRefreshSummary;
 
 use super::Language;
+use super::settings_relay::{
+    CodexRelayDiagnosticsCompletion, CodexRelayDiagnosticsStart, CodexRelayLiveSmokeCompletion,
+    CodexRelayLiveSmokeStart,
+};
 use super::state::UiState;
 
 #[derive(Debug, Clone)]
@@ -19,6 +27,11 @@ pub(in crate::tui) enum PendingOperatorAction {
     RefreshBalances { force: bool },
     MutateRouting(OperatorRoutingMutationRequest),
     MutateSessionAffinity(OperatorSessionAffinityMutationRequest),
+    MutateSessionBinding(OperatorSessionBindingMutationRequest),
+    ReloadRuntime,
+    MutateDefaultProfile(OperatorDefaultProfileMutationRequest),
+    InspectRelayCapabilities(CodexRelayDiagnosticsStart),
+    RunRelayLiveSmoke(CodexRelayLiveSmokeStart),
 }
 
 #[derive(Debug)]
@@ -32,9 +45,23 @@ pub(super) enum OperatorActionOutcome {
         command: OperatorSessionAffinityCommand,
         result: Result<OperatorSessionAffinityMutationResponse, String>,
     },
+    MutateSessionBinding {
+        command: OperatorSessionBindingCommand,
+        result: Result<OperatorSessionBindingMutationResponse, String>,
+    },
+    ReloadRuntime(Result<crate::proxy::OperatorRuntimeReloadResponse, String>),
+    MutateDefaultProfile {
+        scope: OperatorDefaultProfileScope,
+        result: Result<OperatorDefaultProfileMutationResponse, String>,
+    },
+    InspectRelayCapabilities(Box<CodexRelayDiagnosticsCompletion>),
+    RunRelayLiveSmoke(Box<CodexRelayLiveSmokeCompletion>),
 }
 
 pub(super) type OperatorActionSender = mpsc::UnboundedSender<OperatorActionOutcome>;
+
+const AUTO_BALANCE_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
+const FORCED_BALANCE_REFRESH_COOLDOWN: Duration = Duration::from_secs(2);
 
 pub(in crate::tui) fn queue_balance_refresh(ui: &mut UiState, force: bool, announce: bool) -> bool {
     queue_balance_refresh_with_cooldown(ui, force, announce, true)
@@ -52,13 +79,18 @@ fn queue_balance_refresh_with_cooldown(
         }
         return false;
     }
-    if enforce_cooldown
-        && !force
-        && ui
+    if enforce_cooldown {
+        let cooldown = if force {
+            FORCED_BALANCE_REFRESH_COOLDOWN
+        } else {
+            AUTO_BALANCE_REFRESH_COOLDOWN
+        };
+        if ui
             .last_balance_refresh_requested_at
-            .is_some_and(|last| last.elapsed() < Duration::from_secs(10))
-    {
-        return false;
+            .is_some_and(|last| last.elapsed() < cooldown)
+        {
+            return false;
+        }
     }
     if !force && !announce && (ui.operator_action_in_flight || ui.pending_operator_action.is_some())
     {
@@ -130,6 +162,40 @@ pub(in crate::tui) fn queue_session_affinity_mutation(
     true
 }
 
+pub(in crate::tui) fn queue_session_binding_mutation(
+    ui: &mut UiState,
+    request: OperatorSessionBindingMutationRequest,
+) -> bool {
+    if !ui.can_mutate_session_binding() {
+        ui.toast = Some((read_only_action_message(ui), Instant::now()));
+        return false;
+    }
+    if ui.pending_operator_action.is_some() {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "已有本地操作正在进行".to_string(),
+                Language::En => "a local operator action is already in progress".to_string(),
+            },
+            Instant::now(),
+        ));
+        return false;
+    }
+    let queued_behind_in_flight = ui.operator_action_in_flight;
+    ui.pending_operator_action = Some(PendingOperatorAction::MutateSessionBinding(request));
+    if queued_behind_in_flight {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "会话控制变更已排队，将在当前本机操作后执行".to_string(),
+                Language::En => {
+                    "session control change queued behind the current local action".to_string()
+                }
+            },
+            Instant::now(),
+        ));
+    }
+    true
+}
+
 pub(in crate::tui) fn queue_routing_mutation(
     ui: &mut UiState,
     request: OperatorRoutingMutationRequest,
@@ -160,6 +226,74 @@ pub(in crate::tui) fn queue_routing_mutation(
         ));
     }
     true
+}
+
+fn queue_settings_action(ui: &mut UiState, allowed: bool, action: PendingOperatorAction) -> bool {
+    if !allowed {
+        ui.toast = Some((read_only_action_message(ui), Instant::now()));
+        return false;
+    }
+    if ui.pending_operator_action.is_some() {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "已有本地操作正在进行".to_string(),
+                Language::En => "a local operator action is already in progress".to_string(),
+            },
+            Instant::now(),
+        ));
+        return false;
+    }
+    ui.pending_operator_action = Some(action);
+    true
+}
+
+pub(in crate::tui) fn queue_runtime_reload(ui: &mut UiState) -> bool {
+    queue_settings_action(
+        ui,
+        ui.can_reload_runtime(),
+        PendingOperatorAction::ReloadRuntime,
+    )
+}
+
+pub(in crate::tui) fn queue_default_profile_mutation(
+    ui: &mut UiState,
+    request: OperatorDefaultProfileMutationRequest,
+) -> bool {
+    queue_settings_action(
+        ui,
+        ui.can_mutate_default_profile(),
+        PendingOperatorAction::MutateDefaultProfile(request),
+    )
+}
+
+pub(in crate::tui) fn queue_relay_capabilities(
+    ui: &mut UiState,
+    start: CodexRelayDiagnosticsStart,
+) -> bool {
+    let queued = queue_settings_action(
+        ui,
+        ui.can_inspect_relay_capabilities(),
+        PendingOperatorAction::InspectRelayCapabilities(start),
+    );
+    if !queued {
+        ui.codex_relay_diagnostics.loading = false;
+    }
+    queued
+}
+
+pub(in crate::tui) fn queue_relay_live_smoke(
+    ui: &mut UiState,
+    start: CodexRelayLiveSmokeStart,
+) -> bool {
+    let queued = queue_settings_action(
+        ui,
+        ui.can_run_relay_live_smoke(),
+        PendingOperatorAction::RunRelayLiveSmoke(start),
+    );
+    if !queued {
+        ui.codex_relay_live_smoke.loading = false;
+    }
+    queued
 }
 
 pub(super) fn start_integrated_operator_action(
@@ -206,6 +340,63 @@ pub(super) fn start_integrated_operator_action(
                     .await
                     .map_err(|error| error.to_string());
                 let _ = tx.send(OperatorActionOutcome::MutateSessionAffinity { command, result });
+            });
+        }
+        PendingOperatorAction::MutateSessionBinding(request) => {
+            let command = request.command.clone();
+            tokio::spawn(async move {
+                let result = proxy
+                    .mutate_operator_session_binding(request)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::MutateSessionBinding { command, result });
+            });
+        }
+        PendingOperatorAction::ReloadRuntime => {
+            tokio::spawn(async move {
+                let result = proxy
+                    .operator_runtime_reload(crate::proxy::OperatorRuntimeReloadRequest {})
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::ReloadRuntime(result));
+            });
+        }
+        PendingOperatorAction::MutateDefaultProfile(request) => {
+            let scope = request.scope;
+            tokio::spawn(async move {
+                let result = proxy
+                    .mutate_operator_default_profile(request)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::MutateDefaultProfile { scope, result });
+            });
+        }
+        PendingOperatorAction::InspectRelayCapabilities(start) => {
+            tokio::spawn(async move {
+                let result = proxy
+                    .codex_relay_capabilities(start.request)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::InspectRelayCapabilities(Box::new(
+                    CodexRelayDiagnosticsCompletion {
+                        generation: start.generation,
+                        result,
+                    },
+                )));
+            });
+        }
+        PendingOperatorAction::RunRelayLiveSmoke(start) => {
+            tokio::spawn(async move {
+                let result = proxy
+                    .codex_relay_live_smoke(start.request)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::RunRelayLiveSmoke(Box::new(
+                    CodexRelayLiveSmokeCompletion {
+                        generation: start.generation,
+                        result,
+                    },
+                )));
             });
         }
     }
@@ -258,6 +449,63 @@ pub(super) fn start_attached_operator_action(
                 let _ = tx.send(OperatorActionOutcome::MutateSessionAffinity { command, result });
             });
         }
+        PendingOperatorAction::MutateSessionBinding(request) => {
+            let command = request.command.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .mutate_operator_session_binding(&request)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::MutateSessionBinding { command, result });
+            });
+        }
+        PendingOperatorAction::ReloadRuntime => {
+            tokio::spawn(async move {
+                let result = client
+                    .reload_runtime()
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::ReloadRuntime(result));
+            });
+        }
+        PendingOperatorAction::MutateDefaultProfile(request) => {
+            let scope = request.scope;
+            tokio::spawn(async move {
+                let result = client
+                    .mutate_operator_default_profile(&request)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::MutateDefaultProfile { scope, result });
+            });
+        }
+        PendingOperatorAction::InspectRelayCapabilities(start) => {
+            tokio::spawn(async move {
+                let result = client
+                    .inspect_relay_capabilities(&start.request)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::InspectRelayCapabilities(Box::new(
+                    CodexRelayDiagnosticsCompletion {
+                        generation: start.generation,
+                        result,
+                    },
+                )));
+            });
+        }
+        PendingOperatorAction::RunRelayLiveSmoke(start) => {
+            tokio::spawn(async move {
+                let result = client
+                    .run_relay_live_smoke(&start.request)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(OperatorActionOutcome::RunRelayLiveSmoke(Box::new(
+                    CodexRelayLiveSmokeCompletion {
+                        generation: start.generation,
+                        result,
+                    },
+                )));
+            });
+        }
     }
     true
 }
@@ -271,12 +519,14 @@ pub(super) fn apply_operator_action_outcome(ui: &mut UiState, outcome: OperatorA
             ui.last_balance_refresh_finished_at = Some(Instant::now());
             ui.last_balance_refresh_error = None;
             let message = balance_refresh_message(ui.language, &summary);
+            ui.last_balance_refresh_summary = Some(summary);
             ui.last_balance_refresh_message = Some(message.clone());
             message
         }
         OperatorActionOutcome::RefreshBalances(Err(error)) => {
             ui.balance_refresh_in_flight = false;
             ui.last_balance_refresh_finished_at = Some(Instant::now());
+            ui.last_balance_refresh_summary = None;
             ui.last_balance_refresh_message = None;
             ui.last_balance_refresh_error = Some(error.clone());
             match ui.language {
@@ -290,6 +540,23 @@ pub(super) fn apply_operator_action_outcome(ui: &mut UiState, outcome: OperatorA
         OperatorActionOutcome::MutateSessionAffinity { command, result } => {
             session_affinity_mutation_message(ui.language, &command, result)
         }
+        OperatorActionOutcome::MutateSessionBinding { command, result } => {
+            session_binding_mutation_message(ui.language, &command, result)
+        }
+        OperatorActionOutcome::ReloadRuntime(result) => runtime_reload_message(ui.language, result),
+        OperatorActionOutcome::MutateDefaultProfile { scope, result } => {
+            default_profile_mutation_message(ui.language, scope, result)
+        }
+        OperatorActionOutcome::InspectRelayCapabilities(completion) => {
+            ui.codex_relay_diagnostics
+                .apply_completion(*completion, Instant::now());
+            relay_diagnostics_message(ui)
+        }
+        OperatorActionOutcome::RunRelayLiveSmoke(completion) => {
+            ui.codex_relay_live_smoke
+                .apply_completion(*completion, Instant::now());
+            relay_live_smoke_message(ui)
+        }
     };
     ui.toast = Some((message, Instant::now()));
     queue_deferred_auto_balance_refresh(ui);
@@ -302,23 +569,72 @@ fn queue_deferred_auto_balance_refresh(ui: &mut UiState) {
     let _ = queue_balance_refresh_with_cooldown(ui, false, false, false);
 }
 
+pub(in crate::tui) fn balance_refresh_summary_has_warning(
+    summary: &UsageProviderRefreshSummary,
+) -> bool {
+    summary.providers_rejected > 0
+        || summary.failed > 0
+        || summary.missing_token > 0
+        || summary.auto_failed > 0
+}
+
 fn balance_refresh_message(lang: Language, summary: &UsageProviderRefreshSummary) -> String {
-    if summary.deduplicated > 0 && summary.attempted == 0 {
+    if summary.deduplicated > 0
+        && summary.attempted == 0
+        && !balance_refresh_summary_has_warning(summary)
+    {
         return match lang {
             Language::Zh => "余额/额度刷新已由 daemon 合并处理".to_string(),
             Language::En => "balance/quota refresh was deduplicated by the daemon".to_string(),
         };
     }
-    match lang {
-        Language::Zh => format!(
-            "余额/额度：成功 {}/{}，失败 {}，缺少凭据 {}",
-            summary.refreshed, summary.attempted, summary.failed, summary.missing_token
-        ),
-        Language::En => format!(
-            "balance/quota: {}/{} refreshed, {} failed, {} missing credentials",
-            summary.refreshed, summary.attempted, summary.failed, summary.missing_token
-        ),
+    let mut message = match lang {
+        Language::Zh => {
+            let rejected = if summary.providers_rejected > 0 {
+                format!("，跳过无效配置 {}", summary.providers_rejected)
+            } else {
+                String::new()
+            };
+            format!(
+                "余额/额度：成功 {}/{}，失败 {}，缺少凭据 {}{rejected}",
+                summary.refreshed, summary.attempted, summary.failed, summary.missing_token
+            )
+        }
+        Language::En => {
+            let rejected = if summary.providers_rejected > 0 {
+                format!(
+                    ", {} invalid configurations skipped",
+                    summary.providers_rejected
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "balance/quota: {}/{} refreshed, {} failed, {} missing credentials{rejected}",
+                summary.refreshed, summary.attempted, summary.failed, summary.missing_token
+            )
+        }
+    };
+    if let Some(diagnostic) = summary.rejected_providers.first() {
+        match lang {
+            Language::Zh => message.push_str(&format!(
+                "；{} [{}]：{}",
+                diagnostic.provider_id, diagnostic.code, diagnostic.message
+            )),
+            Language::En => message.push_str(&format!(
+                "; {} [{}]: {}",
+                diagnostic.provider_id, diagnostic.code, diagnostic.message
+            )),
+        }
+        let remaining = summary.providers_rejected.saturating_sub(1);
+        if remaining > 0 {
+            match lang {
+                Language::Zh => message.push_str(&format!("；另有 {remaining} 项")),
+                Language::En => message.push_str(&format!("; {remaining} more")),
+            }
+        }
     }
+    message
 }
 
 fn read_only_action_message(ui: &UiState) -> String {
@@ -334,6 +650,105 @@ fn read_only_action_message(ui: &UiState) -> String {
             "the daemon did not advertise local operator actions; falling back to read-only"
                 .to_string()
         }
+    }
+}
+
+fn runtime_reload_message(
+    language: Language,
+    result: Result<crate::proxy::OperatorRuntimeReloadResponse, String>,
+) -> String {
+    match result {
+        Ok(response) if response.changed => match language {
+            Language::Zh => format!("运行时配置已重载（revision={}）", response.runtime_revision),
+            Language::En => format!(
+                "runtime config reloaded (revision={})",
+                response.runtime_revision
+            ),
+        },
+        Ok(_) => match language {
+            Language::Zh => "运行时配置已是磁盘上的最新版本".to_string(),
+            Language::En => "runtime config already matches disk".to_string(),
+        },
+        Err(error) => match language {
+            Language::Zh => format!("运行时配置重载失败；继续使用 last-known-good：{error}"),
+            Language::En => format!("runtime reload failed; keeping last-known-good: {error}"),
+        },
+    }
+}
+
+fn default_profile_mutation_message(
+    language: Language,
+    scope: OperatorDefaultProfileScope,
+    result: Result<OperatorDefaultProfileMutationResponse, String>,
+) -> String {
+    let scope_label = match (language, scope) {
+        (Language::Zh, OperatorDefaultProfileScope::Configured) => "配置默认 profile",
+        (Language::Zh, OperatorDefaultProfileScope::Runtime) => "运行时默认 profile",
+        (Language::En, OperatorDefaultProfileScope::Configured) => "configured default profile",
+        (Language::En, OperatorDefaultProfileScope::Runtime) => "runtime default profile",
+    };
+    match result {
+        Ok(response) if response.status == OperatorDefaultProfileMutationStatus::Applied => {
+            let profile = match scope {
+                OperatorDefaultProfileScope::Configured => {
+                    response.profiles.configured_default_profile.as_deref()
+                }
+                OperatorDefaultProfileScope::Runtime => response
+                    .profiles
+                    .runtime_default_profile_override
+                    .as_deref(),
+            }
+            .unwrap_or("<none>");
+            format!("{scope_label}: {profile}")
+        }
+        Ok(_) => match language {
+            Language::Zh => format!("{scope_label} 已处于所选状态"),
+            Language::En => format!("{scope_label} is already in the selected state"),
+        },
+        Err(error) => match language {
+            Language::Zh => format!("{scope_label} 更新失败：{error}"),
+            Language::En => format!("failed to update {scope_label}: {error}"),
+        },
+    }
+}
+
+fn relay_diagnostics_message(ui: &UiState) -> String {
+    if let Some(error) = ui.codex_relay_diagnostics.last_error.as_deref() {
+        return match ui.language {
+            Language::Zh => format!("relay 能力诊断失败：{error}"),
+            Language::En => format!("relay capability diagnostic failed: {error}"),
+        };
+    }
+    let summary = ui
+        .codex_relay_diagnostics
+        .last_result
+        .as_ref()
+        .map(|response| {
+            format!(
+                "{}/{} mismatches={}",
+                response.provider_id,
+                response.endpoint_id,
+                response.mismatches.len()
+            )
+        })
+        .unwrap_or_else(|| "-".to_string());
+    match ui.language {
+        Language::Zh => format!("relay 能力诊断完成：{summary}"),
+        Language::En => format!("relay capability diagnostic complete: {summary}"),
+    }
+}
+
+fn relay_live_smoke_message(ui: &UiState) -> String {
+    if let Some(error) = ui.codex_relay_live_smoke.last_error.as_deref() {
+        return match ui.language {
+            Language::Zh => format!("relay live smoke 失败：{error}"),
+            Language::En => format!("relay live smoke failed: {error}"),
+        };
+    }
+    let (passed, total) = ui.codex_relay_live_smoke.passed_counts().unwrap_or((0, 0));
+    match ui.language {
+        Language::Zh => format!("relay live smoke：{passed}/{total} 通过"),
+        Language::En => format!("relay live smoke: {passed}/{total} passed"),
     }
 }
 
@@ -478,15 +893,104 @@ fn session_affinity_mutation_message(
     }
 }
 
+fn session_binding_mutation_message(
+    lang: Language,
+    command: &OperatorSessionBindingCommand,
+    result: Result<OperatorSessionBindingMutationResponse, String>,
+) -> String {
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            return match lang {
+                Language::Zh => format!("会话控制更新失败：{error}"),
+                Language::En => format!("session control update failed: {error}"),
+            };
+        }
+    };
+    match response.status {
+        OperatorSessionBindingMutationStatus::Conflict => match lang {
+            Language::Zh => "会话绑定已变化；已刷新，请重试".to_string(),
+            Language::En => "session binding changed; the view was refreshed, retry".to_string(),
+        },
+        OperatorSessionBindingMutationStatus::Unchanged => match lang {
+            Language::Zh => "会话控制已经处于请求的状态".to_string(),
+            Language::En => "session control is already in the requested state".to_string(),
+        },
+        OperatorSessionBindingMutationStatus::Applied => match (lang, command) {
+            (Language::Zh, OperatorSessionBindingCommand::SetProfile { profile_name }) => {
+                match profile_name.as_deref() {
+                    Some(name) => format!("会话已绑定 profile {name}"),
+                    None => "会话 profile 绑定已清除".to_string(),
+                }
+            }
+            (Language::En, OperatorSessionBindingCommand::SetProfile { profile_name }) => {
+                match profile_name.as_deref() {
+                    Some(name) => format!("session bound to profile {name}"),
+                    None => "session profile binding cleared".to_string(),
+                }
+            }
+            (Language::Zh, OperatorSessionBindingCommand::SetModel { model }) => {
+                format!("会话 model：{}", model.as_deref().unwrap_or("<已清除>"))
+            }
+            (Language::En, OperatorSessionBindingCommand::SetModel { model }) => {
+                format!("session model: {}", model.as_deref().unwrap_or("<cleared>"))
+            }
+            (
+                Language::Zh,
+                OperatorSessionBindingCommand::SetReasoningEffort { reasoning_effort },
+            ) => format!(
+                "会话 reasoning effort：{}",
+                reasoning_effort.as_deref().unwrap_or("<已清除>")
+            ),
+            (
+                Language::En,
+                OperatorSessionBindingCommand::SetReasoningEffort { reasoning_effort },
+            ) => format!(
+                "session reasoning effort: {}",
+                reasoning_effort.as_deref().unwrap_or("<cleared>")
+            ),
+            (Language::Zh, OperatorSessionBindingCommand::SetServiceTier { service_tier }) => {
+                format!(
+                    "会话 service tier：{}",
+                    service_tier.as_deref().unwrap_or("<已清除>")
+                )
+            }
+            (Language::En, OperatorSessionBindingCommand::SetServiceTier { service_tier }) => {
+                format!(
+                    "session service tier: {}",
+                    service_tier.as_deref().unwrap_or("<cleared>")
+                )
+            }
+            (Language::Zh, OperatorSessionBindingCommand::ResetManualOverrides) => {
+                "会话手动控制已重置；下一请求恢复默认策略".to_string()
+            }
+            (Language::En, OperatorSessionBindingCommand::ResetManualOverrides) => {
+                "session manual controls reset; the next request uses defaults".to_string()
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage_providers::UsageProviderConfigDiagnostic;
 
     fn session_affinity_request() -> OperatorSessionAffinityMutationRequest {
         OperatorSessionAffinityMutationRequest {
             session_key: "session:sha256:test".to_string(),
             expected_affinity_revision: Some("affinity:v1:test".to_string()),
             command: OperatorSessionAffinityCommand::Clear,
+        }
+    }
+
+    fn session_binding_request() -> OperatorSessionBindingMutationRequest {
+        OperatorSessionBindingMutationRequest {
+            session_key: "session:sha256:test".to_string(),
+            expected_binding_revision: "binding:v1:test".to_string(),
+            command: OperatorSessionBindingCommand::SetReasoningEffort {
+                reasoning_effort: Some("high".to_string()),
+            },
         }
     }
 
@@ -497,7 +1001,62 @@ mod tests {
         ui.pending_operator_action = None;
         ui.last_balance_refresh_requested_at = Some(Instant::now());
         assert!(!queue_balance_refresh(&mut ui, false, false));
-        assert!(queue_balance_refresh(&mut ui, true, false));
+    }
+
+    #[test]
+    fn forced_balance_refresh_is_deduplicated_for_two_seconds() {
+        let mut ui = UiState {
+            last_balance_refresh_requested_at: Some(Instant::now()),
+            ..UiState::default()
+        };
+
+        assert!(!queue_balance_refresh(&mut ui, true, true));
+        assert!(ui.pending_operator_action.is_none());
+
+        ui.last_balance_refresh_requested_at =
+            Some(Instant::now() - FORCED_BALANCE_REFRESH_COOLDOWN);
+        assert!(queue_balance_refresh(&mut ui, true, true));
+        assert!(matches!(
+            ui.pending_operator_action,
+            Some(PendingOperatorAction::RefreshBalances { force: true })
+        ));
+    }
+
+    #[test]
+    fn partial_balance_refresh_retains_and_surfaces_rejected_provider_diagnostic() {
+        let summary = UsageProviderRefreshSummary {
+            providers_configured: 2,
+            providers_rejected: 1,
+            rejected_providers: vec![UsageProviderConfigDiagnostic {
+                provider_id: "siliconflow".to_string(),
+                code: "invalid_config".to_string(),
+                message: "endpoint templates are not supported".to_string(),
+            }],
+            providers_matched: 1,
+            upstreams_matched: 1,
+            attempted: 1,
+            refreshed: 1,
+            ..Default::default()
+        };
+        let mut ui = UiState {
+            language: Language::Zh,
+            ..UiState::default()
+        };
+
+        apply_operator_action_outcome(
+            &mut ui,
+            OperatorActionOutcome::RefreshBalances(Ok(summary.clone())),
+        );
+
+        assert_eq!(ui.last_balance_refresh_summary.as_ref(), Some(&summary));
+        assert!(balance_refresh_summary_has_warning(&summary));
+        assert!(ui.last_balance_refresh_error.is_none());
+        let message = ui.last_balance_refresh_message.as_deref().unwrap();
+        assert!(message.contains("成功 1/1"));
+        assert!(message.contains("跳过无效配置 1"));
+        assert!(message.contains("siliconflow"));
+        assert!(message.contains("invalid_config"));
+        assert!(message.contains("endpoint templates are not supported"));
     }
 
     #[test]
@@ -518,6 +1077,10 @@ mod tests {
         assert!(!queue_session_affinity_mutation(
             &mut ui,
             session_affinity_request()
+        ));
+        assert!(!queue_session_binding_mutation(
+            &mut ui,
+            session_binding_request()
         ));
         assert!(ui.pending_operator_action.is_none());
         assert!(!ui.deferred_auto_balance_refresh);

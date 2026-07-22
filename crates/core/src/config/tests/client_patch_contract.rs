@@ -140,6 +140,80 @@ preset = "default"
 }
 
 #[test]
+fn claude_compaction_is_rejected_even_when_the_table_is_empty() {
+    let config = toml::from_str::<HelperConfig>(
+        r#"
+version = 6
+
+[claude.compaction]
+"#,
+    )
+    .expect("parse typed service config");
+    let error = validate_helper_config(&config).expect_err("Claude compaction must fail");
+    assert!(error.to_string().contains("claude.compaction"));
+}
+
+#[test]
+fn relay_target_client_patch_is_a_partial_codex_only_override() {
+    let valid = toml::from_str::<HelperConfig>(
+        r#"
+version = 6
+
+[codex.client_patch]
+preset = "official-imagegen"
+responses_websocket = true
+compaction = "remote-v2"
+translate_models = true
+
+[relay_targets.nas]
+service = "codex"
+proxy_url = "http://nas.local:3211"
+admin_url = "https://nas.example:4211"
+admin_token_env = "NAS_TOKEN"
+
+[relay_targets.nas.client_patch]
+preset = "official-relay"
+compaction = "remote-v1"
+"#,
+    )
+    .expect("parse target client patch");
+    validate_helper_config(&valid).expect("validate inherited target client patch");
+    let target = valid.relay_targets.get("nas").expect("named target");
+    let resolved = valid
+        .codex
+        .client_patch
+        .expect("global client patch")
+        .with_field_overrides(target.client_patch.expect("target client patch"));
+    assert_eq!(resolved.preset, CodexClientPreset::OfficialRelay);
+    assert!(resolved.responses_websocket);
+    assert_eq!(resolved.compaction, CodexCompactionStrategy::RemoteV1);
+    assert!(resolved.translate_models);
+
+    let claude = toml::from_str::<HelperConfig>(
+        r#"
+version = 6
+
+[relay_targets.remote]
+service = "claude"
+proxy_url = "http://claude.local:3210"
+admin_url = "https://claude.example:4210"
+admin_token_env = "CLAUDE_TOKEN"
+
+[relay_targets.remote.client_patch]
+preset = "default"
+"#,
+    )
+    .expect("parse Claude target with invalid client patch");
+    let error = validate_helper_config(&claude).expect_err("Claude target patch must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("relay_targets.remote.client_patch"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn client_patch_unknown_field_fails_without_rewriting_or_backing_up_source() {
     let _env = setup_temp_codex_home();
     let path = config_file_path();

@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn sampler_refreshes_while_idle_at_the_default_interval() {
+    async fn sampler_starts_with_an_immediate_refresh_then_uses_the_default_interval() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_refresh = calls.clone();
         let sampler = QuotaSampler::new(config(DEFAULT_QUOTA_SAMPLE_INTERVAL), move || {
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn shutdown_cancels_an_in_flight_refresh_and_prevents_later_io() {
+    async fn shutdown_cancels_an_in_flight_initial_refresh_and_prevents_later_io() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_refresh = calls.clone();
         let sampler = QuotaSampler::new(QuotaSamplerConfig::default(), move || {

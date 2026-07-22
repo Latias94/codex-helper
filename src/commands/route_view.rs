@@ -3,8 +3,13 @@ use super::config_doc::{
     routing_exhausted_label, routing_policy_label, select_service_route_config,
 };
 use crate::config::{CURRENT_CONFIG_VERSION, ServiceRouteConfig};
-use crate::routing_explain::parse_routing_explain_headers;
-use crate::routing_ir::{RouteRequestContext, compile_route_plan_template_with_request};
+use crate::routing_explain::{
+    RoutingExplainCandidate, RoutingExplainResponse, RoutingExplainSkipReason,
+    build_routing_explain_response_with_request, parse_routing_explain_headers,
+};
+use crate::routing_ir::{
+    RoutePlanRuntimeState, RouteRequestContext, compile_route_plan_template_with_request,
+};
 use crate::{CliError, CliResult, RoutingCommand};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -40,17 +45,16 @@ struct ConfigExplainRouting {
 
 #[derive(Debug, Serialize)]
 struct ConfigOnlyRouteExplain {
-    api_version: u32,
+    #[serde(flatten)]
+    compatibility: RoutingExplainResponse,
     source: &'static str,
     runtime_state_queried: bool,
     schema_version: u32,
-    service_name: String,
     routing: ConfigExplainRouting,
     providers: Vec<ConfigExplainProvider>,
     request: ConfigOnlyRequestContext,
     route_graph_key: String,
-    first_config_eligible_candidate: Option<ConfigOnlyRouteCandidate>,
-    candidates: Vec<ConfigOnlyRouteCandidate>,
+    first_config_eligible_candidate: Option<RoutingExplainCandidate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,20 +65,6 @@ struct ConfigOnlyRequestContext {
     path: Option<String>,
     method: Option<String>,
     header_names: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct ConfigOnlyRouteCandidate {
-    provider_id: String,
-    provider_alias: Option<String>,
-    endpoint_id: String,
-    provider_endpoint_key: String,
-    route_path: Vec<String>,
-    preference_group: u32,
-    upstream_base_url: String,
-    model_supported: bool,
-    effective_model: Option<String>,
-    config_skip_reasons: Vec<&'static str>,
 }
 
 fn explain_routing(view: &ServiceRouteConfig) -> ConfigExplainRouting {
@@ -274,60 +264,48 @@ fn build_config_only_explain(
         None => explain_providers(view),
     };
     let template = compile_route_plan_template_with_request(service_name, view, &request)?;
-    let requested_model = request.model.as_deref();
-    let candidates = template
-        .candidates
-        .iter()
-        .map(|candidate| {
-            let model_supported = requested_model
-                .map(|model| candidate.is_model_supported(model))
-                .unwrap_or(true);
-            ConfigOnlyRouteCandidate {
-                provider_id: candidate.provider_id.clone(),
-                provider_alias: candidate.provider_alias.clone(),
-                endpoint_id: candidate.endpoint_id.clone(),
-                provider_endpoint_key: template
-                    .candidate_provider_endpoint_key(candidate)
-                    .stable_key(),
-                route_path: candidate.route_path.clone(),
-                preference_group: candidate.preference_group,
-                upstream_base_url: candidate.base_url.clone(),
-                model_supported,
-                effective_model: requested_model.map(|model| candidate.effective_model(model)),
-                config_skip_reasons: if model_supported {
-                    Vec::new()
-                } else {
-                    vec!["unsupported_model"]
-                },
-            }
-        })
-        .collect::<Vec<_>>();
-    let first_config_eligible_candidate = candidates
-        .iter()
-        .find(|candidate| candidate.model_supported)
-        .cloned();
-    let request = ConfigOnlyRequestContext {
-        model: request.model,
-        service_tier: request.service_tier,
-        reasoning_effort: request.reasoning_effort,
-        path: request.path,
-        method: request.method,
-        header_names: request.headers.into_keys().collect(),
+    let request_summary = ConfigOnlyRequestContext {
+        model: request.model.clone(),
+        service_tier: request.service_tier.clone(),
+        reasoning_effort: request.reasoning_effort.clone(),
+        path: request.path.clone(),
+        method: request.method.clone(),
+        header_names: request.headers.keys().cloned().collect(),
     };
+    let compatibility = build_routing_explain_response_with_request(
+        service_name,
+        None,
+        request,
+        None,
+        &template,
+        &RoutePlanRuntimeState::default(),
+    );
+    let first_config_eligible_candidate = compatibility.selected_route.clone();
 
     Ok(ConfigOnlyRouteExplain {
-        api_version: 1,
+        compatibility,
         source: "config_only",
         runtime_state_queried: false,
         schema_version: CURRENT_CONFIG_VERSION,
-        service_name: service_name.to_string(),
         routing: explain_routing(view),
         providers,
-        request,
+        request: request_summary,
         route_graph_key: template.route_graph_key(),
         first_config_eligible_candidate,
-        candidates,
     })
+}
+
+fn config_skip_reason_label(reason: &RoutingExplainSkipReason) -> &'static str {
+    match reason {
+        RoutingExplainSkipReason::UnsupportedModel { .. } => "unsupported_model",
+        RoutingExplainSkipReason::RuntimeDisabled => "runtime_disabled",
+        RoutingExplainSkipReason::Draining => "draining",
+        RoutingExplainSkipReason::Cooldown => "cooldown",
+        RoutingExplainSkipReason::BreakerOpen { .. } => "breaker_open",
+        RoutingExplainSkipReason::UsageExhausted => "usage_exhausted",
+        RoutingExplainSkipReason::MissingAuth => "missing_auth",
+        RoutingExplainSkipReason::ConcurrencySaturated { .. } => "concurrency_saturated",
+    }
 }
 
 fn config_only_explain_text_lines(explain: &ConfigOnlyRouteExplain) -> Vec<String> {
@@ -367,26 +345,23 @@ fn config_only_explain_text_lines(explain: &ConfigOnlyRouteExplain) -> Vec<Strin
         lines.push("First config-eligible candidate: <none>".to_string());
     }
 
-    if explain.candidates.is_empty() {
+    if explain.compatibility.candidates.is_empty() {
         lines.push("Config candidates: <empty>".to_string());
         return lines;
     }
 
     lines.push("Config candidates:".to_string());
-    for (idx, candidate) in explain.candidates.iter().enumerate() {
-        let marker = if explain
-            .first_config_eligible_candidate
-            .as_ref()
-            .is_some_and(|first| first.provider_endpoint_key == candidate.provider_endpoint_key)
-        {
-            "*"
-        } else {
-            " "
-        };
-        let skips = if candidate.config_skip_reasons.is_empty() {
+    for (idx, candidate) in explain.compatibility.candidates.iter().enumerate() {
+        let marker = if candidate.selected { "*" } else { " " };
+        let skips = if candidate.skip_reasons.is_empty() {
             "-".to_string()
         } else {
-            candidate.config_skip_reasons.join(",")
+            candidate
+                .skip_reasons
+                .iter()
+                .map(config_skip_reason_label)
+                .collect::<Vec<_>>()
+                .join(",")
         };
         lines.push(format!(
             "  {} {}. endpoint={} group={} provider={} path=[{}] skip={}",
@@ -488,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn config_only_explain_reports_candidate_order_without_runtime_state() {
+    fn config_only_explain_preserves_v1_runtime_shaped_json_contract() {
         let view = ServiceRouteConfig {
             providers: BTreeMap::from([
                 (
@@ -523,13 +498,13 @@ mod tests {
         assert_eq!(value["source"].as_str(), Some("config_only"));
         assert_eq!(value["runtime_state_queried"].as_bool(), Some(false));
         assert_eq!(value["service_name"].as_str(), Some("codex"));
+        assert!(value.get("runtime_loaded_at_ms").is_some());
+        assert_eq!(value["request_model"].as_str(), Some("gpt-5"));
+        assert_eq!(value["request_context"]["model"].as_str(), Some("gpt-5"));
         assert_eq!(value["request"]["model"].as_str(), Some("gpt-5"));
+        assert_eq!(value["selected_route"]["provider_id"].as_str(), Some("new"));
         assert_eq!(
-            value["first_config_eligible_candidate"]["provider_id"].as_str(),
-            Some("new")
-        );
-        assert_eq!(
-            value["first_config_eligible_candidate"]["route_path"]
+            value["selected_route"]["route_path"]
                 .as_array()
                 .map(|items| items
                     .iter()
@@ -538,12 +513,12 @@ mod tests {
             Some(vec!["main", "new"])
         );
         assert_eq!(
-            value["candidates"][0]["config_skip_reasons"][0].as_str(),
+            value["candidates"][0]["skip_reasons"][0]["code"].as_str(),
             Some("unsupported_model")
         );
-        assert!(value.get("runtime_loaded_at_ms").is_none());
-        assert!(value["candidates"][0].get("availability").is_none());
-        assert!(value["candidates"][0].get("capacity").is_none());
+        assert_eq!(value["candidates"][1]["selected"].as_bool(), Some(true));
+        assert_eq!(value["affinity_policy"].as_str(), Some("fallback_sticky"));
+        assert!(value["candidates"][0].get("availability").is_some());
     }
 
     #[test]

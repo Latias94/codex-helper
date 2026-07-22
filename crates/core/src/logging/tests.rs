@@ -1,6 +1,18 @@
 use super::*;
 
 #[test]
+fn client_uri_logging_drops_query_fragment_and_authority() {
+    assert_eq!(
+        client_uri_for_log("/v1/responses?api_key=sentinel#fragment"),
+        "/v1/responses"
+    );
+    assert_eq!(
+        client_uri_for_log("https://user:sentinel@example.test/private?token=sentinel"),
+        "/private"
+    );
+}
+
+#[test]
 fn request_trace_id_is_versioned_and_stable_within_process() {
     let first = request_trace_id("codex", 42);
     let second = request_trace_id("codex", 42);
@@ -56,6 +68,7 @@ fn request_log_serializes_request_id_when_present() {
         usage: None,
         http_debug: None,
         http_debug_ref: None,
+        http_debug_attempt_refs: Vec::new(),
         route_decision: None,
         retry: None,
         provider_signals: Vec::new(),
@@ -98,6 +111,7 @@ fn request_log_serializes_canonical_provider_endpoint_identity() {
         usage: None,
         http_debug: None,
         http_debug_ref: None,
+        http_debug_attempt_refs: Vec::new(),
         route_decision: None,
         retry: None,
         provider_signals: Vec::new(),
@@ -145,12 +159,14 @@ fn request_log_serializes_codex_bridge_metadata() {
             patch_mode: "official-imagegen".to_string(),
             remote_compaction_v1_request: true,
             remote_compaction_v2_request: true,
+            downgraded_to_responses_compact: true,
             responses_websocket_request: false,
             strips_client_auth: true,
         }),
         usage: None,
         http_debug: None,
         http_debug_ref: None,
+        http_debug_attempt_refs: Vec::new(),
         route_decision: None,
         retry: None,
         provider_signals: Vec::new(),
@@ -171,6 +187,10 @@ fn request_log_serializes_codex_bridge_metadata() {
         Some(true)
     );
     assert_eq!(
+        value["codex_bridge"]["downgraded_to_responses_compact"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
         value["codex_bridge"]["strips_client_auth"].as_bool(),
         Some(true)
     );
@@ -186,6 +206,15 @@ fn upstream_origin_uses_url_parser_and_drops_credentials_path_query_and_fragment
         Some("https://relay.example.test:8443")
     );
     assert_eq!(upstream_origin("not a URL"), None);
+    assert_eq!(
+        upstream_uri_for_log(poisoned).as_deref(),
+        Some("/private/secret-path")
+    );
+    assert_eq!(
+        upstream_uri_for_log("/gateway/v1/responses?token=hidden").as_deref(),
+        Some("/gateway/v1/responses")
+    );
+    assert_eq!(upstream_uri_for_log("not a URL"), None);
 }
 
 #[test]

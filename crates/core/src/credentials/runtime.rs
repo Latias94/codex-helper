@@ -1673,38 +1673,27 @@ mod tests {
         assert_eq!(backend.reads.load(Ordering::SeqCst), 1);
 
         backend.block();
-        let first_runtime = runtime.clone();
-        let first_generation = Arc::clone(&initial);
-        let first = tokio::spawn(async move {
-            first_runtime
-                .refresh_generation(
-                    first_generation,
-                    None,
-                    CredentialRuntimeRefreshCause::AuthenticationFailure,
-                )
-                .await
-        });
-        let second_runtime = runtime.clone();
-        let second = tokio::spawn(async move {
-            second_runtime
-                .refresh_generation(
-                    initial,
-                    None,
-                    CredentialRuntimeRefreshCause::AuthenticationFailure,
-                )
-                .await
-        });
-        wait_for_read_count(backend.as_ref(), 2).await;
-        assert_eq!(backend.reads.load(Ordering::SeqCst), 2);
-        backend.release();
-        first
-            .await
-            .expect("join first refresh")
-            .expect("first refresh");
-        second
-            .await
-            .expect("join second refresh")
-            .expect("second refresh");
+        let release_backend = Arc::clone(&backend);
+        let release_after_read_starts = async move {
+            wait_for_read_count(release_backend.as_ref(), 2).await;
+            assert_eq!(release_backend.reads.load(Ordering::SeqCst), 2);
+            release_backend.release();
+        };
+        let (first, second, ()) = tokio::join!(
+            runtime.refresh_generation(
+                Arc::clone(&initial),
+                None,
+                CredentialRuntimeRefreshCause::AuthenticationFailure,
+            ),
+            runtime.refresh_generation(
+                initial,
+                None,
+                CredentialRuntimeRefreshCause::AuthenticationFailure,
+            ),
+            release_after_read_starts,
+        );
+        first.expect("first refresh");
+        second.expect("second refresh");
         assert_eq!(backend.reads.load(Ordering::SeqCst), 2);
     }
 

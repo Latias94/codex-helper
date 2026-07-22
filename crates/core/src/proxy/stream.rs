@@ -10,30 +10,38 @@ use axum::http::{HeaderMap, Method, Response, StatusCode};
 use futures_util::{Stream, StreamExt, stream};
 use tracing::{info, warn};
 
+use crate::endpoint_health::{RouteCapability, RuntimeHealthDomain};
 use crate::logging::{
     CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_control_trace_event,
-    make_body_preview, request_trace_id, should_include_http_debug, should_include_http_warn,
-    upstream_origin,
+    request_trace_id, should_include_http_debug, should_include_http_warn, upstream_origin,
 };
-use crate::runtime_store::{AttemptHandle, AttemptOutcome, EconomicsState};
+use crate::runtime_store::{AttemptHandle, AttemptOutcome, EconomicsState, RequestAccountingScope};
 use crate::sse::{DecodedSseData, decode_sse_event, find_sse_event_end};
-use crate::state::{ProxyState, RouteDecisionProvenance, SessionIdentitySource};
+use crate::state::{
+    DispatchedRuntimeHealthHalfOpenProbe, ProxyState, RouteDecisionProvenance,
+    SessionIdentitySource,
+};
 
 use super::ProxyService;
 use super::attempt_health::{
-    penalize_attempt_target, record_attempt_failure, record_attempt_success,
+    RecordAndPenalizeAttemptParams, settle_half_open_probe_neutral,
+    settle_or_record_and_penalize_attempt_target, settle_or_record_attempt_failure,
+    settle_or_record_attempt_success,
 };
 use super::classify::{
-    UPSTREAM_OVERLOADED_CLASS, UPSTREAM_RATE_LIMITED_CLASS, classify_observed_upstream_response,
-    is_credential_auth_failure,
+    ProtocolFailureDisposition, UPSTREAM_OVERLOADED_CLASS, UPSTREAM_RATE_LIMITED_CLASS,
+    class_is_health_neutral, classify_observed_upstream_response,
+    classify_protocol_terminal_failure, is_buffered_http_credential_auth_failure,
 };
 use super::codex_failure::CodexFailureSse;
 use super::concurrency_limits::ConcurrencyPermit;
-use super::headers::header_map_to_entries;
-use super::http_debug::{HttpDebugBase, format_reqwest_error_for_retry_chain, warn_http_debug};
+use super::http_debug::{
+    HttpDebugBase, HttpDebugResponseParams, format_reqwest_error_for_retry_chain, warn_http_debug,
+};
 use super::provider_evidence::{ResponseEvidenceParams, response_evidence_from_classification};
 use super::request_body::merge_response_metadata_from_value;
 use super::request_observer::{RequestObserver, RequestPublication, RequestPublicationGate};
+use super::request_preparation::{SharedRouteStateImpact, StreamTerminalPolicy};
 use super::retry::response_penalty_cooldown_secs;
 use super::runtime_config::RuntimeConfig;
 use crate::routing_ir::CapturedRouteCandidate;
@@ -98,7 +106,7 @@ struct StreamErrorInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamErrorHealth {
     Neutral,
-    Penalize,
+    CapabilityPenalty,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -123,9 +131,11 @@ impl StreamProtocolTerminal {
 #[derive(Default)]
 struct StreamUsageState {
     buffer: VecDeque<u8>,
+    response_body_len: usize,
     terminal_publication: RequestPublicationGate,
     stream_error: Option<StreamErrorInfo>,
     protocol_terminal: StreamProtocolTerminal,
+    protocol_failure: Option<ProtocolFailureDisposition>,
     body_complete: bool,
     warned_non_success: bool,
     first_chunk_ms: Option<u64>,
@@ -134,10 +144,16 @@ struct StreamUsageState {
     service_tier: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum StreamHealthUpdate {
     Success,
-    Failure,
-    FailureAndPenalty { cooldown_secs: u64 },
+    Failure {
+        domain: RuntimeHealthDomain,
+    },
+    FailureAndPenalty {
+        domain: RuntimeHealthDomain,
+        cooldown_secs: u64,
+    },
 }
 
 struct StreamTerminalDecision {
@@ -148,6 +164,7 @@ struct StreamTerminalDecisionParams<'a> {
     status_code: u16,
     stream_error: Option<&'a StreamErrorInfo>,
     protocol_terminal: StreamProtocolTerminal,
+    protocol_failure: Option<ProtocolFailureDisposition>,
     resp_headers: &'a HeaderMap,
     response_body: &'a [u8],
     transport_cooldown_secs: u64,
@@ -173,11 +190,13 @@ fn classify_stream_read_error_kind(error: &reqwest::Error) -> &'static str {
 
 fn decide_stream_terminal_response(
     params: StreamTerminalDecisionParams<'_>,
+    route_capability: RouteCapability,
 ) -> StreamTerminalDecision {
     let StreamTerminalDecisionParams {
         status_code,
         stream_error,
         protocol_terminal,
+        protocol_failure,
         resp_headers,
         response_body,
         transport_cooldown_secs,
@@ -188,7 +207,8 @@ fn decide_stream_terminal_response(
     if let Some(stream_error) = stream_error {
         let health_update = match stream_error.health {
             StreamErrorHealth::Neutral => None,
-            StreamErrorHealth::Penalize => Some(StreamHealthUpdate::FailureAndPenalty {
+            StreamErrorHealth::CapabilityPenalty => Some(StreamHealthUpdate::FailureAndPenalty {
+                domain: RuntimeHealthDomain::Capability(route_capability),
                 cooldown_secs: transport_cooldown_secs,
             }),
         };
@@ -196,11 +216,21 @@ fn decide_stream_terminal_response(
     }
 
     if protocol_terminal.is_upstream_failure() {
-        return StreamTerminalDecision {
-            health_update: Some(StreamHealthUpdate::FailureAndPenalty {
-                cooldown_secs: transport_cooldown_secs,
-            }),
-        };
+        let disposition =
+            protocol_failure.unwrap_or_else(ProtocolFailureDisposition::unknown_upstream_failure);
+        let health_update = disposition.health_domain(route_capability).map(|domain| {
+            if disposition.applies_immediate_cooldown() {
+                StreamHealthUpdate::FailureAndPenalty {
+                    domain,
+                    cooldown_secs: disposition
+                        .retry_after_secs
+                        .unwrap_or(transport_cooldown_secs),
+                }
+            } else {
+                StreamHealthUpdate::Failure { domain }
+            }
+        });
+        return StreamTerminalDecision { health_update };
     }
 
     if (200..300).contains(&status_code) && protocol_terminal.is_success() {
@@ -222,6 +252,21 @@ fn decide_stream_terminal_response(
         classify_observed_upstream_response(status_code, resp_headers, response_body);
     let retry_after_secs = classified_response.retry_after_secs();
     let cls = classified_response.class;
+    let auth_failure = StatusCode::from_u16(status_code)
+        .is_ok_and(|status| is_buffered_http_credential_auth_failure(status, cls.as_deref()));
+    if auth_failure {
+        return StreamTerminalDecision {
+            health_update: Some(StreamHealthUpdate::FailureAndPenalty {
+                domain: RuntimeHealthDomain::Credential,
+                cooldown_secs: transport_cooldown_secs,
+            }),
+        };
+    }
+    if class_is_health_neutral(cls.as_deref()) {
+        return StreamTerminalDecision {
+            health_update: None,
+        };
+    }
     let penalty_cooldown_secs = response_penalty_cooldown_secs(
         cloudflare_challenge_cooldown_secs,
         cloudflare_timeout_cooldown_secs,
@@ -229,18 +274,24 @@ fn decide_stream_terminal_response(
         cls.as_deref(),
         retry_after_secs,
     );
-    let health_update = if matches!(
+    let health_update = if matches!(cls.as_deref(), Some(UPSTREAM_OVERLOADED_CLASS)) {
+        Some(StreamHealthUpdate::Failure {
+            domain: RuntimeHealthDomain::Capacity(route_capability),
+        })
+    } else if matches!(
         cls.as_deref(),
         Some("cloudflare_challenge")
             | Some("cloudflare_timeout")
             | Some(UPSTREAM_RATE_LIMITED_CLASS)
-            | Some(UPSTREAM_OVERLOADED_CLASS)
     ) {
         Some(StreamHealthUpdate::FailureAndPenalty {
+            domain: RuntimeHealthDomain::Capability(route_capability),
             cooldown_secs: penalty_cooldown_secs,
         })
     } else if status_code >= 500 || cls.is_some() {
-        Some(StreamHealthUpdate::Failure)
+        Some(StreamHealthUpdate::Failure {
+            domain: RuntimeHealthDomain::Capability(route_capability),
+        })
     } else {
         None
     };
@@ -277,8 +328,6 @@ struct StreamFinalize {
     started_at_ms: u64,
     upstream_start: Instant,
     upstream_headers_ms: u64,
-    request_body_len: usize,
-    upstream_request_body_len: usize,
     provider_id: Option<String>,
     endpoint_id: Option<String>,
     provider_endpoint_key: Option<String>,
@@ -302,9 +351,13 @@ struct StreamFinalize {
     cloudflare_challenge_cooldown_secs: u64,
     cloudflare_timeout_cooldown_secs: u64,
     cooldown_backoff: crate::endpoint_health::CooldownBackoff,
+    route_capability: RouteCapability,
+    shared_route_updates_allowed: bool,
+    terminal_accounting: RequestAccountingScope,
     _concurrency_permit: Option<ConcurrencyPermit>,
     attempt_handle: AttemptHandle,
     route_affinity_success: Option<SessionRouteAffinitySuccess>,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
 }
 
 struct StreamFinalizeWork {
@@ -319,8 +372,11 @@ struct StreamFinalizeWork {
     service_name: String,
     target_for_health: CapturedRouteCandidate,
     cooldown_backoff: crate::endpoint_health::CooldownBackoff,
+    route_capability: RouteCapability,
+    terminal_accounting: RequestAccountingScope,
     route_affinity_success: Option<SessionRouteAffinitySuccess>,
     _concurrency_permit: Option<ConcurrencyPermit>,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
 }
 
 impl StreamFinalize {
@@ -330,7 +386,11 @@ impl StreamFinalize {
         }
     }
 
-    fn mark_protocol_terminal(&self, terminal: StreamProtocolTerminal) {
+    fn mark_protocol_terminal(
+        &self,
+        terminal: StreamProtocolTerminal,
+        protocol_failure: Option<ProtocolFailureDisposition>,
+    ) {
         let Ok(mut guard) = self.usage_state.lock() else {
             return;
         };
@@ -338,66 +398,46 @@ impl StreamFinalize {
             return;
         }
         guard.protocol_terminal = terminal;
-        if terminal.is_upstream_failure() && guard.stream_error.is_none() {
-            guard.stream_error = Some(StreamErrorInfo {
-                class: "upstream_response_error",
-                health: StreamErrorHealth::Penalize,
-            });
-        }
+        guard.protocol_failure =
+            protocol_failure.map(|failure| failure.with_retry_after_headers(&self.resp_headers));
     }
 
     fn build_http_debug(
         &self,
         body: &[u8],
+        response_body_len: usize,
         first_chunk_ms: Option<u64>,
         for_warn: bool,
     ) -> Option<HttpDebugLog> {
-        let b = self.debug_base.as_ref()?;
-        let max = if for_warn {
-            b.warn_max_body_bytes
+        let debug_base = self.debug_base.as_ref()?;
+        let max_body_bytes = if for_warn {
+            debug_base.warn_max_body_bytes
         } else {
-            b.debug_max_body_bytes
+            debug_base.debug_max_body_bytes
         };
-        if max == 0 {
-            return None;
-        }
-        let resp_ct = self
-            .resp_headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok());
-        let (client_body, upstream_request_body) = if for_warn {
-            (
-                b.client_body_warn.clone(),
-                b.upstream_request_body_warn.clone(),
-            )
+        let preview_body = if body.len() > max_body_bytes {
+            &body[body.len() - max_body_bytes..]
         } else {
-            (
-                b.client_body_debug.clone(),
-                b.upstream_request_body_debug.clone(),
-            )
+            body
         };
-        let classified_response =
-            classify_observed_upstream_response(self.status_code, &self.resp_headers, body);
-        Some(HttpDebugLog {
-            request_body_len: Some(self.request_body_len),
-            upstream_request_body_len: Some(self.upstream_request_body_len),
-            upstream_headers_ms: Some(self.upstream_headers_ms),
+        let mut http_debug = debug_base.response_log(HttpDebugResponseParams {
+            status_code: self.status_code,
+            response_headers: &self.resp_headers,
+            response_body: body,
+            response_preview_body: Some(preview_body),
+            upstream_headers_ms: self.upstream_headers_ms,
             upstream_first_chunk_ms: first_chunk_ms,
             upstream_body_read_ms: None,
-            upstream_error_class: classified_response.class,
-            upstream_error_hint: classified_response.hint,
-            upstream_cf_ray: classified_response.cf_ray,
-            client_uri: b.client_uri.clone(),
-            upstream_origin: b.upstream_origin.clone(),
-            client_headers: b.client_headers.clone(),
-            upstream_request_headers: b.upstream_request_headers.clone(),
-            auth_resolution: b.auth_resolution.clone(),
-            client_body,
-            upstream_request_body,
-            upstream_response_headers: Some(header_map_to_entries(&self.resp_headers)),
-            upstream_response_body: Some(make_body_preview(body, resp_ct, max)),
-            upstream_error: None,
-        })
+            for_warn,
+        })?;
+        if response_body_len > preview_body.len()
+            && let Some(preview) = http_debug.upstream_response_body.as_mut()
+        {
+            preview.original_len = response_body_len;
+            preview.truncated = true;
+            preview.window = Some("tail".to_string());
+        }
+        Some(http_debug)
     }
 
     fn take_commit_work(&mut self) -> Option<StreamFinalizeWork> {
@@ -422,21 +462,40 @@ impl StreamFinalize {
         let reported_model = guard.reported_model.clone();
         let stream_error = guard.stream_error.clone();
         let protocol_terminal = guard.protocol_terminal;
+        let protocol_failure = guard.protocol_failure;
         let body_complete = guard.body_complete;
+        let response_body_len = guard.response_body_len;
         let response_body = guard.buffer.iter().copied().collect::<Vec<_>>();
 
         let dur = self.start.elapsed().as_millis() as u64;
-
-        let http_debug_warn = self.build_http_debug(&response_body, guard.first_chunk_ms, true);
-        if should_include_http_warn(self.status_code)
+        let attempt_succeeded = (200..300).contains(&status_code)
+            && stream_error.is_none()
+            && protocol_terminal.is_success();
+        let terminal_status_code = if attempt_succeeded || !(200..300).contains(&status_code) {
+            status_code
+        } else {
+            StatusCode::BAD_GATEWAY.as_u16()
+        };
+        let http_debug_warn = self.build_http_debug(
+            &response_body,
+            response_body_len,
+            guard.first_chunk_ms,
+            true,
+        );
+        if should_include_http_warn(terminal_status_code)
             && !guard.warned_non_success
             && let Some(h) = http_debug_warn.as_ref()
         {
-            warn_http_debug(self.status_code, h);
+            warn_http_debug(terminal_status_code, h);
             guard.warned_non_success = true;
         }
-        let http_debug = if should_include_http_debug(self.status_code) {
-            self.build_http_debug(&response_body, guard.first_chunk_ms, false)
+        let http_debug = if should_include_http_debug(terminal_status_code) {
+            self.build_http_debug(
+                &response_body,
+                response_body_len,
+                guard.first_chunk_ms,
+                false,
+            )
         } else {
             None
         };
@@ -444,22 +503,36 @@ impl StreamFinalize {
         guard.buffer.clear();
         drop(guard);
         let transport_cooldown_secs = self.transport_cooldown_secs;
-        let terminal_decision = decide_stream_terminal_response(StreamTerminalDecisionParams {
-            status_code,
-            stream_error: stream_error.as_ref(),
-            protocol_terminal,
-            resp_headers: &self.resp_headers,
-            response_body: response_body.as_slice(),
-            transport_cooldown_secs,
-            cloudflare_challenge_cooldown_secs: self.cloudflare_challenge_cooldown_secs,
-            cloudflare_timeout_cooldown_secs: self.cloudflare_timeout_cooldown_secs,
-        });
-        let health_update = terminal_decision.health_update;
+        let terminal_decision = decide_stream_terminal_response(
+            StreamTerminalDecisionParams {
+                status_code,
+                stream_error: stream_error.as_ref(),
+                protocol_terminal,
+                protocol_failure,
+                resp_headers: &self.resp_headers,
+                response_body: response_body.as_slice(),
+                transport_cooldown_secs,
+                cloudflare_challenge_cooldown_secs: self.cloudflare_challenge_cooldown_secs,
+                cloudflare_timeout_cooldown_secs: self.cloudflare_timeout_cooldown_secs,
+            },
+            self.route_capability,
+        );
+        let health_update = self
+            .shared_route_updates_allowed
+            .then_some(terminal_decision.health_update)
+            .flatten();
         let classified_response =
             classify_observed_upstream_response(status_code, &self.resp_headers, &response_body);
-        if body_complete
-            && let Ok(status) = StatusCode::from_u16(status_code)
-            && is_credential_auth_failure(status, classified_response.class.as_deref())
+        let http_credential_failure = body_complete
+            && StatusCode::from_u16(status_code).is_ok_and(|status| {
+                is_buffered_http_credential_auth_failure(
+                    status,
+                    classified_response.class.as_deref(),
+                )
+            });
+        if self.shared_route_updates_allowed
+            && (http_credential_failure
+                || protocol_failure.is_some_and(|failure| failure.requires_credential_refresh()))
         {
             self.runtime_config
                 .schedule_credential_refresh(self.target.credential());
@@ -468,9 +541,6 @@ impl StreamFinalize {
             &health_update,
             Some(StreamHealthUpdate::FailureAndPenalty { .. })
         );
-        let attempt_succeeded = (200..300).contains(&status_code)
-            && stream_error.is_none()
-            && protocol_terminal.is_success();
         let provider_evidence = response_evidence_from_classification(ResponseEvidenceParams {
             target: &self.target,
             classified_response: &classified_response,
@@ -479,9 +549,11 @@ impl StreamFinalize {
                 .as_ref()
                 .map(|error| error.class)
                 .or_else(|| {
-                    protocol_terminal
-                        .is_upstream_failure()
-                        .then_some("upstream_response_error")
+                    protocol_failure.map(|failure| failure.class).or_else(|| {
+                        protocol_terminal
+                            .is_upstream_failure()
+                            .then_some("upstream_response_error")
+                    })
                 })
                 .or(classified_response.class.as_deref()),
             route_facing: evidence_route_facing,
@@ -496,11 +568,6 @@ impl StreamFinalize {
             self.method.clone(),
             self.path.clone(),
         );
-        let terminal_status_code = if attempt_succeeded || !(200..300).contains(&status_code) {
-            status_code
-        } else {
-            StatusCode::BAD_GATEWAY.as_u16()
-        };
         let mut publication = RequestPublication::new_terminal(
             request_id,
             terminal_status_code,
@@ -555,8 +622,11 @@ impl StreamFinalize {
             service_name,
             target_for_health,
             cooldown_backoff,
+            route_capability: self.route_capability,
+            terminal_accounting: self.terminal_accounting,
             route_affinity_success,
             _concurrency_permit: self._concurrency_permit.take(),
+            half_open_probe: self.half_open_probe.take(),
         })
     }
 
@@ -582,8 +652,11 @@ impl StreamFinalizeWork {
             service_name,
             target_for_health,
             cooldown_backoff,
+            route_capability,
+            terminal_accounting,
             route_affinity_success,
             _concurrency_permit,
+            mut half_open_probe,
         } = self;
 
         if let Err(error) = state.finish_upstream_attempt(
@@ -602,7 +675,10 @@ impl StreamFinalizeWork {
         if attempt_succeeded {
             publication.route_affinity_success = route_affinity_success;
         }
-        if !observer.publish_terminal_once(publication).await {
+        if !observer
+            .publish_terminal_with_accounting(publication, terminal_accounting)
+            .await
+        {
             tracing::error!(
                 request_id,
                 "failed to commit durable streaming logical terminal"
@@ -611,38 +687,46 @@ impl StreamFinalizeWork {
         }
         match health_update {
             Some(StreamHealthUpdate::Success) => {
-                record_attempt_success(state.as_ref(), service_name.as_str(), &target_for_health)
-                    .await;
-            }
-            Some(StreamHealthUpdate::Failure) => {
-                record_attempt_failure(
+                settle_or_record_attempt_success(
                     state.as_ref(),
                     service_name.as_str(),
                     &target_for_health,
+                    route_capability,
+                    half_open_probe.take(),
+                )
+                .await;
+            }
+            Some(StreamHealthUpdate::Failure { domain }) => {
+                settle_or_record_attempt_failure(
+                    state.as_ref(),
+                    service_name.as_str(),
+                    &target_for_health,
+                    domain,
                     crate::endpoint_health::COOLDOWN_SECS,
                     cooldown_backoff,
+                    half_open_probe.take(),
                 )
                 .await;
             }
-            Some(StreamHealthUpdate::FailureAndPenalty { cooldown_secs }) => {
-                record_attempt_failure(
-                    state.as_ref(),
-                    service_name.as_str(),
-                    &target_for_health,
-                    crate::endpoint_health::COOLDOWN_SECS,
+            Some(StreamHealthUpdate::FailureAndPenalty {
+                domain,
+                cooldown_secs,
+            }) => {
+                settle_or_record_and_penalize_attempt_target(RecordAndPenalizeAttemptParams {
+                    state: state.as_ref(),
+                    service_name: service_name.as_str(),
+                    target: &target_for_health,
+                    domain,
+                    failure_threshold_cooldown_secs: crate::endpoint_health::COOLDOWN_SECS,
+                    penalty_cooldown_secs: cooldown_secs,
                     cooldown_backoff,
-                )
-                .await;
-                penalize_attempt_target(
-                    state.as_ref(),
-                    service_name.as_str(),
-                    &target_for_health,
-                    cooldown_secs,
-                    cooldown_backoff,
-                )
+                    half_open_probe: half_open_probe.take(),
+                })
                 .await;
             }
-            None => {}
+            None => {
+                settle_half_open_probe_neutral(state.as_ref(), half_open_probe.take()).await;
+            }
         }
         true
     }
@@ -665,6 +749,7 @@ enum SseTerminalGateProgress {
         before: Bytes,
         withheld: Bytes,
         terminal: StreamProtocolTerminal,
+        protocol_failure: Option<ProtocolFailureDisposition>,
     },
 }
 
@@ -712,7 +797,7 @@ impl SseTerminalGate {
                 return Err(SseEventTooLarge);
             }
             let terminal = inspect_sse_event(&self.pending[consumed..event_end], &mut observe);
-            if let Some(terminal) = terminal {
+            if let Some((terminal, protocol_failure)) = terminal {
                 if self.pending.len().saturating_sub(consumed) > max_event_bytes {
                     return Err(SseEventTooLarge);
                 }
@@ -723,6 +808,7 @@ impl SseTerminalGate {
                     before: Bytes::from(before),
                     withheld: Bytes::from(withheld),
                     terminal,
+                    protocol_failure,
                 });
             }
 
@@ -735,7 +821,14 @@ impl SseTerminalGate {
         &mut self,
         max_event_bytes: usize,
         mut observe: impl FnMut(&serde_json::Value),
-    ) -> Result<Option<(Bytes, StreamProtocolTerminal)>, SseEventTooLarge> {
+    ) -> Result<
+        Option<(
+            Bytes,
+            StreamProtocolTerminal,
+            Option<ProtocolFailureDisposition>,
+        )>,
+        SseEventTooLarge,
+    > {
         if self.pending.is_empty() {
             return Ok(None);
         }
@@ -743,9 +836,13 @@ impl SseTerminalGate {
             return Err(SseEventTooLarge);
         }
         let terminal = inspect_sse_event(&self.pending, &mut observe);
-        Ok(terminal.map(|terminal| {
+        Ok(terminal.map(|(terminal, protocol_failure)| {
             self.search_pos = 0;
-            (Bytes::from(std::mem::take(&mut self.pending)), terminal)
+            (
+                Bytes::from(std::mem::take(&mut self.pending)),
+                terminal,
+                protocol_failure,
+            )
         }))
     }
 
@@ -758,7 +855,7 @@ impl SseTerminalGate {
 fn inspect_sse_event(
     event: &[u8],
     observe: &mut impl FnMut(&serde_json::Value),
-) -> Option<StreamProtocolTerminal> {
+) -> Option<(StreamProtocolTerminal, Option<ProtocolFailureDisposition>)> {
     let decoded = decode_sse_event(event);
     let event_terminal = decoded
         .event_type
@@ -766,25 +863,40 @@ fn inspect_sse_event(
         .and_then(|event_type| terminal_from_event_type(event_type.as_bytes()));
     let data_terminal = match decoded.data {
         DecodedSseData::Missing | DecodedSseData::Invalid => None,
-        DecodedSseData::Done => Some(StreamProtocolTerminal::Succeeded),
+        DecodedSseData::Done => Some((StreamProtocolTerminal::Succeeded, None)),
         DecodedSseData::Json(value) => {
             let terminal = value
                 .get("type")
                 .and_then(serde_json::Value::as_str)
-                .and_then(|event_type| terminal_from_event_type(event_type.as_bytes()));
+                .and_then(|event_type| terminal_from_event_type(event_type.as_bytes()))
+                .or_else(|| event_terminal.filter(|terminal| terminal.is_upstream_failure()));
             observe(&value);
-            terminal
+            terminal.map(|terminal| {
+                let disposition = terminal
+                    .is_upstream_failure()
+                    .then(|| classify_protocol_terminal_failure(&HeaderMap::new(), &value));
+                (terminal, disposition)
+            })
         }
     };
 
     match (event_terminal, data_terminal) {
         (None, terminal) => terminal,
-        (Some(event), Some(data)) if event == data => Some(event),
-        (Some(_), Some(_)) => Some(StreamProtocolTerminal::UpstreamFailure),
-        (Some(StreamProtocolTerminal::Succeeded), None) => {
-            Some(StreamProtocolTerminal::UpstreamFailure)
-        }
-        (Some(terminal), None) => Some(terminal),
+        (Some(event), Some((data, disposition))) if event == data => Some((event, disposition)),
+        (Some(_), Some(_)) => Some((
+            StreamProtocolTerminal::UpstreamFailure,
+            Some(ProtocolFailureDisposition::unknown_upstream_failure()),
+        )),
+        (Some(StreamProtocolTerminal::Succeeded), None) => Some((
+            StreamProtocolTerminal::UpstreamFailure,
+            Some(ProtocolFailureDisposition::unknown_upstream_failure()),
+        )),
+        (Some(terminal), None) => Some((
+            terminal,
+            terminal
+                .is_upstream_failure()
+                .then(ProtocolFailureDisposition::unknown_upstream_failure),
+        )),
     }
 }
 
@@ -819,7 +931,11 @@ struct StreamForwardState {
     finished: bool,
     sse_terminal_gate: SseTerminalGate,
     non_sse_pending: Vec<u8>,
-    withheld_terminal: Option<(Bytes, StreamProtocolTerminal)>,
+    withheld_terminal: Option<(
+        Bytes,
+        StreamProtocolTerminal,
+        Option<ProtocolFailureDisposition>,
+    )>,
     max_keep: usize,
     max_sse_event_bytes: usize,
 }
@@ -844,8 +960,9 @@ impl StreamForwardState {
                 return None;
             }
 
-            if let Some((withheld, terminal)) = self.withheld_terminal.take() {
-                self.finalize.mark_protocol_terminal(terminal);
+            if let Some((withheld, terminal, protocol_failure)) = self.withheld_terminal.take() {
+                self.finalize
+                    .mark_protocol_terminal(terminal, protocol_failure);
                 if self.finalize.commit_terminal().await {
                     self.terminal_committed = true;
                     return Some((Ok(withheld), self));
@@ -936,8 +1053,9 @@ impl StreamForwardState {
                             before,
                             withheld,
                             terminal,
+                            protocol_failure,
                         }) => {
-                            self.withheld_terminal = Some((withheld, terminal));
+                            self.withheld_terminal = Some((withheld, terminal, protocol_failure));
                             if !before.is_empty() {
                                 return Some((Ok(before), self));
                             }
@@ -963,6 +1081,8 @@ impl StreamForwardState {
                     }
                     self.finalize.mark_body_complete();
                     if !self.gate_success_terminal {
+                        self.finalize
+                            .mark_protocol_terminal(StreamProtocolTerminal::Succeeded, None);
                         if self.finalize.commit_terminal().await {
                             self.finished = true;
                             return None;
@@ -975,6 +1095,7 @@ impl StreamForwardState {
                         self.withheld_terminal = Some((
                             Bytes::from(std::mem::take(&mut self.non_sse_pending)),
                             StreamProtocolTerminal::Succeeded,
+                            None,
                         ));
                         continue;
                     }
@@ -985,8 +1106,8 @@ impl StreamForwardState {
                         .finish(self.max_sse_event_bytes, |value| {
                             merge_stream_sse_value(&usage_state, value)
                         }) {
-                        Ok(Some((withheld, terminal))) => {
-                            self.withheld_terminal = Some((withheld, terminal));
+                        Ok(Some((withheld, terminal, protocol_failure))) => {
+                            self.withheld_terminal = Some((withheld, terminal, protocol_failure));
                             continue;
                         }
                         Err(SseEventTooLarge) => {
@@ -1014,7 +1135,7 @@ impl StreamForwardState {
                         "upstream_stream_error",
                         "missing_terminal",
                         "Upstream SSE stream ended before a terminal event".to_string(),
-                        StreamErrorHealth::Penalize,
+                        StreamErrorHealth::CapabilityPenalty,
                         io::ErrorKind::UnexpectedEof,
                     );
                     if self.finalize.commit_terminal().await {
@@ -1037,12 +1158,17 @@ impl StreamForwardState {
             guard.first_chunk_ms = Some(finalize.upstream_start.elapsed().as_millis() as u64);
         }
 
+        guard.response_body_len = guard.response_body_len.saturating_add(chunk.len());
         append_stream_buffer_tail(&mut guard.buffer, &chunk, self.max_keep);
         if !guard.warned_non_success && !(200..300).contains(&finalize.status_code) {
             let response_body = guard.buffer.iter().copied().collect::<Vec<_>>();
             if should_include_http_warn(finalize.status_code)
-                && let Some(h) =
-                    finalize.build_http_debug(&response_body, guard.first_chunk_ms, true)
+                && let Some(h) = finalize.build_http_debug(
+                    &response_body,
+                    guard.response_body_len,
+                    guard.first_chunk_ms,
+                    true,
+                )
             {
                 warn_http_debug(finalize.status_code, &h);
             } else {
@@ -1070,7 +1196,7 @@ impl StreamForwardState {
             "upstream_stream_error",
             kind,
             message,
-            StreamErrorHealth::Penalize,
+            StreamErrorHealth::CapabilityPenalty,
             io::ErrorKind::Other,
         )
     }
@@ -1084,7 +1210,7 @@ impl StreamForwardState {
             "upstream_stream_idle_timeout",
             "idle_timeout",
             message,
-            StreamErrorHealth::Penalize,
+            StreamErrorHealth::CapabilityPenalty,
             io::ErrorKind::TimedOut,
         )
     }
@@ -1097,21 +1223,22 @@ impl StreamForwardState {
         health: StreamErrorHealth,
         io_kind: io::ErrorKind,
     ) -> Result<Bytes, io::Error> {
-        let (first_chunk_ms, buffered_bytes) =
-            if let Ok(mut guard) = self.finalize.usage_state.lock() {
-                let first_chunk_ms = guard.first_chunk_ms;
-                let buffered_bytes = guard.buffer.len();
-                guard.stream_error = Some(StreamErrorInfo { class, health });
-                if guard.protocol_terminal == StreamProtocolTerminal::Pending {
-                    guard.protocol_terminal = match health {
-                        StreamErrorHealth::Neutral => StreamProtocolTerminal::LogicalFailure,
-                        StreamErrorHealth::Penalize => StreamProtocolTerminal::UpstreamFailure,
-                    };
-                }
-                (first_chunk_ms, buffered_bytes)
-            } else {
-                (None, 0)
-            };
+        let (first_chunk_ms, buffered_bytes) = if let Ok(mut guard) =
+            self.finalize.usage_state.lock()
+        {
+            let first_chunk_ms = guard.first_chunk_ms;
+            let buffered_bytes = guard.buffer.len();
+            guard.stream_error = Some(StreamErrorInfo { class, health });
+            if guard.protocol_terminal == StreamProtocolTerminal::Pending {
+                guard.protocol_terminal = match health {
+                    StreamErrorHealth::Neutral => StreamProtocolTerminal::LogicalFailure,
+                    StreamErrorHealth::CapabilityPenalty => StreamProtocolTerminal::UpstreamFailure,
+                };
+            }
+            (first_chunk_ms, buffered_bytes)
+        } else {
+            (None, 0)
+        };
 
         let trace_id = request_trace_id(
             self.finalize.service_name.as_str(),
@@ -1212,8 +1339,6 @@ pub(super) async fn build_sse_success_response(
         started_at_ms,
         upstream_start,
         upstream_headers_ms,
-        request_body_len,
-        upstream_request_body_len,
         debug_base,
         retry,
         session_id,
@@ -1235,6 +1360,11 @@ pub(super) async fn build_sse_success_response(
         route_decision,
         attempt_handle,
         route_affinity_success,
+        route_capability,
+        shared_route_state_impact,
+        terminal_accounting,
+        stream_terminal_policy,
+        half_open_probe,
     } = meta;
 
     let provider_endpoint_key = target.provider_endpoint_key();
@@ -1268,7 +1398,8 @@ pub(super) async fn build_sse_success_response(
             })
         })
         .unwrap_or(true);
-    let gate_success_terminal = status.is_success();
+    let gate_success_terminal =
+        status.is_success() && stream_terminal_policy == StreamTerminalPolicy::ProtocolEvent;
 
     let finalize = StreamFinalize {
         service_name: service_name.clone(),
@@ -1279,8 +1410,6 @@ pub(super) async fn build_sse_success_response(
         started_at_ms,
         upstream_start,
         upstream_headers_ms,
-        request_body_len,
-        upstream_request_body_len,
         provider_id: provider_id.clone(),
         endpoint_id: endpoint_id.clone(),
         provider_endpoint_key: Some(provider_endpoint_key.clone()),
@@ -1304,15 +1433,25 @@ pub(super) async fn build_sse_success_response(
         cloudflare_challenge_cooldown_secs,
         cloudflare_timeout_cooldown_secs,
         cooldown_backoff,
+        route_capability,
+        shared_route_updates_allowed: shared_route_state_impact.allows_shared_updates(),
+        terminal_accounting,
         _concurrency_permit: concurrency_permit,
         attempt_handle,
         route_affinity_success,
+        half_open_probe,
     };
 
     if is_user_turn && is_codex_service {
         let state = proxy.state.clone();
         let client = proxy.client.clone();
-        super::providers_api::enqueue_provider_balance_probe(client, state, target.clone());
+        let provider_catalog = proxy.config.capture().await.usage_provider_catalog();
+        super::providers_api::enqueue_provider_balance_probe(
+            client,
+            state,
+            target.clone(),
+            provider_catalog,
+        );
     }
 
     let stream_state = StreamForwardState {
@@ -1353,8 +1492,6 @@ pub(super) struct SseSuccessMeta {
     pub(super) started_at_ms: u64,
     pub(super) upstream_start: Instant,
     pub(super) upstream_headers_ms: u64,
-    pub(super) request_body_len: usize,
-    pub(super) upstream_request_body_len: usize,
     pub(super) debug_base: Option<HttpDebugBase>,
     pub(super) retry: Option<RetryInfo>,
     pub(super) session_id: Option<String>,
@@ -1376,6 +1513,11 @@ pub(super) struct SseSuccessMeta {
     pub(super) concurrency_permit: Option<ConcurrencyPermit>,
     pub(super) attempt_handle: AttemptHandle,
     pub(super) route_affinity_success: Option<SessionRouteAffinitySuccess>,
+    pub(super) route_capability: RouteCapability,
+    pub(super) shared_route_state_impact: SharedRouteStateImpact,
+    pub(super) terminal_accounting: RequestAccountingScope,
+    pub(super) stream_terminal_policy: StreamTerminalPolicy,
+    pub(super) half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
 }
 
 #[cfg(test)]
@@ -1404,6 +1546,7 @@ event: response.compl"
             before,
             withheld,
             terminal,
+            ..
         } = drain_sse_before_success_terminal(&mut pending)
         else {
             panic!("completed event should be withheld");
@@ -1423,6 +1566,7 @@ event: response.compl"
             before,
             withheld,
             terminal,
+            ..
         } = drain_sse_before_success_terminal(&mut pending)
         else {
             panic!("done event should be withheld");
@@ -1442,6 +1586,7 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
             before,
             withheld,
             terminal,
+            ..
         } = drain_sse_before_success_terminal(&mut pending)
         else {
             panic!("failed terminal should be withheld");
@@ -1476,6 +1621,7 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
             before,
             withheld,
             terminal,
+            ..
         } = progress
         else {
             panic!("message_stop should be withheld as a successful terminal");
@@ -1598,10 +1744,13 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
                 let progress = gate
                     .push(&event[split..], event.len(), |_| {})
                     .expect("split SSE event");
-                let (withheld, terminal) = match progress {
+                let (withheld, terminal, protocol_failure) = match progress {
                     SseTerminalGateProgress::Terminal {
-                        withheld, terminal, ..
-                    } => (withheld, terminal),
+                        withheld,
+                        terminal,
+                        protocol_failure,
+                        ..
+                    } => (withheld, terminal, protocol_failure),
                     SseTerminalGateProgress::NeedMore => gate
                         .finish(event.len(), |_| {})
                         .expect("EOF event")
@@ -1611,6 +1760,7 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
                     }
                 };
                 assert_eq!(withheld.as_ref(), event, "split {split} for {event:?}");
+                assert!(protocol_failure.is_none());
                 assert_eq!(
                     terminal,
                     StreamProtocolTerminal::Succeeded,
@@ -1630,48 +1780,108 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
             "response.canceled",
         ] {
             let event = format!("event: {event_type}\ndata: {{\"type\":\"{event_type}\"}}\n\n");
-            let terminal =
+            let (terminal, protocol_failure) =
                 inspect_sse_event(event.as_bytes(), &mut |_| {}).expect("logical failure terminal");
             assert_eq!(terminal, StreamProtocolTerminal::LogicalFailure);
+            assert!(protocol_failure.is_none());
 
-            let decision = decide_stream_terminal_response(StreamTerminalDecisionParams {
-                status_code: 200,
-                stream_error: None,
-                protocol_terminal: terminal,
-                resp_headers: &headers,
-                response_body: event.as_bytes(),
-                transport_cooldown_secs: 30,
-                cloudflare_challenge_cooldown_secs: 0,
-                cloudflare_timeout_cooldown_secs: 0,
-            });
+            let decision = decide_stream_terminal_response(
+                StreamTerminalDecisionParams {
+                    status_code: 200,
+                    stream_error: None,
+                    protocol_terminal: terminal,
+                    protocol_failure,
+                    resp_headers: &headers,
+                    response_body: event.as_bytes(),
+                    transport_cooldown_secs: 30,
+                    cloudflare_challenge_cooldown_secs: 0,
+                    cloudflare_timeout_cooldown_secs: 0,
+                },
+                RouteCapability::Inference,
+            );
             assert!(decision.health_update.is_none(), "{event_type}");
         }
     }
 
     #[test]
-    fn upstream_failure_terminals_penalize_endpoint_health() {
+    fn upstream_failure_terminals_use_semantic_health_scope() {
         let headers = HeaderMap::new();
 
-        for event_type in ["response.failed", "error"] {
-            let event = format!("event: {event_type}\ndata: {{\"type\":\"{event_type}\"}}\n\n");
-            let terminal = inspect_sse_event(event.as_bytes(), &mut |_| {})
+        let cases = [
+            (
+                "quota",
+                concat!(
+                    "event: response.failed\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"insufficient_quota\",\"message\":\"quota exhausted\",\"retry_after\":17}}}\n\n"
+                ),
+                Some(StreamHealthUpdate::FailureAndPenalty {
+                    domain: RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                    cooldown_secs: 17,
+                }),
+            ),
+            (
+                "auth",
+                concat!(
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"code\":\"API_KEY_REQUIRED\",\"message\":\"API key is required\"}}\n\n"
+                ),
+                Some(StreamHealthUpdate::FailureAndPenalty {
+                    domain: RuntimeHealthDomain::Credential,
+                    cooldown_secs: 30,
+                }),
+            ),
+            (
+                "invalid request",
+                concat!(
+                    "event: response.failed\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid tool schema\"}}}\n\n"
+                ),
+                None,
+            ),
+            (
+                "server error",
+                concat!(
+                    "event: response.failed\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"internal server error\"}}}\n\n"
+                ),
+                Some(StreamHealthUpdate::FailureAndPenalty {
+                    domain: RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                    cooldown_secs: 30,
+                }),
+            ),
+            (
+                "overload",
+                concat!(
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n"
+                ),
+                Some(StreamHealthUpdate::Failure {
+                    domain: RuntimeHealthDomain::Capacity(RouteCapability::Inference),
+                }),
+            ),
+        ];
+
+        for (label, event, expected_health) in cases {
+            let (terminal, protocol_failure) = inspect_sse_event(event.as_bytes(), &mut |_| {})
                 .expect("upstream failure terminal");
             assert_eq!(terminal, StreamProtocolTerminal::UpstreamFailure);
+            assert!(protocol_failure.is_some(), "{label}");
 
-            let decision = decide_stream_terminal_response(StreamTerminalDecisionParams {
-                status_code: 200,
-                stream_error: None,
-                protocol_terminal: terminal,
-                resp_headers: &headers,
-                response_body: event.as_bytes(),
-                transport_cooldown_secs: 30,
-                cloudflare_challenge_cooldown_secs: 0,
-                cloudflare_timeout_cooldown_secs: 0,
-            });
-            assert!(matches!(
-                decision.health_update,
-                Some(StreamHealthUpdate::FailureAndPenalty { cooldown_secs: 30 })
-            ));
+            let decision = decide_stream_terminal_response(
+                StreamTerminalDecisionParams {
+                    status_code: 200,
+                    stream_error: None,
+                    protocol_terminal: terminal,
+                    protocol_failure,
+                    resp_headers: &headers,
+                    response_body: event.as_bytes(),
+                    transport_cooldown_secs: 30,
+                    cloudflare_challenge_cooldown_secs: 0,
+                    cloudflare_timeout_cooldown_secs: 0,
+                },
+                RouteCapability::Inference,
+            );
+            assert_eq!(decision.health_update, expected_health, "{label}");
         }
     }
 
@@ -1689,7 +1899,10 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
         ] {
             assert_eq!(
                 inspect_sse_event(event.as_bytes(), &mut |_| {}),
-                Some(StreamProtocolTerminal::UpstreamFailure)
+                Some((
+                    StreamProtocolTerminal::UpstreamFailure,
+                    Some(ProtocolFailureDisposition::unknown_upstream_failure()),
+                ))
             );
         }
     }
@@ -1702,42 +1915,53 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
             health: StreamErrorHealth::Neutral,
         };
 
-        let decision = decide_stream_terminal_response(StreamTerminalDecisionParams {
-            status_code: 200,
-            stream_error: Some(&stream_error),
-            protocol_terminal: StreamProtocolTerminal::LogicalFailure,
-            resp_headers: &headers,
-            response_body: b"",
-            transport_cooldown_secs: 30,
-            cloudflare_challenge_cooldown_secs: 0,
-            cloudflare_timeout_cooldown_secs: 0,
-        });
+        let decision = decide_stream_terminal_response(
+            StreamTerminalDecisionParams {
+                status_code: 200,
+                stream_error: Some(&stream_error),
+                protocol_terminal: StreamProtocolTerminal::LogicalFailure,
+                protocol_failure: None,
+                resp_headers: &headers,
+                response_body: b"",
+                transport_cooldown_secs: 30,
+                cloudflare_challenge_cooldown_secs: 0,
+                cloudflare_timeout_cooldown_secs: 0,
+            },
+            RouteCapability::Inference,
+        );
 
         assert!(decision.health_update.is_none());
     }
 
     #[test]
-    fn stream_terminal_failure_penalizes_endpoint() {
+    fn stream_terminal_failure_penalizes_only_the_route_capability() {
         let headers = HeaderMap::new();
         let stream_error = StreamErrorInfo {
             class: "upstream_stream_error",
-            health: StreamErrorHealth::Penalize,
+            health: StreamErrorHealth::CapabilityPenalty,
         };
 
-        let decision = decide_stream_terminal_response(StreamTerminalDecisionParams {
-            status_code: 200,
-            stream_error: Some(&stream_error),
-            protocol_terminal: StreamProtocolTerminal::UpstreamFailure,
-            resp_headers: &headers,
-            response_body: b"",
-            transport_cooldown_secs: 30,
-            cloudflare_challenge_cooldown_secs: 0,
-            cloudflare_timeout_cooldown_secs: 0,
-        });
+        let decision = decide_stream_terminal_response(
+            StreamTerminalDecisionParams {
+                status_code: 200,
+                stream_error: Some(&stream_error),
+                protocol_terminal: StreamProtocolTerminal::UpstreamFailure,
+                protocol_failure: Some(ProtocolFailureDisposition::unknown_upstream_failure()),
+                resp_headers: &headers,
+                response_body: b"",
+                transport_cooldown_secs: 30,
+                cloudflare_challenge_cooldown_secs: 0,
+                cloudflare_timeout_cooldown_secs: 0,
+            },
+            RouteCapability::Inference,
+        );
 
         assert!(matches!(
             decision.health_update,
-            Some(StreamHealthUpdate::FailureAndPenalty { cooldown_secs: 30 })
+            Some(StreamHealthUpdate::FailureAndPenalty {
+                domain: RuntimeHealthDomain::Capability(RouteCapability::Inference),
+                cooldown_secs: 30,
+            })
         ));
     }
 
@@ -1745,16 +1969,20 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
     fn interrupted_stream_does_not_publish_upstream_health() {
         let headers = HeaderMap::new();
 
-        let decision = decide_stream_terminal_response(StreamTerminalDecisionParams {
-            status_code: 200,
-            stream_error: None,
-            protocol_terminal: StreamProtocolTerminal::Pending,
-            resp_headers: &headers,
-            response_body: b"",
-            transport_cooldown_secs: 30,
-            cloudflare_challenge_cooldown_secs: 0,
-            cloudflare_timeout_cooldown_secs: 0,
-        });
+        let decision = decide_stream_terminal_response(
+            StreamTerminalDecisionParams {
+                status_code: 200,
+                stream_error: None,
+                protocol_terminal: StreamProtocolTerminal::Pending,
+                protocol_failure: None,
+                resp_headers: &headers,
+                response_body: b"",
+                transport_cooldown_secs: 30,
+                cloudflare_challenge_cooldown_secs: 0,
+                cloudflare_timeout_cooldown_secs: 0,
+            },
+            RouteCapability::Inference,
+        );
 
         assert!(decision.health_update.is_none());
     }

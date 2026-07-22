@@ -17,12 +17,12 @@ use super::request_body::{
 use super::request_encoding::normalize_request_content_encoding;
 use super::request_failures::{
     ClientBodyReadErrorParams, FailedProxyRequestParams, client_body_read_error,
-    finish_failed_proxy_request,
+    finish_failed_proxy_request_with_accounting,
 };
 use super::request_preparation::{
     CommonRequestPreparationError, CommonRequestPreparationParams, RequestFlavor, RequestOrigin,
     codex_path_is_responses_or_compact, detect_request_flavor, load_request_config_context,
-    prepare_common_request,
+    prepare_http_request,
 };
 use super::response_semantics::ResponseSemanticContract;
 use super::retry::RetryPlan;
@@ -111,6 +111,7 @@ pub(super) async fn prepare_proxy_request(
             }));
         }
     };
+    let client_body = raw_body.clone();
     let (session_identity_hint, raw_body) = if request_flavor.is_codex_service
         && method == Method::POST
         && codex_path_is_responses_or_compact(uri.path())
@@ -124,24 +125,39 @@ pub(super) async fn prepare_proxy_request(
     };
     let request_flavor = request_flavor
         .with_remote_compaction_context_from_body(raw_body.as_ref())
-        .with_responses_stream_from_body(raw_body.as_ref());
+        .with_responses_stream_from_body(raw_body.as_ref())
+        .with_hosted_image_generation(matches!(
+            response_semantic_contract,
+            Some(ResponseSemanticContract::HostedImageGeneration)
+        ));
     let config = load_request_config_context(proxy, session_identity_hint.as_ref()).await;
+    let request_flavor = request_flavor.with_remote_v2_downgrade_enabled(
+        proxy.service_name == "codex"
+            && config
+                .runtime_snapshot
+                .config()
+                .codex
+                .remote_v2_downgrade_enabled(),
+    );
     let request_body_previews = crate::logging::should_log_request_body_preview();
-    let prepared = match prepare_common_request(CommonRequestPreparationParams {
-        proxy,
-        config: &config,
-        method: &method,
-        uri: &uri,
-        client_headers: &client_headers,
-        raw_body: &raw_body,
-        request_dialect: RequestDialect::from_http_path(uri.path()),
-        request_origin,
-        client_name,
-        client_addr,
-        started_at_ms,
-        client_content_type: request_flavor.client_content_type.as_deref(),
-        request_body_previews,
-    })
+    let prepared = match prepare_http_request(
+        CommonRequestPreparationParams {
+            proxy,
+            config: &config,
+            method: &method,
+            uri: &uri,
+            client_headers: &client_headers,
+            raw_body: &raw_body,
+            request_dialect: RequestDialect::from_http_path(uri.path()),
+            request_origin,
+            client_name,
+            client_addr,
+            started_at_ms,
+            client_content_type: request_flavor.client_content_type.as_deref(),
+            request_body_previews,
+        },
+        &client_body,
+    )
     .await
     {
         Ok(prepared) => prepared,
@@ -161,24 +177,28 @@ pub(super) async fn prepare_proxy_request(
             service_tier,
         }) => {
             let dur = start.elapsed().as_millis() as u64;
-            return Err(finish_failed_proxy_request(FailedProxyRequestParams {
-                proxy,
-                method: &method,
-                path: uri.path(),
-                request_id,
-                status: StatusCode::BAD_GATEWAY,
-                message: "no routable provider candidate".to_string(),
-                duration_ms: dur,
-                started_at_ms,
-                session_id: session_id.clone(),
-                session_identity_source,
-                cwd,
-                effective_effort,
-                service_tier,
-                codex_bridge: request_flavor.codex_bridge_log.clone(),
-                retry: None,
-                failure_route_attempts: Vec::new(),
-            })
+            return Err(finish_failed_proxy_request_with_accounting(
+                FailedProxyRequestParams {
+                    proxy,
+                    method: &method,
+                    path: uri.path(),
+                    request_id,
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "no routable provider candidate".to_string(),
+                    duration_ms: dur,
+                    started_at_ms,
+                    session_id: session_id.clone(),
+                    session_identity_source,
+                    cwd,
+                    effective_effort,
+                    service_tier,
+                    codex_bridge: request_flavor.codex_bridge_log.clone(),
+                    retry: None,
+                    http_debug: None,
+                    failure_route_attempts: Vec::new(),
+                },
+                request_flavor.terminal_accounting,
+            )
             .await);
         }
     };

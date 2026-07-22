@@ -15,6 +15,7 @@ use tokio_tungstenite::connect_async;
 
 use crate::auth_resolution::UpstreamAuthResolutionError;
 use crate::credentials::CredentialGenerationMarker;
+use crate::endpoint_health::{CooldownBackoff, RouteCapability, RuntimeHealthDomain};
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http as tungstenite_http;
@@ -28,14 +29,21 @@ use crate::routing_ir::{
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::runtime_store::{AttemptHandle, AttemptOutcome, AttemptRouteEvidence, EconomicsState};
 use crate::state::{
-    AttemptProviderScopeCapture, CapturedUpstreamAttemptContext, ResolvedRouteValue,
-    RouteDecisionProvenance, RouteValueSource, SessionIdentitySource,
+    AttemptProviderScopeCapture, CapturedUpstreamAttemptContext,
+    DispatchedRuntimeHealthHalfOpenProbe, ResolvedRouteValue, RouteDecisionProvenance,
+    RouteValueSource, RuntimeHealthHalfOpenProbeLease, SessionIdentitySource,
 };
 
 use super::attempt_failures::{TerminalUpstreamFailureParams, apply_terminal_upstream_failure};
-use super::attempt_health::record_attempt_success;
+use super::attempt_health::{
+    settle_half_open_probe_neutral, settle_or_penalize_attempt_target,
+    settle_or_record_attempt_failure, settle_or_record_attempt_success,
+};
 use super::attempt_request::inject_auth_headers;
-use super::classify::{classify_observed_upstream_response, is_credential_auth_failure};
+use super::classify::{
+    ProtocolFailureDisposition, classify_dedicated_capability_handshake_failure,
+    classify_observed_upstream_response, classify_protocol_terminal_failure,
+};
 use super::client_identity::extract_session_identity;
 use super::codex_failure::CodexFailureKind;
 use super::concurrency_limits::{
@@ -78,7 +86,7 @@ use super::route_target_selection::{
     apply_routing_operator_control_to_runtime, restrict_route_state_to_affinity_continuity_domain,
     route_graph_request_requires_existing_affinity, route_graph_runtime_for_request,
     runtime_for_acquired_candidate_revalidation, runtime_for_capacity_wait_selection,
-    select_route_graph_candidate,
+    runtime_for_transient_half_open_selection, select_route_graph_candidate,
 };
 use super::runtime_config::{CapturedRoutePlan, RuntimeSnapshot};
 use super::selected_upstream_request::apply_selected_model_mapping;
@@ -142,6 +150,7 @@ struct ResponsesWebSocketHandshakeRoute {
     avoided_indices: Vec<usize>,
     avoided_total: usize,
     total_upstreams: usize,
+    half_open_probe: Option<RuntimeHealthHalfOpenProbeLease>,
 }
 
 struct ResponsesWebSocketUpstream {
@@ -150,6 +159,7 @@ struct ResponsesWebSocketUpstream {
     status_code: u16,
     headers_ms: u64,
     attempt_scope: ResponsesWebSocketAttemptScope,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
     _connection_permit: Option<ConcurrencyPermit>,
 }
 
@@ -165,13 +175,36 @@ type ConcurrencyAdmissionFuture =
 struct PendingResponsesWebSocketCreate {
     prepared: ResponsesWebSocketPrepared,
     admission: ConcurrencyAdmissionFuture,
+    half_open_probe: Option<PendingWebSocketHalfOpenProbe>,
 }
 
 struct ActiveResponsesWebSocketCreate {
     prepared: ResponsesWebSocketPrepared,
     selected: ResponsesWebSocketSelected,
     attempt_handle: AttemptHandle,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
     _concurrency_permit: Option<ConcurrencyPermit>,
+}
+
+enum PendingWebSocketHalfOpenProbe {
+    Lease(RuntimeHealthHalfOpenProbeLease),
+    Dispatched(DispatchedRuntimeHealthHalfOpenProbe),
+}
+
+enum WebSocketRelayTermination {
+    ClientOrDownstream(String),
+    UpstreamTransport(String),
+    Internal(String),
+}
+
+impl WebSocketRelayTermination {
+    fn into_message(self) -> String {
+        match self {
+            Self::ClientOrDownstream(message)
+            | Self::UpstreamTransport(message)
+            | Self::Internal(message) => message,
+        }
+    }
 }
 
 struct PrepareResponsesWebSocketParams {
@@ -224,7 +257,7 @@ pub(super) async fn handle_responses_websocket(
     };
 
     let runtime_snapshot = proxy.config.capture().await;
-    let route =
+    let mut route =
         match prepare_responses_websocket_handshake_route(&proxy, runtime_snapshot, &headers).await
         {
             Ok(route) => route,
@@ -282,29 +315,44 @@ pub(super) async fn handle_responses_websocket(
         }
     };
 
+    let allow_transient_half_open = route.half_open_probe.is_some();
+    let probe_is_current = match route.half_open_probe.as_ref() {
+        Some(probe) => proxy.state.validate_runtime_half_open_probe(probe).await,
+        None => true,
+    };
+    if !probe_is_current
+        || !websocket_handshake_route_is_current(&proxy, &route, allow_transient_half_open).await
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "captured WebSocket endpoint changed before upstream handshake dispatch",
+        )
+            .into_response();
+    }
+    let half_open_probe = match route.half_open_probe.take() {
+        Some(probe) => match proxy.state.dispatch_runtime_half_open_probe(probe).await {
+            Ok(probe) => Some(probe),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "captured WebSocket endpoint half-open probe was invalidated",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
     let upstream_start = Instant::now();
     let (upstream_socket, upstream_response) =
         match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, connect_async(upstream_request)).await {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
-                if let tungstenite::Error::Http(response) = &error {
-                    let classification = classify_observed_upstream_response(
-                        response.status().as_u16(),
-                        response.headers(),
-                        response.body().as_deref().unwrap_or_default(),
-                    );
-                    if is_credential_auth_failure(
-                        response.status(),
-                        classification.class.as_deref(),
-                    ) {
-                        proxy
-                            .config
-                            .schedule_credential_refresh(route.target.credential());
-                    }
-                }
+                finish_websocket_handshake_failure(&proxy, &route, &error, half_open_probe).await;
                 return upstream_ws_handshake_error_response(error);
             }
             Err(_) => {
+                finish_websocket_handshake_capability_failure(&proxy, &route, half_open_probe)
+                    .await;
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
                     "upstream WebSocket handshake timed out",
@@ -334,6 +382,7 @@ pub(super) async fn handle_responses_websocket(
             endpoint: target_url,
             account_fingerprint,
         },
+        half_open_probe,
         _connection_permit: connection_permit,
     };
 
@@ -356,6 +405,174 @@ pub(super) async fn handle_responses_websocket(
         }
     }
     response
+}
+
+async fn websocket_handshake_route_is_current(
+    proxy: &ProxyService,
+    route: &ResponsesWebSocketHandshakeRoute,
+    allow_transient_half_open: bool,
+) -> bool {
+    let Ok(mut runtime) = route_graph_runtime_for_request(
+        proxy,
+        route.route_template.as_ref(),
+        route.routing_control_graph_key.as_str(),
+        route.route_revision,
+        route.runtime_snapshot.provider_policy().as_ref(),
+        Some(RouteCapability::ResponsesWebSocket),
+        None,
+    )
+    .await
+    else {
+        return false;
+    };
+    let provider_endpoint = route.target.provider_endpoint().clone();
+    if allow_transient_half_open {
+        runtime = runtime_for_transient_half_open_selection(
+            route.route_template.as_ref(),
+            &runtime,
+            &HashSet::from([provider_endpoint]),
+        );
+    }
+    let runtime = runtime_for_acquired_candidate_revalidation(
+        route.route_template.as_ref(),
+        &runtime,
+        route.target.candidate(),
+    );
+    runtime
+        .candidate_runtime_snapshot(route.route_template.as_ref(), route.target.candidate())
+        .skip_reasons_for_candidate(route.target.candidate(), None)
+        .is_empty()
+}
+
+fn websocket_handshake_health_policy(
+    route: &ResponsesWebSocketHandshakeRoute,
+) -> (u64, CooldownBackoff) {
+    let retry = route.runtime_snapshot.config().retry.resolve();
+    (
+        retry.transport_cooldown_secs,
+        CooldownBackoff {
+            factor: retry.cooldown_backoff_factor,
+            max_secs: retry.cooldown_backoff_max_secs,
+        },
+    )
+}
+
+async fn finish_websocket_handshake_transport_failure(
+    proxy: &ProxyService,
+    route: &ResponsesWebSocketHandshakeRoute,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
+) {
+    let (cooldown_secs, cooldown_backoff) = websocket_handshake_health_policy(route);
+    settle_or_penalize_attempt_target(
+        proxy.state.as_ref(),
+        proxy.service_name,
+        &route.target,
+        RuntimeHealthDomain::EndpointTransport,
+        cooldown_secs,
+        cooldown_backoff,
+        half_open_probe,
+    )
+    .await;
+}
+
+async fn finish_websocket_handshake_capability_failure(
+    proxy: &ProxyService,
+    route: &ResponsesWebSocketHandshakeRoute,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
+) {
+    let (cooldown_secs, cooldown_backoff) = websocket_handshake_health_policy(route);
+    settle_or_penalize_attempt_target(
+        proxy.state.as_ref(),
+        proxy.service_name,
+        &route.target,
+        RuntimeHealthDomain::Capability(RouteCapability::ResponsesWebSocket),
+        cooldown_secs,
+        cooldown_backoff,
+        half_open_probe,
+    )
+    .await;
+}
+
+async fn finish_websocket_handshake_failure(
+    proxy: &ProxyService,
+    route: &ResponsesWebSocketHandshakeRoute,
+    error: &tungstenite::Error,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
+) {
+    let response = match error {
+        tungstenite::Error::Http(response) => response,
+        tungstenite::Error::Io(_) | tungstenite::Error::Tls(_) => {
+            finish_websocket_handshake_transport_failure(proxy, route, half_open_probe).await;
+            return;
+        }
+        _ => {
+            finish_websocket_handshake_capability_failure(proxy, route, half_open_probe).await;
+            return;
+        }
+    };
+    let body = response.body().as_deref().unwrap_or_default();
+    let classification =
+        classify_observed_upstream_response(response.status().as_u16(), response.headers(), body);
+    let (cooldown_secs, cooldown_backoff) = websocket_handshake_health_policy(route);
+    let disposition = classify_dedicated_capability_handshake_failure(
+        response.headers(),
+        body,
+        classification.class.as_deref(),
+    );
+    if disposition.requires_credential_refresh() {
+        proxy
+            .config
+            .schedule_credential_refresh(route.target.credential());
+    }
+    settle_websocket_protocol_failure_health(
+        proxy,
+        &route.target,
+        disposition,
+        cooldown_secs,
+        cooldown_backoff,
+        half_open_probe,
+    )
+    .await;
+}
+
+async fn settle_websocket_protocol_failure_health(
+    proxy: &ProxyService,
+    target: &CapturedRouteCandidate,
+    disposition: ProtocolFailureDisposition,
+    default_cooldown_secs: u64,
+    cooldown_backoff: CooldownBackoff,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
+) {
+    let Some(health_domain) = disposition.health_domain(RouteCapability::ResponsesWebSocket) else {
+        settle_half_open_probe_neutral(proxy.state.as_ref(), half_open_probe).await;
+        return;
+    };
+    let cooldown_secs = disposition
+        .retry_after_secs
+        .unwrap_or(default_cooldown_secs);
+    if disposition.applies_immediate_cooldown() {
+        settle_or_penalize_attempt_target(
+            proxy.state.as_ref(),
+            proxy.service_name,
+            target,
+            health_domain,
+            cooldown_secs,
+            cooldown_backoff,
+            half_open_probe,
+        )
+        .await;
+    } else {
+        settle_or_record_attempt_failure(
+            proxy.state.as_ref(),
+            proxy.service_name,
+            target,
+            health_domain,
+            cooldown_secs,
+            cooldown_backoff,
+            half_open_probe,
+        )
+        .await;
+    }
 }
 
 async fn serve_responses_websocket(
@@ -473,6 +690,7 @@ async fn prepare_responses_websocket(
                 service_tier,
                 codex_bridge: None,
                 retry: None,
+                http_debug: None,
                 failure_route_attempts: Vec::new(),
             })
             .await;
@@ -538,11 +756,12 @@ async fn prepare_responses_websocket_handshake_route(
     })?;
     let mut runtime = proxy
         .state
-        .route_plan_runtime_state_with_provider_policy(
+        .route_plan_runtime_state_with_provider_policy_for_capability(
             proxy.service_name,
             provider_policy.as_ref(),
             runtime_snapshot.revision(),
             runtime_identities.as_slice(),
+            Some(RouteCapability::ResponsesWebSocket),
         )
         .await;
     apply_auth_resolution_to_runtime(proxy.service_name, &template, &mut runtime).map_err(
@@ -633,6 +852,7 @@ async fn prepare_responses_websocket_handshake_route(
         );
     }
     select_captured_handshake_route(
+        proxy,
         runtime_snapshot,
         template,
         runtime,
@@ -643,6 +863,7 @@ async fn prepare_responses_websocket_handshake_route(
             .as_ref()
             .map(|affinity| &affinity.provider_endpoint),
     )
+    .await
 }
 
 enum HandshakeSelectionHint {
@@ -838,14 +1059,16 @@ fn compatible_websocket_route_with_template(
         avoided_indices: bound.avoided_indices.clone(),
         avoided_total: bound.avoided_total,
         total_upstreams: bound.total_upstreams,
+        half_open_probe: None,
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn select_captured_handshake_route(
+async fn select_captured_handshake_route(
+    proxy: &ProxyService,
     runtime_snapshot: Arc<RuntimeSnapshot>,
     template: RoutePlanTemplate,
-    runtime: RoutePlanRuntimeState,
+    mut runtime: RoutePlanRuntimeState,
     routing_control_graph_key: String,
     route_graph_key: String,
     selection_hint: HandshakeSelectionHint,
@@ -853,7 +1076,7 @@ fn select_captured_handshake_route(
 ) -> Result<ResponsesWebSocketHandshakeRoute, ResponsesWebSocketSelectionFailure> {
     let executor = RoutePlanExecutor::new(&template);
     let mut route_state = RoutePlanAttemptState::default();
-    let selection = if affinity_endpoint.is_some() {
+    let mut selection = if affinity_endpoint.is_some() {
         executor.select_supported_candidate_with_soft_affinity_runtime_state(
             &mut route_state,
             &runtime,
@@ -862,6 +1085,45 @@ fn select_captured_handshake_route(
     } else {
         executor.select_supported_candidate_with_runtime_state(&mut route_state, &runtime, None)
     };
+    let mut half_open_selection = false;
+    if selection.selected.is_none() {
+        let runtime_identities = template.candidate_identities().map_err(|error| {
+            ResponsesWebSocketSelectionFailure::new(
+                StatusCode::BAD_GATEWAY,
+                format!("captured WebSocket credential binding is invalid: {error}"),
+            )
+        })?;
+        let eligible_provider_endpoints = proxy
+            .state
+            .half_open_probe_eligible_provider_endpoints(
+                proxy.service_name,
+                runtime_identities.as_slice(),
+                RouteCapability::ResponsesWebSocket,
+            )
+            .await;
+        if !eligible_provider_endpoints.is_empty() {
+            runtime = runtime_for_transient_half_open_selection(
+                &template,
+                &runtime,
+                &eligible_provider_endpoints,
+            );
+            route_state = RoutePlanAttemptState::default();
+            selection = if affinity_endpoint.is_some() {
+                executor.select_supported_candidate_with_soft_affinity_runtime_state(
+                    &mut route_state,
+                    &runtime,
+                    None,
+                )
+            } else {
+                executor.select_supported_candidate_with_runtime_state(
+                    &mut route_state,
+                    &runtime,
+                    None,
+                )
+            };
+            half_open_selection = selection.selected.is_some();
+        }
+    }
     let selected = selection.selected.ok_or_else(|| {
         let all_candidates_missing_auth = !template.candidates.is_empty()
             && template.candidates.iter().all(|candidate| {
@@ -931,6 +1193,26 @@ fn select_captured_handshake_route(
                 "captured WebSocket route has no matching credential binding",
             )
         })?;
+    let half_open_probe = if half_open_selection {
+        Some(
+            proxy
+                .state
+                .try_acquire_runtime_half_open_probe(
+                    proxy.service_name,
+                    target.runtime_identity(),
+                    RouteCapability::ResponsesWebSocket,
+                )
+                .await
+                .ok_or_else(|| {
+                    ResponsesWebSocketSelectionFailure::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "captured WebSocket endpoint half-open probe is already in flight",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let handshake_credential_generation = runtime_snapshot.credential_generation().marker();
     Ok(ResponsesWebSocketHandshakeRoute {
         route_revision: runtime_snapshot.revision(),
@@ -944,6 +1226,7 @@ fn select_captured_handshake_route(
         avoided_indices: selection.avoided_candidate_indices,
         avoided_total: selection.avoided_total,
         total_upstreams: selection.total_upstreams,
+        half_open_probe,
     })
 }
 
@@ -1085,13 +1368,14 @@ async fn relay_websocket_streams(
         status_code,
         headers_ms: upstream_headers_ms,
         attempt_scope,
+        half_open_probe: mut connection_half_open_probe,
         _connection_permit,
     } = upstream;
     let (mut client_sender, mut client_receiver) = client_socket.split();
     let (mut upstream_sender, mut upstream_receiver) = upstream_socket.split();
     let mut pending: Option<PendingResponsesWebSocketCreate> = None;
     let mut active: Option<ActiveResponsesWebSocketCreate> = None;
-    let close_reason: String;
+    let termination: WebSocketRelayTermination;
 
     loop {
         tokio::select! {
@@ -1103,7 +1387,7 @@ async fn relay_websocket_streams(
                     .as_mut()
                     .await
             }, if pending.is_some() => {
-                let pending_create = pending
+                let mut pending_create = pending
                     .take()
                     .expect("completed admission must have pending request state");
                 let permit = match admission {
@@ -1118,6 +1402,11 @@ async fn relay_websocket_streams(
                             Vec::new(),
                         )
                         .await;
+                        settle_pending_websocket_probe_neutral(
+                            proxy.state.as_ref(),
+                            pending_create.half_open_probe.take(),
+                        )
+                        .await;
                         send_client_ws_error_and_close(
                             &mut client_sender,
                             1013,
@@ -1125,7 +1414,7 @@ async fn relay_websocket_streams(
                             message.as_str(),
                         )
                         .await;
-                        close_reason = message;
+                        termination = WebSocketRelayTermination::Internal(message);
                         break;
                     }
                 };
@@ -1149,6 +1438,11 @@ async fn relay_websocket_streams(
                         Vec::new(),
                     )
                     .await;
+                    settle_pending_websocket_probe_neutral(
+                        proxy.state.as_ref(),
+                        pending_create.half_open_probe.take(),
+                    )
+                    .await;
                     drop(permit);
                     send_client_ws_error_and_close(
                         &mut client_sender,
@@ -1157,15 +1451,17 @@ async fn relay_websocket_streams(
                         message.as_str(),
                     )
                     .await;
-                    close_reason = message;
+                    termination = WebSocketRelayTermination::Internal(message);
                     break;
                 };
                 route = current_route;
-                if !websocket_bound_candidate_is_current(
+                if !ensure_websocket_bound_candidate_is_current(
                     &proxy,
                     &route,
                     &pending_create.prepared,
                     WebSocketCandidateValidationPhase::AfterAdmission,
+                    &mut pending_create.half_open_probe,
+                    None,
                 )
                 .await
                 {
@@ -1178,6 +1474,11 @@ async fn relay_websocket_streams(
                         Vec::new(),
                     )
                     .await;
+                    settle_pending_websocket_probe_neutral(
+                        proxy.state.as_ref(),
+                        pending_create.half_open_probe.take(),
+                    )
+                    .await;
                     drop(permit);
                     send_client_ws_error_and_close(
                         &mut client_sender,
@@ -1186,7 +1487,7 @@ async fn relay_websocket_streams(
                         message.as_str(),
                     )
                     .await;
-                    close_reason = message;
+                    termination = WebSocketRelayTermination::Internal(message);
                     break;
                 }
 
@@ -1223,7 +1524,12 @@ async fn relay_websocket_streams(
                             failure.message.as_str(),
                         )
                         .await;
-                        close_reason = failure.message;
+                        settle_pending_websocket_probe_neutral(
+                            proxy.state.as_ref(),
+                            pending_create.half_open_probe.take(),
+                        )
+                        .await;
+                        termination = WebSocketRelayTermination::Internal(failure.message);
                         break;
                     }
                 };
@@ -1262,7 +1568,45 @@ async fn relay_websocket_streams(
                             message.as_str(),
                         )
                         .await;
-                        close_reason = message;
+                        settle_pending_websocket_probe_neutral(
+                            proxy.state.as_ref(),
+                            pending_create.half_open_probe.take(),
+                        )
+                        .await;
+                        termination = WebSocketRelayTermination::Internal(message);
+                        break;
+                    }
+                };
+
+                let half_open_probe = match dispatch_pending_websocket_probe(
+                    proxy.state.as_ref(),
+                    pending_create.half_open_probe.take(),
+                )
+                .await
+                {
+                    Ok(probe) => probe,
+                    Err(()) => {
+                        let message = "WebSocket half-open probe was invalidated before dispatch"
+                            .to_string();
+                        let _ = finish_websocket_neutral_failure(
+                            &proxy,
+                            &prepared,
+                            selected,
+                            attempt_handle,
+                            "websocket_half_open_invalidated",
+                            message.clone(),
+                            None,
+                        )
+                        .await;
+                        drop(permit);
+                        send_client_ws_error_and_close(
+                            &mut client_sender,
+                            1012,
+                            "websocket_reconnect_required",
+                            message.as_str(),
+                        )
+                        .await;
+                        termination = WebSocketRelayTermination::Internal(message);
                         break;
                     }
                 };
@@ -1281,6 +1625,7 @@ async fn relay_websocket_streams(
                         attempt_handle,
                         "upstream_transport_error",
                         message.clone(),
+                        half_open_probe,
                     )
                     .await;
                     drop(permit);
@@ -1291,7 +1636,7 @@ async fn relay_websocket_streams(
                         message.as_str(),
                     )
                     .await;
-                    close_reason = message;
+                    termination = WebSocketRelayTermination::UpstreamTransport(message);
                     break;
                 }
 
@@ -1299,6 +1644,7 @@ async fn relay_websocket_streams(
                     prepared,
                     selected,
                     attempt_handle,
+                    half_open_probe,
                     _concurrency_permit: permit,
                 });
             }
@@ -1307,7 +1653,9 @@ async fn relay_websocket_streams(
                     Some(Ok(message)) => {
                         if matches!(message, AxumWsMessage::Close(_)) {
                             let _ = upstream_sender.send(axum_to_tungstenite_message(message)).await;
-                            close_reason = "client closed the WebSocket".to_string();
+                            termination = WebSocketRelayTermination::ClientOrDownstream(
+                                "client closed the WebSocket".to_string(),
+                            );
                             break;
                         }
 
@@ -1321,7 +1669,7 @@ async fn relay_websocket_streams(
                                     message.as_str(),
                                 )
                                 .await;
-                                close_reason = message;
+                                termination = WebSocketRelayTermination::ClientOrDownstream(message);
                                 break;
                             }
                         };
@@ -1335,7 +1683,7 @@ async fn relay_websocket_streams(
                                     message.as_str(),
                                 )
                                 .await;
-                                close_reason = message;
+                                termination = WebSocketRelayTermination::ClientOrDownstream(message);
                                 break;
                             }
                             let prepared = match prepare_responses_websocket(
@@ -1359,7 +1707,7 @@ async fn relay_websocket_streams(
                                         message.as_str(),
                                     )
                                     .await;
-                                    close_reason = message;
+                                    termination = WebSocketRelayTermination::ClientOrDownstream(message);
                                     break;
                                 }
                             };
@@ -1387,15 +1735,18 @@ async fn relay_websocket_streams(
                                     message.as_str(),
                                 )
                                 .await;
-                                close_reason = message;
+                                termination = WebSocketRelayTermination::Internal(message);
                                 break;
                             };
                             route = admitted_route;
-                            if !websocket_bound_candidate_is_current(
+                            let mut half_open_probe = None;
+                            if !ensure_websocket_bound_candidate_is_current(
                                 &proxy,
                                 &route,
                                 &prepared,
                                 WebSocketCandidateValidationPhase::BeforeAdmission,
+                                &mut half_open_probe,
+                                Some(&mut connection_half_open_probe),
                             )
                             .await
                             {
@@ -1415,7 +1766,7 @@ async fn relay_websocket_streams(
                                     message.as_str(),
                                 )
                                 .await;
-                                close_reason = message;
+                                termination = WebSocketRelayTermination::Internal(message);
                                 break;
                             }
                             let admission = websocket_concurrency_admission(
@@ -1428,6 +1779,7 @@ async fn relay_websocket_streams(
                             pending = Some(PendingResponsesWebSocketCreate {
                                 prepared,
                                 admission,
+                                half_open_probe,
                             });
                             continue;
                         }
@@ -1437,6 +1789,7 @@ async fn relay_websocket_streams(
                             let PendingResponsesWebSocketCreate {
                                 prepared,
                                 admission,
+                                half_open_probe,
                             } = pending_create;
                             drop(admission);
                             finish_websocket_pre_upstream_failure(
@@ -1448,20 +1801,27 @@ async fn relay_websocket_streams(
                                 Vec::new(),
                             )
                             .await;
+                            settle_pending_websocket_probe_neutral(
+                                proxy.state.as_ref(),
+                                half_open_probe,
+                            )
+                            .await;
                             continue;
                         }
 
                         if let Err(error) = upstream_sender.send(axum_to_tungstenite_message(message)).await {
-                            close_reason = error.to_string();
+                            termination = WebSocketRelayTermination::UpstreamTransport(error.to_string());
                             break;
                         }
                     }
                     Some(Err(error)) => {
-                        close_reason = error.to_string();
+                        termination = WebSocketRelayTermination::ClientOrDownstream(error.to_string());
                         break;
                     }
                     None => {
-                        close_reason = "client WebSocket stream ended".to_string();
+                        termination = WebSocketRelayTermination::ClientOrDownstream(
+                            "client WebSocket stream ended".to_string(),
+                        );
                         break;
                     }
                 }
@@ -1471,7 +1831,9 @@ async fn relay_websocket_streams(
                     Some(Ok(message)) => {
                         if matches!(message, tungstenite::Message::Close(_)) {
                             let _ = client_sender.send(tungstenite_to_axum_message(message)).await;
-                            close_reason = "upstream closed the WebSocket".to_string();
+                            termination = WebSocketRelayTermination::UpstreamTransport(
+                                "upstream closed the WebSocket".to_string(),
+                            );
                             break;
                         }
                         let terminal = websocket_upstream_terminal(&message);
@@ -1488,6 +1850,7 @@ async fn relay_websocket_streams(
                                         status_code,
                                         upstream_headers_ms,
                                         &message,
+                                        active_create.half_open_probe,
                                     )
                                     .await
                                 }
@@ -1499,17 +1862,20 @@ async fn relay_websocket_streams(
                                         active_create.attempt_handle,
                                         upstream_headers_ms,
                                         websocket_message_text(&message),
+                                        active_create.half_open_probe,
                                     )
                                     .await
                                 }
-                                WebSocketTerminal::UpstreamFailure => {
-                                    finish_websocket_failure(
+                                WebSocketTerminal::UpstreamFailure(disposition) => {
+                                    finish_websocket_protocol_failure(
                                         &proxy,
                                         &active_create.prepared,
                                         active_create.selected,
                                         active_create.attempt_handle,
-                                        "upstream_response_error",
+                                        upstream_headers_ms,
+                                        disposition,
                                         websocket_message_text(&message),
+                                        active_create.half_open_probe,
                                     )
                                     .await
                                 }
@@ -1524,21 +1890,23 @@ async fn relay_websocket_streams(
                                     message.as_str(),
                                 )
                                 .await;
-                                close_reason = message;
+                                termination = WebSocketRelayTermination::Internal(message);
                                 break;
                             }
                         }
                         if let Err(error) = client_sender.send(tungstenite_to_axum_message(message)).await {
-                            close_reason = error.to_string();
+                            termination = WebSocketRelayTermination::ClientOrDownstream(error.to_string());
                             break;
                         }
                     }
                     Some(Err(error)) => {
-                        close_reason = error.to_string();
+                        termination = WebSocketRelayTermination::UpstreamTransport(error.to_string());
                         break;
                     }
                     None => {
-                        close_reason = "upstream WebSocket stream ended".to_string();
+                        termination = WebSocketRelayTermination::UpstreamTransport(
+                            "upstream WebSocket stream ended".to_string(),
+                        );
                         break;
                     }
                 }
@@ -1546,7 +1914,12 @@ async fn relay_websocket_streams(
         }
     }
 
-    if let Some(pending_create) = pending.take() {
+    let upstream_transport = matches!(
+        &termination,
+        WebSocketRelayTermination::UpstreamTransport(_)
+    );
+    let close_reason = termination.into_message();
+    if let Some(mut pending_create) = pending.take() {
         finish_websocket_pre_upstream_failure(
             &proxy,
             &pending_create.prepared,
@@ -1555,17 +1928,63 @@ async fn relay_websocket_streams(
             Vec::new(),
         )
         .await;
+        if upstream_transport {
+            finish_pending_websocket_probe_capability_failure(
+                &proxy,
+                &route.target,
+                &pending_create.prepared,
+                pending_create.half_open_probe.take(),
+            )
+            .await;
+        } else {
+            settle_pending_websocket_probe_neutral(
+                proxy.state.as_ref(),
+                pending_create.half_open_probe.take(),
+            )
+            .await;
+        }
     }
     if let Some(active_create) = active.take() {
-        let _ = finish_websocket_failure(
-            &proxy,
-            &active_create.prepared,
-            active_create.selected,
-            active_create.attempt_handle,
-            CodexFailureKind::StreamError.helper_error(),
-            close_reason,
-        )
-        .await;
+        if upstream_transport {
+            let _ = finish_websocket_failure(
+                &proxy,
+                &active_create.prepared,
+                active_create.selected,
+                active_create.attempt_handle,
+                CodexFailureKind::StreamError.helper_error(),
+                close_reason.clone(),
+                active_create.half_open_probe,
+            )
+            .await;
+        } else {
+            let _ = finish_websocket_neutral_failure(
+                &proxy,
+                &active_create.prepared,
+                active_create.selected,
+                active_create.attempt_handle,
+                CodexFailureKind::StreamError.helper_error(),
+                close_reason.clone(),
+                active_create.half_open_probe,
+            )
+            .await;
+        }
+    }
+    if let Some(half_open_probe) = connection_half_open_probe.take() {
+        if upstream_transport {
+            let (cooldown_secs, cooldown_backoff) = websocket_handshake_health_policy(&route);
+            settle_or_penalize_attempt_target(
+                proxy.state.as_ref(),
+                proxy.service_name,
+                &route.target,
+                RuntimeHealthDomain::Capability(RouteCapability::ResponsesWebSocket),
+                cooldown_secs,
+                cooldown_backoff,
+                Some(half_open_probe),
+            )
+            .await;
+        } else {
+            settle_half_open_probe_neutral(proxy.state.as_ref(), Some(half_open_probe)).await;
+        }
     }
 }
 
@@ -1588,11 +2007,137 @@ fn websocket_concurrency_admission(
     })
 }
 
+async fn ensure_websocket_bound_candidate_is_current(
+    proxy: &ProxyService,
+    route: &ResponsesWebSocketHandshakeRoute,
+    prepared: &ResponsesWebSocketPrepared,
+    phase: WebSocketCandidateValidationPhase,
+    pending_probe: &mut Option<PendingWebSocketHalfOpenProbe>,
+    mut connection_probe: Option<&mut Option<DispatchedRuntimeHealthHalfOpenProbe>>,
+) -> bool {
+    if let Some(probe) = pending_probe.as_ref() {
+        if pending_websocket_probe_is_current(proxy.state.as_ref(), probe).await
+            && websocket_bound_candidate_is_current(proxy, route, prepared, phase, true).await
+        {
+            return true;
+        }
+        settle_pending_websocket_probe_neutral(proxy.state.as_ref(), pending_probe.take()).await;
+    }
+
+    if websocket_bound_candidate_is_current(proxy, route, prepared, phase, false).await {
+        if let Some(connection_probe) = connection_probe.as_mut() {
+            settle_half_open_probe_neutral(proxy.state.as_ref(), connection_probe.take()).await;
+        }
+        return true;
+    }
+
+    if let Some(connection_probe) = connection_probe.as_mut()
+        && let Some(probe) = connection_probe.take()
+    {
+        let candidate_probe = PendingWebSocketHalfOpenProbe::Dispatched(probe);
+        if pending_websocket_probe_is_current(proxy.state.as_ref(), &candidate_probe).await
+            && websocket_bound_candidate_is_current(proxy, route, prepared, phase, true).await
+        {
+            *pending_probe = Some(candidate_probe);
+            return true;
+        }
+        settle_pending_websocket_probe_neutral(proxy.state.as_ref(), Some(candidate_probe)).await;
+    }
+
+    let Some(probe) = proxy
+        .state
+        .try_acquire_runtime_half_open_probe(
+            proxy.service_name,
+            route.target.runtime_identity(),
+            RouteCapability::ResponsesWebSocket,
+        )
+        .await
+    else {
+        return false;
+    };
+    let candidate_probe = PendingWebSocketHalfOpenProbe::Lease(probe);
+    if pending_websocket_probe_is_current(proxy.state.as_ref(), &candidate_probe).await
+        && websocket_bound_candidate_is_current(proxy, route, prepared, phase, true).await
+    {
+        *pending_probe = Some(candidate_probe);
+        return true;
+    }
+    drop(candidate_probe);
+    false
+}
+
+async fn pending_websocket_probe_is_current(
+    state: &crate::state::ProxyState,
+    probe: &PendingWebSocketHalfOpenProbe,
+) -> bool {
+    match probe {
+        PendingWebSocketHalfOpenProbe::Lease(probe) => {
+            state.validate_runtime_half_open_probe(probe).await
+        }
+        PendingWebSocketHalfOpenProbe::Dispatched(probe) => {
+            state
+                .validate_dispatched_runtime_half_open_probe(probe)
+                .await
+        }
+    }
+}
+
+async fn dispatch_pending_websocket_probe(
+    state: &crate::state::ProxyState,
+    probe: Option<PendingWebSocketHalfOpenProbe>,
+) -> Result<Option<DispatchedRuntimeHealthHalfOpenProbe>, ()> {
+    match probe {
+        None => Ok(None),
+        Some(PendingWebSocketHalfOpenProbe::Lease(probe)) => state
+            .dispatch_runtime_half_open_probe(probe)
+            .await
+            .map(Some)
+            .map_err(|_| ()),
+        Some(PendingWebSocketHalfOpenProbe::Dispatched(probe)) => state
+            .validate_dispatched_runtime_half_open_probe(&probe)
+            .await
+            .then_some(Some(probe))
+            .ok_or(()),
+    }
+}
+
+async fn settle_pending_websocket_probe_neutral(
+    state: &crate::state::ProxyState,
+    probe: Option<PendingWebSocketHalfOpenProbe>,
+) {
+    if let Some(PendingWebSocketHalfOpenProbe::Dispatched(probe)) = probe {
+        settle_half_open_probe_neutral(state, Some(probe)).await;
+    }
+}
+
+async fn finish_pending_websocket_probe_capability_failure(
+    proxy: &ProxyService,
+    target: &CapturedRouteCandidate,
+    prepared: &ResponsesWebSocketPrepared,
+    probe: Option<PendingWebSocketHalfOpenProbe>,
+) {
+    let half_open_probe = match probe {
+        Some(PendingWebSocketHalfOpenProbe::Dispatched(probe)) => Some(probe),
+        Some(PendingWebSocketHalfOpenProbe::Lease(_)) | None => None,
+    };
+    settle_or_penalize_attempt_target(
+        proxy.state.as_ref(),
+        proxy.service_name,
+        target,
+        RuntimeHealthDomain::Capability(RouteCapability::ResponsesWebSocket),
+        prepared.plan.transport_cooldown_secs,
+        prepared.cooldown_backoff,
+        half_open_probe,
+    )
+    .await;
+}
+
 async fn websocket_bound_candidate_is_current(
     proxy: &ProxyService,
     route: &ResponsesWebSocketHandshakeRoute,
     prepared: &ResponsesWebSocketPrepared,
     phase: WebSocketCandidateValidationPhase,
+    allow_transient_half_open: bool,
 ) -> bool {
     let reservation_guard =
         if route.route_template.affinity_policy != crate::config::RouteAffinityPolicy::Off {
@@ -1606,6 +2151,7 @@ async fn websocket_bound_candidate_is_current(
         route.routing_control_graph_key.as_str(),
         route.route_revision,
         route.runtime_snapshot.provider_policy().as_ref(),
+        Some(RouteCapability::ResponsesWebSocket),
         prepared.session_id.as_deref(),
     )
     .await
@@ -1657,7 +2203,7 @@ async fn websocket_bound_candidate_is_current(
         &runtime,
     );
     let executor = RoutePlanExecutor::new(route.route_template.as_ref());
-    let selection_runtime = match phase {
+    let mut selection_runtime = match phase {
         WebSocketCandidateValidationPhase::BeforeAdmission => {
             runtime_for_capacity_wait_selection(route.route_template.as_ref(), &runtime)
         }
@@ -1669,15 +2215,29 @@ async fn websocket_bound_candidate_is_current(
             )
         }
     };
+    if allow_transient_half_open {
+        selection_runtime = runtime_for_transient_half_open_selection(
+            route.route_template.as_ref(),
+            &selection_runtime,
+            &HashSet::from([provider_endpoint.clone()]),
+        );
+    }
     if matches!(
         route.binding_source,
         WebSocketHandshakeBindingSource::Explicit | WebSocketHandshakeBindingSource::Singleton
     ) {
-        let validation_runtime = runtime_for_acquired_candidate_revalidation(
+        let mut validation_runtime = runtime_for_acquired_candidate_revalidation(
             route.route_template.as_ref(),
             &runtime,
             route.target.candidate(),
         );
+        if allow_transient_half_open {
+            validation_runtime = runtime_for_transient_half_open_selection(
+                route.route_template.as_ref(),
+                &validation_runtime,
+                &HashSet::from([provider_endpoint.clone()]),
+            );
+        }
         let candidate = validation_runtime
             .candidate_runtime_snapshot(route.route_template.as_ref(), route.target.candidate());
         if !candidate
@@ -1696,11 +2256,18 @@ async fn websocket_bound_candidate_is_current(
             continuity,
         );
         let Some(selected) = selection.selected else {
-            let validation_runtime = runtime_for_acquired_candidate_revalidation(
+            let mut validation_runtime = runtime_for_acquired_candidate_revalidation(
                 route.route_template.as_ref(),
                 &runtime,
                 route.target.candidate(),
             );
+            if allow_transient_half_open {
+                validation_runtime = runtime_for_transient_half_open_selection(
+                    route.route_template.as_ref(),
+                    &validation_runtime,
+                    &HashSet::from([provider_endpoint.clone()]),
+                );
+            }
             let candidate = validation_runtime.candidate_runtime_snapshot(
                 route.route_template.as_ref(),
                 route.target.candidate(),
@@ -1744,11 +2311,18 @@ async fn websocket_bound_candidate_is_current(
         }
     }
     drop(reservation_guard);
-    let validation_runtime = runtime_for_acquired_candidate_revalidation(
+    let mut validation_runtime = runtime_for_acquired_candidate_revalidation(
         route.route_template.as_ref(),
         &runtime,
         route.target.candidate(),
     );
+    if allow_transient_half_open {
+        validation_runtime = runtime_for_transient_half_open_selection(
+            route.route_template.as_ref(),
+            &validation_runtime,
+            &HashSet::from([provider_endpoint]),
+        );
+    }
     let candidate = validation_runtime
         .candidate_runtime_snapshot(route.route_template.as_ref(), route.target.candidate());
     candidate
@@ -1762,6 +2336,7 @@ enum WebSocketCandidateValidationPhase {
     AfterAdmission,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_websocket_success(
     proxy: &ProxyService,
     prepared: &ResponsesWebSocketPrepared,
@@ -1770,6 +2345,7 @@ async fn finish_websocket_success(
     status_code: u16,
     upstream_headers_ms: u64,
     terminal_message: &tungstenite::Message,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
 ) -> bool {
     let duration_ms = prepared.start.elapsed().as_millis() as u64;
     record_status_route_attempt(
@@ -1804,6 +2380,7 @@ async fn finish_websocket_success(
             remote_compaction_v2_request: prepared
                 .request_continuity
                 .is_remote_compaction_v2_request,
+            downgraded_to_responses_compact: false,
             responses_websocket_request: true,
             strips_client_auth: false,
         });
@@ -1855,6 +2432,14 @@ async fn finish_websocket_success(
             error = %error,
             "failed to commit durable WebSocket attempt success"
         );
+        settle_or_record_attempt_success(
+            proxy.state.as_ref(),
+            proxy.service_name,
+            &selected.target,
+            RouteCapability::ResponsesWebSocket,
+            half_open_probe,
+        )
+        .await;
         return false;
     }
     let published = if prepared.is_warmup {
@@ -1865,10 +2450,25 @@ async fn finish_websocket_success(
         observer.publish_terminal_once(publication).await
     };
     if !published {
+        settle_or_record_attempt_success(
+            proxy.state.as_ref(),
+            proxy.service_name,
+            &selected.target,
+            RouteCapability::ResponsesWebSocket,
+            half_open_probe,
+        )
+        .await;
         return false;
     }
 
-    record_attempt_success(proxy.state.as_ref(), proxy.service_name, &selected.target).await;
+    settle_or_record_attempt_success(
+        proxy.state.as_ref(),
+        proxy.service_name,
+        &selected.target,
+        RouteCapability::ResponsesWebSocket,
+        half_open_probe,
+    )
+    .await;
     true
 }
 
@@ -1896,6 +2496,7 @@ async fn finish_websocket_pre_upstream_failure(
         service_tier: prepared.base_service_tier.clone(),
         codex_bridge: None,
         retry,
+        http_debug: None,
         failure_route_attempts: route_attempts,
     };
     if prepared.is_warmup {
@@ -1905,11 +2506,11 @@ async fn finish_websocket_pre_upstream_failure(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WebSocketTerminal {
     Completed,
     LogicalFailure,
-    UpstreamFailure,
+    UpstreamFailure(ProtocolFailureDisposition),
 }
 
 fn websocket_client_event_type(message: &AxumWsMessage) -> Result<Option<String>, String> {
@@ -1936,7 +2537,9 @@ fn websocket_upstream_terminal(message: &tungstenite::Message) -> Option<WebSock
         Some("response.incomplete" | "response.cancelled" | "response.canceled") => {
             Some(WebSocketTerminal::LogicalFailure)
         }
-        Some("response.failed" | "error") => Some(WebSocketTerminal::UpstreamFailure),
+        Some("response.failed" | "error") => Some(WebSocketTerminal::UpstreamFailure(
+            classify_protocol_terminal_failure(&HeaderMap::new(), &value),
+        )),
         _ => None,
     }
 }
@@ -2009,6 +2612,7 @@ async fn finish_websocket_failure(
     attempt_handle: AttemptHandle,
     error_class: &'static str,
     message: String,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
 ) -> bool {
     record_error_route_attempt(
         &mut selected.route_attempts,
@@ -2023,11 +2627,14 @@ async fn finish_websocket_failure(
         },
     );
     let target = selected.target.clone();
-    if !commit_websocket_failed_terminal(proxy, prepared, selected, attempt_handle, message.clone())
-        .await
-    {
-        return false;
-    }
+    let published = commit_websocket_failed_terminal(
+        proxy,
+        prepared,
+        selected,
+        attempt_handle,
+        message.clone(),
+    )
+    .await;
     let cooldown_secs = prepared.plan.transport_cooldown_secs;
     let cooldown_backoff = prepared.cooldown_backoff;
     let mut avoid_set = HashSet::new();
@@ -2036,16 +2643,101 @@ async fn finish_websocket_failure(
     apply_terminal_upstream_failure(TerminalUpstreamFailureParams {
         proxy,
         target: &target,
-        penalize_endpoint: true,
+        health_domain: Some(RuntimeHealthDomain::Capability(
+            RouteCapability::ResponsesWebSocket,
+        )),
         cooldown_secs,
         cooldown_backoff,
         error_message: message,
+        half_open_probe,
         avoid_set: &mut avoid_set,
         avoided_total: &mut avoided_total,
         last_err: &mut last_err,
     })
     .await;
-    true
+    published
+}
+
+async fn finish_websocket_neutral_failure(
+    proxy: &ProxyService,
+    prepared: &ResponsesWebSocketPrepared,
+    mut selected: ResponsesWebSocketSelected,
+    attempt_handle: AttemptHandle,
+    _error_class: &'static str,
+    message: String,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
+) -> bool {
+    record_error_route_attempt(
+        &mut selected.route_attempts,
+        ErrorRouteAttemptParams {
+            target: &selected.target,
+            route_attempt_index: selected.route_attempt_index,
+            kind: RouteAttemptErrorKind::Transport,
+            model_note: selected.model_note.as_str(),
+            duration_ms: Some(prepared.start.elapsed().as_millis() as u64),
+            cooldown_secs: None,
+            cooldown_reason: None,
+        },
+    );
+    let published =
+        commit_websocket_failed_terminal(proxy, prepared, selected, attempt_handle, message).await;
+    settle_half_open_probe_neutral(proxy.state.as_ref(), half_open_probe).await;
+    published
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_websocket_protocol_failure(
+    proxy: &ProxyService,
+    prepared: &ResponsesWebSocketPrepared,
+    mut selected: ResponsesWebSocketSelected,
+    attempt_handle: AttemptHandle,
+    upstream_headers_ms: u64,
+    disposition: ProtocolFailureDisposition,
+    message: String,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
+) -> bool {
+    let cooldown_secs = disposition
+        .retry_after_secs
+        .unwrap_or(prepared.plan.transport_cooldown_secs);
+    record_status_route_attempt(
+        &mut selected.route_attempts,
+        StatusRouteAttemptParams {
+            target: &selected.target,
+            route_attempt_index: selected.route_attempt_index,
+            status_code: StatusCode::BAD_GATEWAY.as_u16(),
+            error_class: Some(disposition.class),
+            model_note: selected.model_note.as_str(),
+            upstream_headers_ms,
+            duration_ms: prepared.start.elapsed().as_millis() as u64,
+            cooldown_secs: disposition
+                .applies_immediate_cooldown()
+                .then_some(cooldown_secs),
+            cooldown_reason: disposition
+                .applies_immediate_cooldown()
+                .then_some(disposition.class),
+            provider_signals: Vec::new(),
+            policy_actions: Vec::new(),
+        },
+    );
+    let target = selected.target.clone();
+    let published =
+        commit_websocket_failed_terminal(proxy, prepared, selected, attempt_handle, message).await;
+
+    if disposition.requires_credential_refresh() {
+        proxy
+            .config
+            .schedule_credential_refresh(target.credential());
+    }
+    settle_websocket_protocol_failure_health(
+        proxy,
+        &target,
+        disposition,
+        prepared.plan.transport_cooldown_secs,
+        prepared.cooldown_backoff,
+        half_open_probe,
+    )
+    .await;
+    published
 }
 
 async fn finish_websocket_logical_failure(
@@ -2055,6 +2747,7 @@ async fn finish_websocket_logical_failure(
     attempt_handle: AttemptHandle,
     upstream_headers_ms: u64,
     message: String,
+    half_open_probe: Option<DispatchedRuntimeHealthHalfOpenProbe>,
 ) -> bool {
     record_status_route_attempt(
         &mut selected.route_attempts,
@@ -2072,7 +2765,10 @@ async fn finish_websocket_logical_failure(
             policy_actions: Vec::new(),
         },
     );
-    commit_websocket_failed_terminal(proxy, prepared, selected, attempt_handle, message).await
+    let published =
+        commit_websocket_failed_terminal(proxy, prepared, selected, attempt_handle, message).await;
+    settle_half_open_probe_neutral(proxy.state.as_ref(), half_open_probe).await;
+    published
 }
 
 async fn commit_websocket_failed_terminal(
@@ -2112,6 +2808,7 @@ async fn commit_websocket_failed_terminal(
         service_tier: prepared.base_service_tier.clone(),
         codex_bridge: None,
         retry,
+        http_debug: None,
         failure_route_attempts: selected.route_attempts,
     };
     let (_, _, published) = if prepared.is_warmup {
@@ -2418,6 +3115,152 @@ mod tests {
                 HeaderValue::from_static("session=secret"),
             ),
         ])
+    }
+
+    #[test]
+    fn websocket_protocol_failures_use_semantic_health_scope() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": "insufficient_quota",
+                            "message": "quota exhausted",
+                            "retry_after": 23
+                        }
+                    }
+                }),
+                crate::endpoint_health::RuntimeHealthDomain::Capability(
+                    RouteCapability::ResponsesWebSocket,
+                ),
+                true,
+                false,
+                Some(23),
+            ),
+            (
+                serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "code": "API_KEY_REQUIRED",
+                        "message": "API key is required"
+                    }
+                }),
+                crate::endpoint_health::RuntimeHealthDomain::Credential,
+                true,
+                true,
+                None,
+            ),
+            (
+                serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "overloaded_error",
+                        "message": "overloaded"
+                    }
+                }),
+                crate::endpoint_health::RuntimeHealthDomain::Capacity(
+                    RouteCapability::ResponsesWebSocket,
+                ),
+                false,
+                false,
+                None,
+            ),
+            (
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "type": "server_error",
+                            "message": "internal server error"
+                        }
+                    }
+                }),
+                crate::endpoint_health::RuntimeHealthDomain::Capability(
+                    RouteCapability::ResponsesWebSocket,
+                ),
+                true,
+                false,
+                None,
+            ),
+        ];
+
+        for (value, domain, immediate_cooldown, refresh, retry_after_secs) in cases {
+            let message = tungstenite::Message::Text(value.to_string().into());
+            let Some(WebSocketTerminal::UpstreamFailure(disposition)) =
+                websocket_upstream_terminal(&message)
+            else {
+                panic!("expected typed WebSocket protocol failure");
+            };
+            assert_eq!(
+                disposition.health_domain(RouteCapability::ResponsesWebSocket),
+                Some(domain)
+            );
+            assert_eq!(disposition.applies_immediate_cooldown(), immediate_cooldown);
+            assert_eq!(disposition.requires_credential_refresh(), refresh);
+            assert_eq!(disposition.retry_after_secs, retry_after_secs);
+        }
+    }
+
+    #[test]
+    fn websocket_handshake_throttle_statuses_keep_protocol_health_scope() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
+
+        for (status, expected_domain, immediate) in [
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                RuntimeHealthDomain::Capability(RouteCapability::ResponsesWebSocket),
+                true,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                RuntimeHealthDomain::Capacity(RouteCapability::ResponsesWebSocket),
+                false,
+            ),
+        ] {
+            let observed = classify_observed_upstream_response(status.as_u16(), &headers, b"");
+            let disposition = classify_dedicated_capability_handshake_failure(
+                &headers,
+                b"",
+                observed.class.as_deref(),
+            );
+            assert_eq!(
+                disposition.health_domain(RouteCapability::ResponsesWebSocket),
+                Some(expected_domain),
+                "{status}"
+            );
+            assert_eq!(
+                disposition.applies_immediate_cooldown(),
+                immediate,
+                "{status}"
+            );
+            assert_eq!(disposition.retry_after_secs, Some(7), "{status}");
+        }
+    }
+
+    #[test]
+    fn websocket_invalid_request_failure_is_health_neutral() {
+        let value = serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "invalid tool schema"
+                }
+            }
+        });
+        let message = tungstenite::Message::Text(value.to_string().into());
+        let Some(WebSocketTerminal::UpstreamFailure(disposition)) =
+            websocket_upstream_terminal(&message)
+        else {
+            panic!("expected typed WebSocket protocol failure");
+        };
+        assert_eq!(
+            disposition.health_domain(RouteCapability::ResponsesWebSocket),
+            None
+        );
+        assert!(!disposition.applies_immediate_cooldown());
     }
 
     #[test]

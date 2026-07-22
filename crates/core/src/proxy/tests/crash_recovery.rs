@@ -499,7 +499,7 @@ async fn direct_phase_snapshot(
         .expect("rehydrate direct crash state");
     assert!(state.list_active_requests().await.is_empty());
     let recent = state.list_recent_finished(10).await;
-    let sessions = state.list_session_stats().await;
+    let sessions = state.list_session_stats("codex").await;
     let usage = state.get_usage_rollup_view("codex", 12, 0).await;
     if phase == DirectCrashPhase::LogicalTerminal {
         assert_eq!(recent.len(), 1, "phase={phase:?}");
@@ -649,7 +649,7 @@ async fn policy_phase_snapshot(
         .expect("rehydrate policy crash state");
     assert_eq!(*state.capture_provider_policy_snapshot().await, policy);
     assert!(state.list_recent_finished(10).await.is_empty());
-    assert!(state.list_session_stats().await.is_empty());
+    assert!(state.list_session_stats("codex").await.is_empty());
     drop(state);
 
     PolicyPhaseSnapshot {
@@ -1133,7 +1133,7 @@ async fn crash_gate_during_attempt_recovers_without_success_projection() {
     let recovered_state = ProxyState::new_with_runtime_store(Arc::clone(&recovered_store))
         .expect("rehydrate state after during-attempt crash");
     assert!(recovered_state.list_recent_finished(10).await.is_empty());
-    assert!(recovered_state.list_session_stats().await.is_empty());
+    assert!(recovered_state.list_session_stats("codex").await.is_empty());
     let usage = recovered_state.get_usage_rollup_view("codex", 12, 0).await;
     assert_eq!(usage.loaded.requests_total, 0);
     assert_eq!(usage.loaded.usage.total_tokens, 0);

@@ -7,7 +7,7 @@ use crate::cli_types::{ProviderAuthKind, ProviderCommand};
 use crate::config::{
     CURRENT_CONFIG_VERSION, CredentialRef, ProviderConfig, ProviderEndpointConfig, ServiceKind,
     ServiceRouteConfig, UpstreamAuth,
-    storage::{load_config, mutate_helper_config, save_helper_config},
+    storage::{load_config, mutate_helper_config},
 };
 use crate::{CliError, CliResult};
 use serde::Serialize;
@@ -131,16 +131,19 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
             let parsed_model_mapping = parse_cli_string_map(&model_mapping, "model-map")
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            let (mut cfg, service, label) = load_helper_config(codex, claude, "provider")
+            let requested_service = requested_service(codex, claude)?;
+            load_helper_config(codex, claude, "provider")
                 .await
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            {
-                let (view, _) = select_service_route_config_mut(&mut cfg, service);
+            let provider_name = name.clone();
+            let (_, service) = mutate_helper_config(move |config| {
+                let service = select_requested_service(config, requested_service);
+                let (view, _) = select_service_route_config_mut(config, service);
                 if view.providers.contains_key(name.as_str()) && !replace {
-                    return Err(CliError::Configuration(format!(
+                    anyhow::bail!(
                         "provider '{}' already exists; pass --replace to overwrite it",
                         name
-                    )));
+                    );
                 }
                 view.providers.insert(
                     name.clone(),
@@ -167,36 +170,39 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
                 if disabled {
                     clear_manual_target_for_provider(view, name.as_str());
                 }
-            }
-
-            save_helper_config(&cfg)
-                .await
-                .map_err(|e| CliError::Configuration(e.to_string()))?;
-            println!("Added {label} provider '{}'", name);
+                Ok(service)
+            })
+            .await
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let label = service_label(service);
+            println!("Added {label} provider '{}'", provider_name);
         }
         ProviderCommand::Enable {
             name,
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_helper_config(codex, claude, "provider")
+            let requested_service = requested_service(codex, claude)?;
+            load_helper_config(codex, claude, "provider")
                 .await
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            {
-                let (view, _) = select_service_route_config_mut(&mut cfg, service);
-                let Some(provider) = view.providers.get_mut(name.as_str()) else {
-                    return Err(CliError::Configuration(format!(
-                        "provider '{}' not found in source config",
-                        name
-                    )));
-                };
+            let provider_name = name.clone();
+            let (_, service) = mutate_helper_config(move |config| {
+                let service = select_requested_service(config, requested_service);
+                let (view, _) = select_service_route_config_mut(config, service);
+                let provider = view
+                    .providers
+                    .get_mut(provider_name.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("provider '{}' not found in source config", provider_name)
+                    })?;
                 provider.enabled = true;
-                ensure_routing_order_contains(view, name.as_str());
-            }
-
-            save_helper_config(&cfg)
-                .await
-                .map_err(|e| CliError::Configuration(e.to_string()))?;
+                ensure_routing_order_contains(view, provider_name.as_str());
+                Ok(service)
+            })
+            .await
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let label = service_label(service);
             println!("Enabled {label} provider '{}'", name);
         }
         ProviderCommand::Disable {
@@ -204,28 +210,28 @@ pub async fn handle_provider_cmd(cmd: ProviderCommand) -> CliResult<()> {
             codex,
             claude,
         } => {
-            let (mut cfg, service, label) = load_helper_config(codex, claude, "provider")
+            let requested_service = requested_service(codex, claude)?;
+            load_helper_config(codex, claude, "provider")
                 .await
                 .map_err(|e| CliError::Configuration(e.to_string()))?;
-            let mut cleared_target = false;
-            {
-                let (view, _) = select_service_route_config_mut(&mut cfg, service);
-                let Some(provider) = view.providers.get_mut(name.as_str()) else {
-                    return Err(CliError::Configuration(format!(
-                        "provider '{}' not found in source config",
-                        name
-                    )));
-                };
+            let provider_name = name.clone();
+            let (_, (service, cleared_target)) = mutate_helper_config(move |config| {
+                let service = select_requested_service(config, requested_service);
+                let (view, _) = select_service_route_config_mut(config, service);
+                let provider = view
+                    .providers
+                    .get_mut(provider_name.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("provider '{}' not found in source config", provider_name)
+                    })?;
                 provider.enabled = false;
 
-                if clear_manual_target_for_provider(view, name.as_str()) {
-                    cleared_target = true;
-                }
-            }
-
-            save_helper_config(&cfg)
-                .await
-                .map_err(|e| CliError::Configuration(e.to_string()))?;
+                let cleared_target = clear_manual_target_for_provider(view, provider_name.as_str());
+                Ok((service, cleared_target))
+            })
+            .await
+            .map_err(|e| CliError::Configuration(e.to_string()))?;
+            let label = service_label(service);
             if cleared_target {
                 println!(
                     "Disabled {label} provider '{}' and cleared manual routing target",

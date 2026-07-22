@@ -347,6 +347,219 @@ fn locked_config_mutation_reads_latest_source_and_aborts_without_writing() {
 }
 
 #[test]
+fn locked_config_mutation_preserves_comments_formatting_and_unknown_fields() {
+    let _env = setup_temp_codex_home();
+    let path = super::config_file_path();
+    let source = r#"# personal operator notes
+version = 6 # keep schema note
+
+[notify]
+enabled = true # keep notify note
+
+[ui] # keep ui heading
+# language rationale
+language    = "en" # keep language note
+
+[future_extension]
+mode = "keep-me"
+"#;
+    write_file(&path, source);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(super::mutate_helper_config(|current| {
+        current.ui.language = Some("zh".to_string());
+        Ok(())
+    }))
+    .expect("mutate language without normalizing the whole document");
+
+    let updated = std::fs::read_to_string(&path).expect("read format-preserved config");
+    for preserved in [
+        "# personal operator notes",
+        "version = 6 # keep schema note",
+        "enabled = true # keep notify note",
+        "[ui] # keep ui heading",
+        "# language rationale",
+        "# keep language note",
+        "[future_extension]",
+        "mode = \"keep-me\"",
+    ] {
+        assert!(
+            updated.contains(preserved),
+            "missing preserved fragment {preserved:?} in:\n{updated}"
+        );
+    }
+    assert!(updated.contains("language    = \"zh\" # keep language note"));
+    assert_eq!(
+        std::fs::read_to_string(path.with_file_name("config.toml.bak"))
+            .expect("read exact pre-mutation backup"),
+        source
+    );
+}
+
+#[test]
+fn locked_config_mutation_auto_migrates_v5_without_losing_source_format() {
+    let _env = setup_temp_codex_home();
+    let path = super::config_file_path();
+    let backup_path = path.with_file_name("config.toml.bak");
+    let source = r#"# personal migration notes
+version = 5 # keep schema note
+
+[notify] # keep notify heading
+enabled = true # keep notify note
+
+[relay_targets.local] # keep local target heading
+proxy_url = "http://127.0.0.1:3211"
+client_preset = "official-relay"
+responses_websocket = true
+future_target = { mode = "keep" } # keep extension
+"#;
+    write_file(&path, source);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(super::mutate_helper_config(|current| {
+        current.ui.language = Some("zh".to_string());
+        Ok(())
+    }))
+    .expect("migrate and mutate v5 config under one lock");
+
+    let updated = std::fs::read_to_string(&path).expect("read migrated config");
+    for preserved in [
+        "# personal migration notes",
+        "version = 6 # keep schema note",
+        "[notify] # keep notify heading",
+        "enabled = true # keep notify note",
+        "[relay_targets.local] # keep local target heading",
+        "future_target = { mode = \"keep\" } # keep extension",
+    ] {
+        assert!(
+            updated.contains(preserved),
+            "missing preserved fragment {preserved:?} in:\n{updated}"
+        );
+    }
+    assert!(!updated.contains("client_preset"));
+    assert!(!updated.contains("responses_websocket = true\nfuture_target"));
+    assert!(updated.contains("[relay_targets.local.client_patch]"));
+    assert!(updated.contains("preset = \"official-relay\""));
+    assert!(updated.contains("responses_websocket = true"));
+    assert!(updated.contains("language = \"zh\""));
+    assert_eq!(
+        std::fs::read_to_string(&backup_path).expect("read exact v5 backup"),
+        source,
+        "the first mutation after migration must retain the exact pre-migration source"
+    );
+
+    let config = rt
+        .block_on(super::load_config())
+        .expect("load migrated and mutated config");
+    assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+    assert_eq!(config.ui.language.as_deref(), Some("zh"));
+    let local_patch = config
+        .relay_targets
+        .get("local")
+        .and_then(|target| target.client_patch.as_ref())
+        .expect("migrated local relay client patch");
+    assert_eq!(local_patch.preset, Some(CodexClientPreset::OfficialRelay));
+    assert_eq!(local_patch.responses_websocket, Some(true));
+}
+
+#[test]
+fn locked_config_noop_mutation_does_not_write_or_rotate_backup() {
+    let _env = setup_temp_codex_home();
+    let path = super::config_file_path();
+    let backup_path = path.with_file_name("config.toml.bak");
+    let source = "# keep exact bytes\nversion = 6\n";
+    write_file(&path, source);
+    write_file(&backup_path, "existing backup sentinel\n");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(super::mutate_helper_config(|_| Ok(())))
+        .expect("no-op mutation");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read unchanged config"),
+        source
+    );
+    assert_eq!(
+        std::fs::read_to_string(&backup_path).expect("read unchanged backup"),
+        "existing backup sentinel\n"
+    );
+}
+
+#[test]
+fn locked_config_mutation_preserves_inline_table_shape_and_unknown_siblings() {
+    let _env = setup_temp_codex_home();
+    let path = super::config_file_path();
+    let source = r#"version = 6
+
+[codex]
+providers = { inline = { enabled = true, base_url = "https://inline.example/v1", allow_anonymous = true, future_mode = "keep" } } # keep inline provider
+"#;
+    write_file(&path, source);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(super::mutate_helper_config(|current| {
+        current
+            .codex
+            .providers
+            .get_mut("inline")
+            .expect("inline provider")
+            .enabled = false;
+        Ok(())
+    }))
+    .expect("mutate inline provider without replacing its table");
+
+    let updated = std::fs::read_to_string(&path).expect("read inline-preserved config");
+    assert!(updated.contains("enabled = false"));
+    assert!(updated.contains("future_mode = \"keep\""));
+    assert!(updated.contains("} # keep inline provider"));
+    assert!(updated.contains("providers = { inline = {"));
+}
+
+#[test]
+fn locked_config_mutation_preserves_array_of_tables_comments_and_unknown_siblings() {
+    let _env = setup_temp_codex_home();
+    let path = super::config_file_path();
+    let source = r#"version = 6
+
+[ui.service_status]
+enabled = true
+
+[[ui.service_status.probes]] # keep probe heading
+id = "primary"
+url = "https://status.example/health"
+future_probe_field = "keep" # keep probe extension
+"#;
+    write_file(&path, source);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(super::mutate_helper_config(|current| {
+        current.ui.service_status.probes[0].timeout_ms = Some(1_250);
+        Ok(())
+    }))
+    .expect("mutate one probe without replacing its array-of-tables entry");
+
+    let updated = std::fs::read_to_string(&path).expect("read probe-preserved config");
+    assert!(updated.contains("[[ui.service_status.probes]] # keep probe heading"));
+    assert!(updated.contains("future_probe_field = \"keep\" # keep probe extension"));
+    assert!(updated.contains("timeout_ms = 1250"));
+}
+
+#[test]
 fn config_mutations_fail_before_overwrite_when_backup_cannot_be_written() {
     let _env = setup_temp_codex_home();
     let rt = tokio::runtime::Builder::new_current_thread()

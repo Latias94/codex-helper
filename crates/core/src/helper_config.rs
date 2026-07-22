@@ -192,6 +192,19 @@ pub fn validate_helper_config(source: &HelperConfig) -> Result<()> {
     if source.claude.client_patch.is_some() {
         anyhow::bail!("claude.client_patch is invalid; client_patch is a Codex-only contract");
     }
+    if source.claude.compaction.is_some() {
+        anyhow::bail!("claude.compaction is invalid; compaction is a Codex-only contract");
+    }
+    for (target_name, target) in &source.relay_targets {
+        if target.client_patch.is_none() {
+            continue;
+        }
+        if target.service == Some(ServiceKind::Claude) {
+            anyhow::bail!(
+                "relay_targets.{target_name}.client_patch is invalid; client_patch is a Codex-only contract"
+            );
+        }
+    }
     validate_service_config("codex", &source.codex)?;
     validate_service_config("claude", &source.claude)
 }

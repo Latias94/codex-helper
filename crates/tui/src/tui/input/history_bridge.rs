@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use crate::dashboard_core::OperatorRequestSummary;
 use crate::sessions::{SessionSummary, SessionSummarySource};
-use crate::tui::model::{SessionRow, Snapshot, format_age, now_ms};
+use crate::tui::model::{
+    SessionRow, Snapshot, dashboard_request_filtered_indices, format_age, now_ms,
+};
 use crate::tui::state::{CodexHistoryExternalFocusOrigin, RecentCodexRow, UiState};
 use crate::tui::types::{Focus, Page};
 
@@ -19,34 +21,20 @@ pub(super) fn selected_dashboard_request<'a>(
     snapshot: &'a Snapshot,
     ui: &UiState,
 ) -> Option<&'a OperatorRequestSummary> {
-    let selected_sid = snapshot
-        .rows
-        .get(ui.selected_session_idx)
-        .and_then(|row| row.session_id.as_deref());
-
-    snapshot
-        .recent
-        .iter()
-        .filter(
-            |request| match (selected_sid, request.session_key.as_deref()) {
-                (Some(sid), Some(request_sid)) => sid == request_sid,
-                (Some(_), None) => false,
-                (None, _) => true,
-            },
-        )
-        .take(60)
-        .nth(ui.selected_request_idx)
+    dashboard_request_filtered_indices(snapshot, ui.selected_session_idx)
+        .get(ui.selected_request_idx)
+        .and_then(|request_idx| snapshot.recent.get(*request_idx))
 }
 
-pub(super) fn local_session_id_for_opaque_key<'a>(
-    snapshot: &'a Snapshot,
+pub(super) fn local_session_context_for_opaque_key(
+    snapshot: &Snapshot,
     opaque_session_key: &str,
-) -> Option<&'a str> {
+) -> Option<(String, Option<String>)> {
     snapshot
         .rows
         .iter()
         .find(|row| row.session_id.as_deref() == Some(opaque_session_key))
-        .and_then(SessionRow::local_command_session_id)
+        .and_then(|row| Some((row.local_command_session_id()?.to_string(), row.cwd.clone())))
 }
 
 pub(super) fn selected_recent_row(ui: &UiState) -> Option<RecentCodexRow> {
@@ -177,6 +165,7 @@ pub(super) fn recent_history_summary_from_row(
 pub(super) fn request_history_summary_from_request(
     request: &OperatorRequestSummary,
     local_session_id: &str,
+    cwd: Option<String>,
     path: Option<PathBuf>,
 ) -> SessionSummary {
     let updated_at = Some(format_age(now_ms(), Some(request.ended_at_ms)));
@@ -188,7 +177,7 @@ pub(super) fn request_history_summary_from_request(
     SessionSummary {
         id: local_session_id.to_string(),
         path: path.unwrap_or_default(),
-        cwd: None,
+        cwd,
         created_at: None,
         updated_at: updated_at.clone(),
         last_response_at: updated_at,
@@ -210,4 +199,42 @@ pub(super) fn prepare_select_history_from_external(
     ui.focus = Focus::Sessions;
     ui.prepare_codex_history_external_focus(summary, origin);
     ui.needs_codex_history_refresh = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_history_summary_keeps_captured_session_cwd() {
+        let request: OperatorRequestSummary = serde_json::from_value(serde_json::json!({
+            "id": 7,
+            "observability": {
+                "attempt_count": 1,
+                "route_attempt_count": 0,
+                "retried": false,
+                "cross_provider_failover": false,
+                "same_provider_retry": false,
+                "fast_mode": false,
+                "streaming": true
+            },
+            "service": "codex",
+            "method": "POST",
+            "path": "/v1/responses",
+            "status_code": 200,
+            "duration_ms": 12,
+            "streaming": true,
+            "ended_at_ms": 1
+        }))
+        .expect("request fixture");
+
+        let summary = request_history_summary_from_request(
+            &request,
+            "raw-session-id",
+            Some("/work/project".to_string()),
+            None,
+        );
+
+        assert_eq!(summary.cwd.as_deref(), Some("/work/project"));
+    }
 }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
@@ -10,7 +10,8 @@ use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
 use crate::config::{RetryStrategy, RouteAffinityPolicy};
 use crate::endpoint_health::CooldownBackoff;
 use crate::logging::{
-    BodyPreview, HeaderEntry, RouteAttemptLog, ServiceTierLog, log_control_trace_event,
+    BodyPreview, HeaderEntry, HttpDebugLog, RouteAttemptLog, ServiceTierLog,
+    log_control_trace_event,
 };
 use crate::routing_ir::{
     RoutePlanAttemptState, RoutePlanExecutor, RoutePlanRuntimeState, RoutePlanSkipReason,
@@ -18,7 +19,7 @@ use crate::routing_ir::{
 };
 use crate::runtime_identity::ProviderEndpointKey;
 use crate::runtime_store::ProviderPolicySnapshot;
-use crate::state::{SessionBinding, SessionIdentitySource};
+use crate::state::{RuntimeHealthHalfOpenProbeLease, SessionBinding, SessionIdentitySource};
 
 use super::ProxyService;
 use super::attempt_execution::{
@@ -42,7 +43,7 @@ use super::route_target_selection::{
     restrict_route_state_to_affinity_continuity_domain,
     route_graph_request_requires_existing_affinity, route_graph_runtime_for_request,
     runtime_for_acquired_candidate_revalidation, runtime_for_capacity_wait_selection,
-    select_route_graph_candidate,
+    runtime_for_transient_half_open_selection, select_route_graph_candidate,
 };
 use super::route_unavailability::route_unavailable_report;
 use super::runtime_config::CapturedRoutePlan;
@@ -138,12 +139,13 @@ pub(super) struct ExecuteProviderChainParams<'a> {
 
 pub(super) enum ProviderExecutionOutcome {
     Return(Response<Body>),
-    Exhausted(ProviderExecutionState),
+    Exhausted(Box<ProviderExecutionState>),
 }
 
 pub(super) struct ProviderExecutionState {
     pub(super) route_attempts: Vec<RouteAttemptLog>,
     pub(super) last_err: Option<(StatusCode, String)>,
+    pub(super) last_http_debug: Option<HttpDebugLog>,
 }
 
 #[derive(Clone, Copy)]
@@ -191,8 +193,10 @@ struct SelectedAttemptExecutionParams<'a> {
     avoid_set: &'a mut HashSet<usize>,
     avoided_total: &'a mut usize,
     last_err: &'a mut Option<(StatusCode, String)>,
+    last_http_debug: &'a mut Option<HttpDebugLog>,
     route_attempts: &'a mut Vec<RouteAttemptLog>,
     concurrency_permit: Option<ConcurrencyPermit>,
+    half_open_probe: Option<RuntimeHealthHalfOpenProbeLease>,
 }
 
 impl<'a> ProviderExecutionContext<'a> {
@@ -247,6 +251,24 @@ impl<'a> ProviderExecutionContext<'a> {
     where
         'a: 'attempt,
     {
+        let mut half_open_upstream_opt = self.upstream_opt().clone();
+        let mut half_open_provider_opt = self.provider_opt().clone();
+        let is_half_open_probe = params.half_open_probe.is_some();
+        if is_half_open_probe {
+            half_open_upstream_opt.max_attempts = 1;
+            half_open_provider_opt.max_attempts = 1;
+        }
+        let upstream_opt = if is_half_open_probe {
+            &half_open_upstream_opt
+        } else {
+            self.upstream_opt()
+        };
+        let provider_opt = if is_half_open_probe {
+            &half_open_provider_opt
+        } else {
+            self.provider_opt()
+        };
+
         execute_selected_upstream(ExecuteSelectedUpstreamParams {
             proxy: self.proxy,
             target: params.target,
@@ -280,9 +302,9 @@ impl<'a> ProviderExecutionContext<'a> {
             client_body_warn: self.client_body_warn,
             plan: self.plan,
             route_graph_key: params.route_graph_key,
-            upstream_opt: self.upstream_opt(),
-            provider_opt: self.provider_opt(),
-            allow_provider_failover: params.allow_provider_failover,
+            upstream_opt,
+            provider_opt,
+            allow_provider_failover: params.allow_provider_failover && !is_half_open_probe,
             provider_attempt: params.provider_attempt,
             total_upstreams: params.total_upstreams,
             cooldown_backoff: self.cooldown_backoff,
@@ -290,8 +312,10 @@ impl<'a> ProviderExecutionContext<'a> {
             avoid_set: params.avoid_set,
             avoided_total: params.avoided_total,
             last_err: params.last_err,
+            last_http_debug: params.last_http_debug,
             route_attempts: params.route_attempts,
             concurrency_permit: params.concurrency_permit,
+            half_open_probe: params.half_open_probe,
         })
         .await
     }
@@ -365,6 +389,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
         routing_control_graph_key,
         route_plan.runtime_revision(),
         route_plan.provider_policy(),
+        ctx.request_flavor.transient_health_capability(),
         route_state_session_id,
     )
     .await
@@ -377,13 +402,14 @@ pub(super) async fn execute_provider_chain_with_route_executor(
                 error = %error,
                 "captured runtime credential binding is invalid"
             );
-            return ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
+            return ProviderExecutionOutcome::Exhausted(Box::new(ProviderExecutionState {
                 route_attempts: Vec::new(),
                 last_err: Some((
                     StatusCode::SERVICE_UNAVAILABLE,
                     "configured upstream credentials are unavailable".to_string(),
                 )),
-            });
+                last_http_debug: None,
+            }));
         }
     };
     let mut route_state = RoutePlanAttemptState::default();
@@ -392,6 +418,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
     let mut route_attempts: Vec<RouteAttemptLog> = Vec::new();
     let mut global_attempt: u32 = 0;
     let mut last_err: Option<(StatusCode, String)> = None;
+    let mut last_http_debug: Option<HttpDebugLog> = None;
 
     if route_graph_request_requires_existing_affinity(
         provider_chain_policy.continuity,
@@ -408,10 +435,11 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             provider_chain_policy.continuity,
             None,
         );
-        return ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
+        return ProviderExecutionOutcome::Exhausted(Box::new(ProviderExecutionState {
             route_attempts,
             last_err,
-        });
+            last_http_debug,
+        }));
     }
     restrict_route_state_to_affinity_continuity_domain(
         provider_chain_policy.continuity,
@@ -437,6 +465,7 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             route_state: &mut route_state,
             global_attempt: &mut global_attempt,
             last_err: &mut last_err,
+            last_http_debug: &mut last_http_debug,
             route_attempts: &mut route_attempts,
             policy: provider_chain_policy,
         },
@@ -446,10 +475,11 @@ pub(super) async fn execute_provider_chain_with_route_executor(
         return ProviderExecutionOutcome::Return(response);
     }
 
-    ProviderExecutionOutcome::Exhausted(ProviderExecutionState {
+    ProviderExecutionOutcome::Exhausted(Box::new(ProviderExecutionState {
         route_attempts,
         last_err,
-    })
+        last_http_debug,
+    }))
 }
 
 struct ExecuteRouteGraphExecutorParams<'a, 'route> {
@@ -466,6 +496,7 @@ struct ExecuteRouteGraphExecutorParams<'a, 'route> {
     route_state: &'a mut RoutePlanAttemptState,
     global_attempt: &'a mut u32,
     last_err: &'a mut Option<(StatusCode, String)>,
+    last_http_debug: &'a mut Option<HttpDebugLog>,
     route_attempts: &'a mut Vec<RouteAttemptLog>,
     policy: ProviderChainAttemptPolicy,
 }
@@ -495,6 +526,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
             route_state,
             global_attempt,
             last_err,
+            last_http_debug,
             route_attempts,
             policy,
         } = params;
@@ -555,7 +587,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
             }
             let selection_runtime =
                 runtime_for_capacity_wait_selection(executor.template(), runtime);
-            let selection = select_route_graph_candidate(
+            let mut selection = select_route_graph_candidate(
                 executor,
                 route_state,
                 &selection_runtime,
@@ -570,6 +602,83 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 provider_attempt,
                 ctx.plan.route.max_attempts,
             );
+
+            let compact_short_cooldown_wait_secs = if selection.selected.is_none()
+                && ctx.request_flavor.is_remote_compaction_request()
+                && !compact_route_unavailable_waited
+                && route_graph_key.is_some()
+            {
+                route_unavailable_report(
+                    ctx.proxy.service_name,
+                    ctx.request_id,
+                    executor,
+                    &*runtime,
+                    route_state,
+                    ctx.request_model,
+                )
+                .and_then(|report| {
+                    report.short_cooldown_wait_secs(COMPACT_ROUTE_UNAVAILABLE_WAIT_MAX_SECS)
+                })
+            } else {
+                None
+            };
+
+            let mut half_open_probe = None;
+            if selection.selected.is_none()
+                && compact_short_cooldown_wait_secs.is_none()
+                && shared_route_updates_allowed
+                && !ctx.request_flavor.is_remote_compaction_v2_request
+                && let Some(capability) = ctx.request_flavor.transient_health_capability()
+                && let Ok(identities) = executor.template().candidate_identities()
+            {
+                let eligible_provider_endpoints = ctx
+                    .proxy
+                    .state
+                    .half_open_probe_eligible_provider_endpoints(
+                        ctx.proxy.service_name,
+                        identities.as_slice(),
+                        capability,
+                    )
+                    .await;
+                if !eligible_provider_endpoints.is_empty() {
+                    let half_open_runtime = runtime_for_transient_half_open_selection(
+                        executor.template(),
+                        &selection_runtime,
+                        &eligible_provider_endpoints,
+                    );
+                    let mut half_open_route_state = route_state.clone();
+                    let half_open_selection = select_route_graph_candidate(
+                        executor,
+                        &mut half_open_route_state,
+                        &half_open_runtime,
+                        ctx.request_model,
+                        ctx.request_flavor.is_remote_compaction_request(),
+                        policy.continuity,
+                    );
+                    if let Some(selected) = half_open_selection.selected.as_ref()
+                        && let Ok(identity) =
+                            executor.template().candidate_identity(selected.candidate)
+                        && let Some(probe) = ctx
+                            .proxy
+                            .state
+                            .try_acquire_runtime_half_open_probe(
+                                ctx.proxy.service_name,
+                                &identity,
+                                capability,
+                            )
+                            .await
+                    {
+                        log_control_trace_event(serde_json::json!({
+                            "event": "route_transient_half_open_acquired",
+                            "service": ctx.proxy.service_name,
+                            "request_id": ctx.request_id,
+                            "provider_endpoint_key": selected.provider_endpoint.stable_key(),
+                        }));
+                        selection = half_open_selection;
+                        half_open_probe = Some(probe);
+                    }
+                }
+            }
 
             let avoided_candidate_indices = selection.avoided_candidate_indices.clone();
             let mut avoided_total = selection.avoided_total;
@@ -586,8 +695,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                     if ctx.request_flavor.is_remote_compaction_request()
                         && !compact_route_unavailable_waited
                         && route_graph_key.is_some()
-                        && let Some(wait_secs) =
-                            report.short_cooldown_wait_secs(COMPACT_ROUTE_UNAVAILABLE_WAIT_MAX_SECS)
+                        && let Some(wait_secs) = compact_short_cooldown_wait_secs
                     {
                         compact_route_unavailable_waited = true;
                         log_control_trace_event(serde_json::json!({
@@ -604,6 +712,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                             routing_control_graph_key,
                             runtime_revision,
                             provider_policy,
+                            ctx.request_flavor.transient_health_capability(),
                             route_state_session_id,
                         )
                         .await;
@@ -793,7 +902,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                 }
             };
 
-            if concurrency_permit.is_some() {
+            if concurrency_permit.is_some() || half_open_probe.is_some() {
                 let selected_provider_endpoint = executor
                     .template()
                     .candidate_provider_endpoint_key(selected_candidate);
@@ -803,6 +912,7 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                     routing_control_graph_key,
                     runtime_revision,
                     provider_policy,
+                    ctx.request_flavor.transient_health_capability(),
                     route_state_session_id,
                 )
                 .await;
@@ -822,11 +932,34 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                         break;
                     }
                 }
-                let validation_runtime = runtime_for_acquired_candidate_revalidation(
+                if let Some(probe) = half_open_probe.as_ref()
+                    && !ctx
+                        .proxy
+                        .state
+                        .validate_runtime_half_open_probe(probe)
+                        .await
+                {
+                    log_control_trace_event(serde_json::json!({
+                        "event": "route_transient_half_open_revalidation_failed",
+                        "service": ctx.proxy.service_name,
+                        "request_id": ctx.request_id,
+                        "provider_endpoint_key": selected_provider_endpoint.stable_key(),
+                    }));
+                    drop(concurrency_permit);
+                    continue;
+                }
+                let mut validation_runtime = runtime_for_acquired_candidate_revalidation(
                     executor.template(),
                     runtime,
                     selected_candidate,
                 );
+                if half_open_probe.is_some() {
+                    validation_runtime = runtime_for_transient_half_open_selection(
+                        executor.template(),
+                        &validation_runtime,
+                        &HashSet::from([selected_provider_endpoint.clone()]),
+                    );
+                }
                 if !executor.candidate_is_valid_after_runtime_update(
                     route_state,
                     &validation_runtime,
@@ -857,8 +990,10 @@ impl<'a, 'route> RouteGraphAttemptLoop<'a, 'route> {
                     avoid_set: &mut avoid_set,
                     avoided_total: &mut avoided_total,
                     last_err,
+                    last_http_debug,
                     route_attempts,
                     concurrency_permit,
+                    half_open_probe,
                 })
                 .await
             {
@@ -1117,6 +1252,7 @@ async fn enqueue_usage_probes_for_provider_endpoints<'a>(
     }
 
     let topology = template.continuity_topology();
+    let provider_catalog = proxy.config.capture().await.usage_provider_catalog();
     for provider_endpoint in provider_endpoints {
         let Some(candidate) = topology.find_candidate_by_provider_endpoint(&provider_endpoint)
         else {
@@ -1129,6 +1265,7 @@ async fn enqueue_usage_probes_for_provider_endpoints<'a>(
             proxy.client.clone(),
             proxy.state.clone(),
             target,
+            Arc::clone(&provider_catalog),
         );
     }
 }
@@ -1196,9 +1333,19 @@ mod tests {
             is_user_turn: false,
             is_remote_compaction_v1_request,
             is_remote_compaction_v2_request: false,
+            remote_v2_downgrade_enabled: false,
             remote_compaction_requires_affinity,
             is_codex_service: false,
             shared_route_state_impact: SharedRouteStateImpact::RouteFacing,
+            terminal_accounting: crate::runtime_store::RequestAccountingScope::Economic,
+            route_capability: if is_remote_compaction_v1_request {
+                crate::endpoint_health::RouteCapability::RemoteCompaction
+            } else {
+                crate::endpoint_health::RouteCapability::Inference
+            },
+            stream_terminal_policy:
+                crate::proxy::request_preparation::StreamTerminalPolicy::ProtocolEvent,
+            replay_policy: crate::proxy::request_preparation::RequestReplayPolicy::RouteFacing,
             codex_bridge_log: None,
         }
     }
@@ -1293,6 +1440,44 @@ mod tests {
         assert!(!policy.requires_known_affinity());
         assert!(policy.allow_provider_failover());
         assert_eq!(policy.provider_failover_blocked_reason(), None);
+    }
+
+    #[test]
+    fn half_open_selection_clears_only_transient_breaker_fields() {
+        let template = test_route_template(&["relay"]);
+        let endpoint = template.candidate_provider_endpoint_key(&template.candidates[0]);
+        let mut runtime = RoutePlanRuntimeState::default();
+        runtime.set_provider_endpoint(
+            endpoint.clone(),
+            RoutePlanUpstreamRuntimeState {
+                runtime_disabled: true,
+                failure_count: crate::endpoint_health::FAILURE_THRESHOLD,
+                cooldown_active: true,
+                cooldown_remaining_secs: Some(30),
+                usage_exhausted: true,
+                ..RoutePlanUpstreamRuntimeState::default()
+            },
+        );
+
+        let half_open_runtime = runtime_for_transient_half_open_selection(
+            &template,
+            &runtime,
+            &HashSet::from([endpoint.clone()]),
+        );
+        let projected = half_open_runtime.provider_endpoint(&endpoint);
+        assert_eq!(projected.failure_count, 0);
+        assert!(!projected.cooldown_active);
+        assert_eq!(projected.cooldown_remaining_secs, None);
+        assert!(projected.runtime_disabled);
+        assert!(projected.usage_exhausted);
+
+        let executor = RoutePlanExecutor::new(&template);
+        let selection = executor.select_supported_candidate_with_runtime_state(
+            &mut RoutePlanAttemptState::default(),
+            &half_open_runtime,
+            None,
+        );
+        assert!(selection.selected.is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "codex-helper"
-version = "0.20.3"
+version = "0.21.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
@@ -38,14 +38,14 @@ name = "ch"
 path = "src/bin/ch.rs"
 
 [dependencies]
-codex-helper-core = { path = "crates/core", version = "0.20.3", features = ["native-credentials"] }
-codex-helper-tui = { path = "crates/tui", version = "0.20.3" }
+codex-helper-core = { path = "crates/core", version = "0.21.0", features = ["native-credentials"] }
+codex-helper-tui = { path = "crates/tui", version = "0.21.0" }
 anyhow = "1.0.103"
 base64 = "0.22.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "1.1"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "fs", "process"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "fs", "process", "io-std"] }
 axum = { version = "0.8.9", features = ["http2", "macros", "ws"] }
 hyper = { version = "1.10.1", features = ["full"] }
 reqwest = { version = "0.13.4", features = ["json", "stream", "gzip", "brotli", "zstd", "deflate"] }

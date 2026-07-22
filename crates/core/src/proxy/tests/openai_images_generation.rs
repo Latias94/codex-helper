@@ -1,7 +1,8 @@
 use super::*;
+use crate::codex_switch::{CODEX_CLIENT_FACADE_ACTOR_HEADER, CODEX_CLIENT_FACADE_ACTOR_VALUE};
 use crate::proxy::tests::harness::{
-    post_images_edits_json, post_images_generations_json, spawn_test_proxy, spawn_test_upstream,
-    upstream_config,
+    post_images_edits_json, post_images_generations_json, post_responses_json, spawn_test_proxy,
+    spawn_test_upstream, upstream_config,
 };
 use std::sync::{Arc, Mutex};
 
@@ -187,6 +188,67 @@ async fn openai_images_generation_endpoint_strips_client_user_agent_before_upstr
 }
 
 #[tokio::test]
+async fn current_codex_images_request_consumes_actor_marker_before_upstream() {
+    let seen_actor_marker = Arc::new(Mutex::new(None::<Option<String>>));
+    let seen_actor_marker_for_route = seen_actor_marker.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap| {
+            let seen_actor_marker_for_route = seen_actor_marker_for_route.clone();
+            async move {
+                let seen = headers
+                    .get(CODEX_CLIENT_FACADE_ACTOR_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                *seen_actor_marker_for_route.lock().expect("lock") = Some(seen);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "id": "resp_image",
+                        "created": 42,
+                        "output": [{
+                            "type": "image_generation_call",
+                            "id": "ig_1",
+                            "status": "completed",
+                            "result": "Zm9v"
+                        }]
+                    })),
+                )
+            }
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let proxy = spawn_test_proxy(cfg);
+    let client = Client::new();
+
+    client
+        .post(proxy.images_generations_url())
+        .header("content-type", "application/json")
+        .header(
+            CODEX_CLIENT_FACADE_ACTOR_HEADER,
+            CODEX_CLIENT_FACADE_ACTOR_VALUE,
+        )
+        .body(
+            r#"{"prompt":"cat","background":"auto","model":"gpt-image-2","quality":"auto","size":"auto"}"#,
+        )
+        .send()
+        .await
+        .expect("send current Codex images request")
+        .error_for_status()
+        .expect("images status");
+
+    assert_eq!(
+        seen_actor_marker
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("captured actor marker"),
+        None
+    );
+}
+
+#[tokio::test]
 async fn openai_images_generation_endpoint_rejects_n_greater_than_one_before_upstream() {
     let hit_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hit_count_for_route = hit_count.clone();
@@ -281,6 +343,73 @@ async fn openai_images_generation_endpoint_reports_missing_image_result() {
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(text.contains("image_generation_call"));
+}
+
+#[tokio::test]
+async fn image_capability_failure_does_not_cool_models_or_inference() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let response_hits = hits.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let hits = response_hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let is_image = body["tools"].as_array().is_some_and(|tools| {
+                        tools
+                            .iter()
+                            .any(|tool| tool["type"].as_str() == Some("image_generation"))
+                    });
+                    if is_image {
+                        Json(serde_json::json!({
+                            "id": "resp_no_image",
+                            "object": "response",
+                            "output": [{"type": "message", "content": []}]
+                        }))
+                    } else {
+                        Json(serde_json::json!({
+                            "id": "resp_inference",
+                            "object": "response",
+                            "output": []
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async {
+                Json(serde_json::json!({
+                    "object": "list",
+                    "data": [{"id": "gpt-5.6-sol", "object": "model"}]
+                }))
+            }),
+        );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_helper_config(vec![upstream.upstream_config()], RetryConfig::default());
+    let proxy = spawn_test_proxy(cfg);
+    let client = Client::new();
+
+    let image =
+        post_images_generations_json(&client, &proxy, r#"{"model":"gpt-image-2","prompt":"cat"}"#)
+            .await;
+    assert_eq!(image.status(), StatusCode::BAD_GATEWAY);
+    let _ = image.bytes().await.expect("read image failure");
+
+    let models = client
+        .get(proxy.url("/models"))
+        .send()
+        .await
+        .expect("send models request after image failure");
+    assert_eq!(models.status(), StatusCode::OK);
+    let _ = models.bytes().await.expect("read models response");
+
+    let inference =
+        post_responses_json(&client, &proxy, r#"{"model":"gpt-5.6-sol","input":"hi"}"#).await;
+    assert_eq!(inference.status(), StatusCode::OK);
+    let _ = inference.bytes().await.expect("read inference response");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

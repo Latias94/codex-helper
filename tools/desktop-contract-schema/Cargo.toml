@@ -1,6 +1,6 @@
 [package]
 name = "codex-helper-desktop-contract-schema"
-version = "0.20.3"
+version = "0.21.0"
 edition = "2024"
 publish = false
 

@@ -113,6 +113,24 @@ pub(crate) fn upstream_origin(value: &str) -> Option<String> {
     (origin != "null").then_some(origin)
 }
 
+pub(crate) fn upstream_uri_for_log(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Ok(url) = reqwest::Url::parse(value) {
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return None;
+        }
+        let path = url.path();
+        return Some(if path.is_empty() { "/" } else { path }.to_string());
+    }
+
+    let uri = value.parse::<axum::http::Uri>().ok()?;
+    if !value.starts_with('/') || uri.scheme().is_some() || uri.authority().is_some() {
+        return None;
+    }
+    let path = uri.path();
+    Some(if path.is_empty() { "/" } else { path }.to_string())
+}
+
 fn route_decision_for_request_log(
     mut route_decision: Option<RouteDecisionProvenance>,
 ) -> Option<RouteDecisionProvenance> {
@@ -123,10 +141,36 @@ fn route_decision_for_request_log(
 }
 
 fn http_debug_for_request_log(mut http_debug: HttpDebugLog) -> HttpDebugLog {
+    http_debug.client_uri = client_uri_for_log(http_debug.client_uri.as_str());
     http_debug.upstream_origin = http_debug
         .upstream_origin
         .and_then(|value| upstream_origin(value.as_str()));
+    http_debug.upstream_uri = http_debug
+        .upstream_uri
+        .and_then(|value| upstream_uri_for_log(value.as_str()));
     http_debug
+}
+
+pub(crate) fn client_uri_for_log(value: &str) -> String {
+    if let Ok(url) = reqwest::Url::parse(value)
+        && matches!(url.scheme(), "http" | "https")
+    {
+        let path = url.path();
+        return if path.is_empty() { "/" } else { path }.to_string();
+    }
+    value
+        .parse::<axum::http::Uri>()
+        .ok()
+        .map(|uri| uri.path().to_string())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| {
+            value
+                .split(['?', '#'])
+                .next()
+                .filter(|path| !path.is_empty())
+                .unwrap_or("/")
+                .to_string()
+        })
 }
 
 fn env_bool(key: &str) -> bool {
@@ -209,13 +253,13 @@ pub fn should_include_http_warn(status_code: u16) -> bool {
     !is_logical_request_success_status(status_code)
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct HeaderEntry {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct AuthResolutionLog {
     /// Where the upstream `Authorization` header value came from (never includes the secret).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,7 +269,7 @@ pub struct AuthResolutionLog {
     pub x_api_key: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct BodyPreview {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
@@ -233,6 +277,8 @@ pub struct BodyPreview {
     pub data: String,
     pub truncated: bool,
     pub original_len: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
 }
 
 fn normalize_content_type(content_type: Option<&str>) -> Option<&str> {
@@ -269,6 +315,7 @@ pub fn make_body_preview(bytes: &[u8], content_type: Option<&str>, max: usize) -
             data: text,
             truncated,
             original_len,
+            window: None,
         };
     }
 
@@ -279,11 +326,14 @@ pub fn make_body_preview(bytes: &[u8], content_type: Option<&str>, max: usize) -
         data: b64,
         truncated,
         original_len,
+        window: None,
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct HttpDebugLog {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_attempt_index: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body_len: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,6 +359,8 @@ pub struct HttpDebugLog {
     pub client_uri: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_uri: Option<String>,
     pub client_headers: Vec<HeaderEntry>,
     pub upstream_request_headers: Vec<HeaderEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -346,6 +398,8 @@ pub struct CodexBridgeLog {
     pub remote_compaction_v1_request: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub remote_compaction_v2_request: bool,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub downgraded_to_responses_compact: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub responses_websocket_request: bool,
     #[serde(default, skip_serializing_if = "bool_is_false")]
@@ -397,6 +451,8 @@ pub struct RequestLog<'a> {
     pub http_debug: Option<HttpDebugLog>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_debug_ref: Option<HttpDebugRef>,
+    #[serde(default, skip_serializing_if = "http_debug_attempt_refs_is_empty")]
+    pub http_debug_attempt_refs: Vec<HttpDebugAttemptRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_decision: Option<RouteDecisionProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -411,6 +467,17 @@ pub struct RequestLog<'a> {
 pub struct HttpDebugRef {
     pub id: String,
     pub file: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct HttpDebugAttemptRef {
+    pub route_attempt_index: u32,
+    pub id: String,
+    pub file: String,
+}
+
+fn http_debug_attempt_refs_is_empty(value: &[HttpDebugAttemptRef]) -> bool {
+    value.is_empty()
 }
 
 fn route_attempts_is_empty(value: &[RouteAttemptLog]) -> bool {
@@ -506,6 +573,8 @@ pub struct RouteAttemptLog {
     pub policy_actions: Vec<PolicyAction>,
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub skipped: bool,
+    #[serde(skip)]
+    pub(crate) http_debug: Option<HttpDebugLog>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -563,6 +632,8 @@ struct HttpDebugLogEntry<'a> {
     pub request_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_attempt_index: Option<u32>,
     pub service: &'a str,
     pub method: &'a str,
     pub path: &'a str,
@@ -686,12 +757,61 @@ pub(crate) fn log_committed_request_with_debug(
     let upstream_origin = upstream_origin.and_then(|value| self::upstream_origin(value.as_str()));
     let route_decision = route_decision_for_request_log(route_decision);
     let http_debug = http_debug.map(http_debug_for_request_log);
+    let terminal_route_attempt_index = http_debug
+        .as_ref()
+        .and_then(|debug| debug.route_attempt_index);
+    let mut http_debug_attempts = retry
+        .as_ref()
+        .into_iter()
+        .flat_map(|retry| retry.route_attempts.iter())
+        .filter_map(|attempt| {
+            attempt
+                .http_debug
+                .clone()
+                .map(|debug| (attempt.clone(), http_debug_for_request_log(debug)))
+        })
+        .collect::<Vec<_>>();
+    if let (Some(attempt_index), Some(terminal_debug)) =
+        (terminal_route_attempt_index, http_debug.as_ref())
+    {
+        if let Some((_, debug)) = http_debug_attempts
+            .iter_mut()
+            .find(|(attempt, _)| attempt.attempt_index == attempt_index)
+        {
+            *debug = terminal_debug.clone();
+        } else {
+            let attempt = retry
+                .as_ref()
+                .and_then(|retry| {
+                    retry
+                        .route_attempts
+                        .iter()
+                        .find(|attempt| attempt.attempt_index == attempt_index)
+                })
+                .cloned()
+                .unwrap_or_else(|| RouteAttemptLog {
+                    attempt_index,
+                    provider_id: provider_id.clone(),
+                    endpoint_id: endpoint_id.clone(),
+                    provider_endpoint_key: provider_endpoint_key.clone(),
+                    status_code: Some(status_code),
+                    model: model.clone(),
+                    upstream_headers_ms: ttfb_ms,
+                    duration_ms: Some(duration_ms),
+                    ..RouteAttemptLog::default()
+                });
+            http_debug_attempts.push((attempt, terminal_debug.clone()));
+        }
+    }
+    http_debug_attempts.sort_by_key(|(attempt, _)| attempt.attempt_index);
 
     static DEBUG_SEQ: AtomicU64 = AtomicU64::new(0);
     let mut http_debug_for_main = http_debug;
     let mut http_debug_ref: Option<HttpDebugRef> = None;
+    let mut http_debug_attempt_refs = Vec::new();
 
     let log_file_path = request_log_path();
+    let split_http_debug = http_debug_split_enabled();
 
     let _guard = match log_lock().lock() {
         Ok(g) => g,
@@ -699,9 +819,7 @@ pub(crate) fn log_committed_request_with_debug(
     };
 
     // Optional: write large http_debug blobs to a separate file and keep only a reference in requests.jsonl.
-    if http_debug_split_enabled()
-        && let Some(h) = http_debug_for_main.take()
-    {
+    if split_http_debug && let Some(h) = http_debug_for_main.take() {
         let seq = DEBUG_SEQ.fetch_add(1, Ordering::Relaxed);
         let id = format!("{ts}-{seq}");
         let debug_entry = HttpDebugLogEntry {
@@ -709,6 +827,7 @@ pub(crate) fn log_committed_request_with_debug(
             timestamp_ms: ts,
             request_id,
             trace_id: trace_id.clone(),
+            route_attempt_index: h.route_attempt_index,
             service,
             method,
             path,
@@ -750,6 +869,74 @@ pub(crate) fn log_committed_request_with_debug(
         }
     }
 
+    if split_http_debug {
+        if let (Some(route_attempt_index), Some(reference)) =
+            (terminal_route_attempt_index, http_debug_ref.as_ref())
+        {
+            http_debug_attempt_refs.push(HttpDebugAttemptRef {
+                route_attempt_index,
+                id: reference.id.clone(),
+                file: reference.file.clone(),
+            });
+        }
+
+        let debug_path = debug_log_path();
+        for (attempt, http_debug) in http_debug_attempts {
+            if Some(attempt.attempt_index) == terminal_route_attempt_index
+                && http_debug_ref.is_some()
+            {
+                continue;
+            }
+
+            let seq = DEBUG_SEQ.fetch_add(1, Ordering::Relaxed);
+            let id = format!("{ts}-{seq}");
+            let debug_entry = HttpDebugLogEntry {
+                id: &id,
+                timestamp_ms: ts,
+                request_id,
+                trace_id: trace_id.clone(),
+                route_attempt_index: Some(attempt.attempt_index),
+                service,
+                method,
+                path,
+                status_code: attempt.status_code.unwrap_or(status_code),
+                duration_ms: attempt.duration_ms.unwrap_or(duration_ms),
+                ttfb_ms: attempt.upstream_headers_ms,
+                provider_id: attempt.provider_id.or_else(|| provider_id.clone()),
+                endpoint_id: attempt.endpoint_id.or_else(|| endpoint_id.clone()),
+                provider_endpoint_key: attempt
+                    .provider_endpoint_key
+                    .or_else(|| provider_endpoint_key.clone()),
+                upstream_origin: http_debug
+                    .upstream_origin
+                    .clone()
+                    .or_else(|| upstream_origin.clone()),
+                session_id: session_id.clone(),
+                session_identity_source,
+                cwd: cwd.clone(),
+                model: attempt.model.or_else(|| model.clone()),
+                reasoning_effort: reasoning_effort.clone(),
+                service_tier: service_tier.clone(),
+                codex_bridge: codex_bridge.clone(),
+                usage: usage.clone(),
+                route_decision: route_decision.clone(),
+                retry: retry.clone(),
+                http_debug,
+            };
+            let wrote_debug = serde_json::to_string(&debug_entry)
+                .ok()
+                .is_some_and(|line| append_json_line(&debug_path, opt, &line));
+            if wrote_debug {
+                http_debug_attempt_refs.push(HttpDebugAttemptRef {
+                    route_attempt_index: attempt.attempt_index,
+                    id,
+                    file: "requests_debug.jsonl".to_string(),
+                });
+            }
+        }
+        http_debug_attempt_refs.sort_by_key(|reference| reference.route_attempt_index);
+    }
+
     let provider_signals = provider_signals_from_retry(retry.as_ref());
     let policy_actions = policy_actions_from_retry(retry.as_ref());
 
@@ -777,6 +964,7 @@ pub(crate) fn log_committed_request_with_debug(
         usage,
         http_debug: http_debug_for_main,
         http_debug_ref,
+        http_debug_attempt_refs,
         route_decision,
         retry,
         provider_signals,

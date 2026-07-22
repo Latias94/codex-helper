@@ -101,8 +101,10 @@ mod tests {
     use super::*;
     use crate::config::{HelperConfig, ProviderConfig, RouteGraphConfig, ServiceRouteConfig};
     use crate::proxy::{
-        LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_OPERATOR_SESSION,
-        LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SESSION_AFFINITY_MUTATION,
+        LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_DEFAULT_PROFILE_MUTATION,
+        LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_RELAY_CAPABILITIES, LOCAL_V1_RELAY_LIVE_SMOKE,
+        LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_RUNTIME_RELOAD, LOCAL_V1_SESSION_AFFINITY_MUTATION,
+        LOCAL_V1_SESSION_BINDING_MUTATION,
     };
 
     fn proxy_with_upstream(base_url: String) -> ProxyService {
@@ -199,6 +201,11 @@ mod tests {
             LOCAL_V1_CREDENTIAL_REFRESH,
             LOCAL_V1_ROUTING_MUTATION,
             LOCAL_V1_SESSION_AFFINITY_MUTATION,
+            LOCAL_V1_SESSION_BINDING_MUTATION,
+            LOCAL_V1_DEFAULT_PROFILE_MUTATION,
+            LOCAL_V1_RUNTIME_RELOAD,
+            LOCAL_V1_RELAY_CAPABILITIES,
+            LOCAL_V1_RELAY_LIVE_SMOKE,
         ] {
             let response = app
                 .clone()
@@ -220,7 +227,14 @@ mod tests {
     #[tokio::test]
     async fn admin_listener_rejects_unsigned_local_operator_actions() {
         let app = admin_listener_router(proxy_with_upstream("http://127.0.0.1:1".to_string()));
-        for path in [LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH] {
+        for path in [
+            LOCAL_V1_BALANCE_REFRESH,
+            LOCAL_V1_CREDENTIAL_REFRESH,
+            LOCAL_V1_DEFAULT_PROFILE_MUTATION,
+            LOCAL_V1_RUNTIME_RELOAD,
+            LOCAL_V1_RELAY_CAPABILITIES,
+            LOCAL_V1_RELAY_LIVE_SMOKE,
+        ] {
             let mut request = Request::builder()
                 .method("POST")
                 .uri(path)

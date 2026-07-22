@@ -183,6 +183,12 @@ version = 6
 # admin_url = "https://nas.example.com:4211"
 # admin_token_env = "CODEX_HELPER_NAS_ADMIN_TOKEN"
 #
+# [relay_targets.nas.client_patch]
+# # Only fields present here override [codex.client_patch] when `ch relay nas`
+# # switches the local Codex client to this relay.
+# preset = "official-relay"
+# responses_websocket = true
+#
 # 常用命令：
 #   ch relay add nas --proxy-url http://nas.local:3211 --admin-url https://nas.example.com:4211 --admin-token-env CODEX_HELPER_NAS_ADMIN_TOKEN
 #   ch relay nas
@@ -292,7 +298,8 @@ version = 6
 #
 # --- 会话控制模板（profiles，可选） ---
 #
-# Phase 1 先支持“定义 / 列出 / 应用到会话”，暂不自动把 default_profile 绑定到新会话。
+# default_profile 会绑定到新会话，用于连续性和归因；它不会覆盖客户端请求字段。
+# 只有显式的会话手动 profile/field override 才会改写 model、effort 或 service_tier。
 #
 # [codex]
 # default_profile = "daily"
@@ -520,7 +527,6 @@ fn collect_retired_relay_target_settings(value: &TomlValue, retired: &mut Vec<St
 }
 
 const RETIRED_V5_REMOVALS: &[(&[&str], &str)] = &[
-    (&["codex", "compaction"], "codex.compaction"),
     (&["claude", "compaction"], "claude.compaction"),
     (&["ui", "usage_forecast"], "ui.usage_forecast"),
     (
@@ -572,11 +578,6 @@ fn reject_retired_v5_settings(value: &TomlValue) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     let mut compaction_guidance = String::new();
-    if retired.iter().any(|path| path == "codex.compaction") {
-        compaction_guidance.push_str(
-            " `[codex.compaction].remote_v2_downgrade` has been removed because codex-helper no longer performs remote compaction v2-to-v1 downgrade. Delete the entire `[codex.compaction]` table.",
-        );
-    }
     if retired.iter().any(|path| path == "claude.compaction") {
         compaction_guidance.push_str(
             " `[claude.compaction]` was accepted by the shared v0.20.3 version 5 service schema but had no Claude runtime effect. Delete the entire `[claude.compaction]` table.",
@@ -603,7 +604,7 @@ fn remove_toml_path(value: &mut TomlValue, path: &[&str]) -> bool {
         .is_some_and(|child| remove_toml_path(child, tail))
 }
 
-fn remove_retired_settings(value: &mut TomlValue, notices: &mut Vec<String>) {
+fn remove_retired_settings(value: &mut TomlValue, notices: &mut Vec<String>) -> Result<()> {
     for &(path, label) in RETIRED_V5_REMOVALS {
         if remove_toml_path(value, path) {
             notices.push(format!("removed retired setting `{label}`"));
@@ -626,22 +627,125 @@ fn remove_retired_settings(value: &mut TomlValue, notices: &mut Vec<String>) {
         }
     }
 
-    let target_names = value
-        .get("relay_targets")
-        .and_then(TomlValue::as_table)
-        .map(|targets| targets.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    for target_name in target_names {
-        for field in ["client_preset", "responses_websocket"] {
-            let path = ["relay_targets", target_name.as_str(), field];
-            if remove_toml_path(value, &path) {
-                notices.push(format!(
-                    "removed retired setting `relay_targets.{}.{field}`",
-                    toml_path_key(&target_name)
-                ));
+    migrate_relay_target_client_patch(value, notices)?;
+    Ok(())
+}
+
+fn migrate_relay_target_client_patch(
+    value: &mut TomlValue,
+    notices: &mut Vec<String>,
+) -> Result<()> {
+    let Some(targets) = value
+        .get_mut("relay_targets")
+        .and_then(TomlValue::as_table_mut)
+    else {
+        return Ok(());
+    };
+    for (target_name, target) in targets {
+        let Some(target) = target.as_table_mut() else {
+            continue;
+        };
+        let legacy_preset = target.remove("client_preset");
+        let legacy_websocket = target.remove("responses_websocket");
+        if legacy_preset.is_none() && legacy_websocket.is_none() {
+            continue;
+        }
+        let patch = target
+            .entry("client_patch".to_string())
+            .or_insert_with(|| TomlValue::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .with_context(|| format!("relay_targets.{target_name}.client_patch must be a table"))?;
+
+        if let Some(legacy_preset) = legacy_preset {
+            let preset = legacy_preset
+                .clone()
+                .try_into::<CodexClientPreset>()
+                .with_context(|| format!("parse relay_targets.{target_name}.client_preset"))?;
+            if let Some(existing) = patch.get("preset") {
+                let existing = existing
+                    .clone()
+                    .try_into::<CodexClientPreset>()
+                    .with_context(|| {
+                        format!("parse relay_targets.{target_name}.client_patch.preset")
+                    })?;
+                anyhow::ensure!(
+                    existing == preset,
+                    "relay_targets.{target_name}.client_preset conflicts with relay_targets.{target_name}.client_patch.preset"
+                );
+            } else {
+                patch.insert(
+                    "preset".to_string(),
+                    TomlValue::String(preset.as_str().to_string()),
+                );
             }
         }
+        if let Some(legacy_websocket) = legacy_websocket {
+            let websocket = legacy_websocket.as_bool().with_context(|| {
+                format!("relay_targets.{target_name}.responses_websocket must be a boolean")
+            })?;
+            if let Some(existing) = patch.get("responses_websocket") {
+                anyhow::ensure!(
+                    existing.as_bool() == Some(websocket),
+                    "relay_targets.{target_name}.responses_websocket conflicts with relay_targets.{target_name}.client_patch.responses_websocket"
+                );
+            } else {
+                patch.insert(
+                    "responses_websocket".to_string(),
+                    TomlValue::Boolean(websocket),
+                );
+            }
+        }
+        notices.push(format!(
+            "migrated legacy relay target client settings to `relay_targets.{}.client_patch`",
+            toml_path_key(target_name)
+        ));
     }
+    Ok(())
+}
+
+/// Persists the pre-v6 immediate-failover behavior without changing v6 defaults.
+fn migrate_pre_v6_scheduling_preset(
+    value: &mut TomlValue,
+    notices: &mut Vec<String>,
+    source_version: Option<u64>,
+) -> Result<()> {
+    if source_version.is_some_and(|version| version >= u64::from(CURRENT_CONFIG_VERSION)) {
+        return Ok(());
+    }
+
+    for service_name in ["codex", "claude"] {
+        let Some(service) = value
+            .get_mut(service_name)
+            .and_then(TomlValue::as_table_mut)
+        else {
+            continue;
+        };
+        let has_providers = service
+            .get("providers")
+            .and_then(TomlValue::as_table)
+            .is_some_and(|providers| !providers.is_empty());
+        if !service.contains_key("routing") && !has_providers {
+            continue;
+        }
+
+        let routing = service
+            .entry("routing".to_string())
+            .or_insert_with(|| TomlValue::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .with_context(|| format!("{service_name}.routing must be a table"))?;
+        if routing.contains_key("scheduling_preset") {
+            continue;
+        }
+        routing.insert(
+            "scheduling_preset".to_string(),
+            TomlValue::String("throughput-first".to_string()),
+        );
+        notices.push(format!(
+            "set `{service_name}.routing.scheduling_preset` to `throughput-first` to preserve pre-v6 immediate failover"
+        ));
+    }
+
+    Ok(())
 }
 
 fn normalize_codex_client_patch(
@@ -2057,6 +2161,7 @@ fn migration_service_unknown_fields(value: &TomlValue, notices: &mut Vec<String>
         let known = if service_name == "codex" {
             vec![
                 "client_patch",
+                "compaction",
                 "default_profile",
                 "profiles",
                 "providers",
@@ -2156,6 +2261,7 @@ async fn build_config_migration_plan(
 
     let mut notices = Vec::new();
     let mut raw = parse_migration_source(format, source_name, &source.contents, &mut notices)?;
+    let original_raw = raw.clone();
     let explicit_version = toml_schema_version(&raw, source_name)?;
     let source_version = explicit_version.or_else(|| inferred_migration_schema_version(&raw));
     if source_version.is_some_and(|version| version > u64::from(CURRENT_CONFIG_VERSION)) {
@@ -2195,7 +2301,8 @@ async fn build_config_migration_plan(
 
     migrate_flat_retry_settings(&mut raw, &mut notices)?;
     normalize_codex_client_patch(&mut raw, &mut notices, source_version)?;
-    remove_retired_settings(&mut raw, &mut notices);
+    remove_retired_settings(&mut raw, &mut notices)?;
+    migrate_pre_v6_scheduling_preset(&mut raw, &mut notices, source_version)?;
     migration_root_unknown_fields(&raw, &mut notices);
     migration_service_unknown_fields(&raw, &mut notices);
 
@@ -2206,15 +2313,21 @@ async fn build_config_migration_plan(
         "version".to_string(),
         TomlValue::Integer(i64::from(CURRENT_CONFIG_VERSION)),
     );
-    let raw_body = toml::to_string_pretty(&raw).context("serialize migrated configuration")?;
-    let candidate = toml::from_str::<HelperConfig>(&raw_body)
+    let rendered = match format {
+        ConfigMigrationFormat::Toml => {
+            render_lossless_toml_value_transform(source.text()?, &original_raw, &raw, "migration")?
+        }
+        ConfigMigrationFormat::Json => {
+            let body = toml::to_string_pretty(&raw).context("serialize migrated configuration")?;
+            format!("{CONFIG_TOML_DOC_HEADER}\n{body}")
+        }
+    };
+    let candidate = toml::from_str::<HelperConfig>(&rendered)
         .context("parse migrated configuration against the current v6 schema")?;
     validate_helper_config(&candidate).context("validate migrated configuration")?;
     // Retain every raw field that was not explicitly transformed or retired.
     // Typed parsing above validates known settings without silently erasing
     // unknown nested values during migration.
-    let candidate_body = raw_body;
-    let rendered = format!("{CONFIG_TOML_DOC_HEADER}\n{candidate_body}");
     let preview = redact_migration_preview(rendered.as_str());
 
     let backup_name = if matches!(format, ConfigMigrationFormat::Json) {
@@ -3808,10 +3921,17 @@ async fn write_helper_config_locked(
     normalized.version = CURRENT_CONFIG_VERSION;
     validate_helper_config(&normalized)?;
 
-    let path = paths.logical_file("config.toml");
     let body = toml::to_string_pretty(&normalized)?;
     let text = format!("{CONFIG_TOML_DOC_HEADER}\n{body}");
-    let data = text.into_bytes();
+    write_helper_config_bytes_locked(paths, existing, text.into_bytes()).await
+}
+
+async fn write_helper_config_bytes_locked(
+    paths: &ResolvedConfigDirectory,
+    existing: Option<&ExistingConfigToml>,
+    data: Vec<u8>,
+) -> Result<PathBuf> {
+    let path = paths.logical_file("config.toml");
 
     if let Some(existing) = existing {
         write_config_backup(paths, existing, true).await?;
@@ -3846,20 +3966,231 @@ async fn write_helper_config_locked(
     Ok(path)
 }
 
+fn render_lossless_helper_config_mutation(
+    existing: &ExistingConfigToml,
+    before: &HelperConfig,
+    after: &HelperConfig,
+) -> Result<Vec<u8>> {
+    let source = existing.text()?;
+    let mut document = source
+        .parse::<toml_edit::DocumentMut>()
+        .context("parse current config.toml for format-preserving mutation")?;
+    let before_value = TomlValue::try_from(before)
+        .context("serialize config.toml state before format-preserving mutation")?;
+    let after_value = TomlValue::try_from(after)
+        .context("serialize config.toml state after format-preserving mutation")?;
+    let generated = toml::to_string(after)
+        .context("serialize changed config.toml fields for format-preserving mutation")?
+        .parse::<toml_edit::DocumentMut>()
+        .context("render changed config.toml fields for format-preserving mutation")?;
+    let before_table = before_value
+        .as_table()
+        .context("serialized config.toml state before mutation is not a table")?;
+    let after_table = after_value
+        .as_table()
+        .context("serialized config.toml state after mutation is not a table")?;
+
+    apply_typed_config_diff(
+        document.as_table_mut(),
+        before_table,
+        after_table,
+        generated.as_table(),
+    )?;
+
+    let rendered = document.to_string();
+    validate_current_config_toml(&rendered)?;
+    let reparsed = toml::from_str::<HelperConfig>(&rendered)
+        .context("parse format-preserving config.toml mutation")?;
+    validate_helper_config(&reparsed)?;
+    let reparsed_value = TomlValue::try_from(&reparsed)
+        .context("serialize format-preserving config.toml mutation for verification")?;
+    if reparsed_value != after_value {
+        anyhow::bail!(
+            "format-preserving config.toml mutation did not reproduce the requested typed configuration"
+        );
+    }
+    Ok(rendered.into_bytes())
+}
+
+fn render_lossless_toml_value_transform(
+    source: &str,
+    before: &TomlValue,
+    after: &TomlValue,
+    operation: &str,
+) -> Result<String> {
+    let mut document = source
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parse config.toml for format-preserving {operation}"))?;
+    let generated = toml::to_string(after)
+        .with_context(|| format!("serialize changed config.toml fields for {operation}"))?
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("render changed config.toml fields for {operation}"))?;
+    let before_table = before
+        .as_table()
+        .with_context(|| format!("config.toml state before {operation} is not a table"))?;
+    let after_table = after
+        .as_table()
+        .with_context(|| format!("config.toml state after {operation} is not a table"))?;
+
+    apply_typed_config_diff(
+        document.as_table_mut(),
+        before_table,
+        after_table,
+        generated.as_table(),
+    )?;
+
+    let rendered = document.to_string();
+    let reparsed = toml::from_str::<TomlValue>(&rendered)
+        .with_context(|| format!("parse format-preserving config.toml {operation}"))?;
+    anyhow::ensure!(
+        reparsed == *after,
+        "format-preserving config.toml {operation} did not reproduce the requested configuration"
+    );
+    Ok(rendered)
+}
+
+fn apply_typed_config_diff(
+    target: &mut dyn toml_edit::TableLike,
+    before: &toml::map::Map<String, TomlValue>,
+    after: &toml::map::Map<String, TomlValue>,
+    generated: &dyn toml_edit::TableLike,
+) -> Result<()> {
+    let keys = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for key in keys {
+        let before_item = before.get(&key);
+        let after_item = after.get(&key);
+        if before_item == after_item {
+            continue;
+        }
+
+        let Some(after_item) = after_item else {
+            target.remove(&key);
+            continue;
+        };
+        let generated_item = generated.get(&key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "serialized config.toml mutation omitted changed field `{key}` ({})",
+                after_item.type_str()
+            )
+        })?;
+
+        if let (Some(TomlValue::Table(before_table)), TomlValue::Table(after_table)) =
+            (before_item, after_item)
+            && let Some(generated_table) = generated_item.as_table_like()
+            && let Some(target_item) = target.get_mut(&key)
+            && let Some(target_table) = target_item.as_table_like_mut()
+        {
+            let generated_requires_explicit_empty_table = after_table.is_empty()
+                && generated_item
+                    .as_table()
+                    .is_some_and(|table| !table.is_implicit());
+            apply_typed_config_diff(target_table, before_table, after_table, generated_table)?;
+            if generated_requires_explicit_empty_table
+                && let Some(target_table) = target_item.as_table_mut()
+                && target_table.is_empty()
+            {
+                target_table.set_implicit(false);
+            }
+            continue;
+        }
+
+        if let (Some(TomlValue::Array(before_array)), TomlValue::Array(after_array)) =
+            (before_item, after_item)
+            && before_array.len() == after_array.len()
+            && let Some(generated_array) = generated_item.as_array_of_tables()
+            && let Some(target_array) = target
+                .get_mut(&key)
+                .and_then(toml_edit::Item::as_array_of_tables_mut)
+            && target_array.len() == before_array.len()
+            && generated_array.len() == after_array.len()
+            && before_array.iter().all(|value| value.as_table().is_some())
+            && after_array.iter().all(|value| value.as_table().is_some())
+        {
+            for index in 0..before_array.len() {
+                let before_table = before_array[index]
+                    .as_table()
+                    .expect("array element shape checked before diff");
+                let after_table = after_array[index]
+                    .as_table()
+                    .expect("array element shape checked before diff");
+                let generated_table = generated_array
+                    .get(index)
+                    .expect("generated array length checked before diff");
+                let target_table = target_array
+                    .get_mut(index)
+                    .expect("target array length checked before diff");
+                apply_typed_config_diff(target_table, before_table, after_table, generated_table)?;
+            }
+            continue;
+        }
+
+        replace_config_item_preserving_decor(target, &key, generated_item.clone());
+    }
+    Ok(())
+}
+
+fn replace_config_item_preserving_decor(
+    table: &mut dyn toml_edit::TableLike,
+    key: &str,
+    mut replacement: toml_edit::Item,
+) {
+    let Some(current) = table.get_mut(key) else {
+        table.insert(key, replacement);
+        return;
+    };
+
+    match (&*current, &mut replacement) {
+        (toml_edit::Item::Value(current), toml_edit::Item::Value(replacement)) => {
+            *replacement.decor_mut() = current.decor().clone();
+        }
+        (toml_edit::Item::Table(current), toml_edit::Item::Table(replacement)) => {
+            *replacement.decor_mut() = current.decor().clone();
+            replacement.set_position(current.position());
+        }
+        _ => {}
+    }
+    *current = replacement;
+}
+
 pub async fn mutate_helper_config<T>(
     mutate: impl FnOnce(&mut HelperConfig) -> Result<T>,
 ) -> Result<(PathBuf, T)> {
     let paths = ResolvedConfigDirectory::prepare().await?;
     let _lock = ConfigMutationLock::try_acquire(&paths)?;
     paths.ensure_unchanged().await?;
+    if automatic_config_migration_required(&paths).await? {
+        let plan = build_config_migration_plan(&paths).await?;
+        apply_config_migration_plan(&paths, &plan).await?;
+    }
     let existing = preflight_existing_config_before_save(&paths).await?;
     let mut config = match existing.as_ref() {
         Some(existing) => toml::from_str::<HelperConfig>(existing.text()?)?,
         None => HelperConfig::default(),
     };
     validate_helper_config(&config)?;
+    let before = config.clone();
     let output = mutate(&mut config)?;
-    let path = write_helper_config_locked(&paths, existing.as_ref(), &config).await?;
+    config.version = CURRENT_CONFIG_VERSION;
+    validate_helper_config(&config)?;
+    let path = match existing.as_ref() {
+        Some(existing) => {
+            if TomlValue::try_from(&before)
+                .context("serialize config.toml state before mutation")?
+                == TomlValue::try_from(&config)
+                    .context("serialize config.toml state after mutation")?
+            {
+                return Ok((paths.logical_file("config.toml"), output));
+            }
+            let data = render_lossless_helper_config_mutation(existing, &before, &config)?;
+            write_helper_config_bytes_locked(&paths, Some(existing), data).await?
+        }
+        None => write_helper_config_locked(&paths, None, &config).await?,
+    };
     Ok((path, output))
 }
 

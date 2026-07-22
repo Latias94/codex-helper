@@ -8,20 +8,29 @@ use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Client, Url};
 use thiserror::Error;
 
-use crate::dashboard_core::{OperatorReadModel, OperatorReadStatus};
+use crate::dashboard_core::{
+    LOCAL_OPERATOR_SESSION_METADATA_BATCH_MAX, LocalOperatorSessionMetadataRequest,
+    LocalOperatorSessionMetadataResponse, OperatorReadModel, OperatorReadStatus,
+};
 use crate::local_operator::{
     LocalOperatorSessionRequest, LocalOperatorSessionResponse, local_operator_client_proof,
     local_operator_request_signature, new_local_operator_nonce, unix_time_ms,
     verify_local_operator_server_proof,
 };
 use crate::proxy::{
-    ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, LOCAL_OPERATOR_NONCE_HEADER,
-    LOCAL_OPERATOR_SESSION_HEADER, LOCAL_OPERATOR_SIGNATURE_HEADER,
+    ADMIN_TOKEN_ENV_VAR, ADMIN_TOKEN_HEADER, CodexRelayCapabilitiesRequest,
+    CodexRelayCapabilitiesResponse, CodexRelayLiveSmokeRequest, CodexRelayLiveSmokeResponse,
+    LOCAL_OPERATOR_NONCE_HEADER, LOCAL_OPERATOR_SESSION_HEADER, LOCAL_OPERATOR_SIGNATURE_HEADER,
     LOCAL_OPERATOR_TIMESTAMP_HEADER, LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH,
-    LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SERVICE_RUNTIME_READ,
-    LOCAL_V1_SESSION_AFFINITY_MUTATION, OperatorRoutingMutationRequest,
-    OperatorRoutingMutationResponse, OperatorSessionAffinityMutationRequest,
-    OperatorSessionAffinityMutationResponse, ProviderBalanceRefreshResponse,
+    LOCAL_V1_DEFAULT_PROFILE_MUTATION, LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_RELAY_CAPABILITIES,
+    LOCAL_V1_RELAY_LIVE_SMOKE, LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_RUNTIME_RELOAD,
+    LOCAL_V1_SERVICE_RUNTIME_READ, LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    LOCAL_V1_SESSION_BINDING_MUTATION, LOCAL_V1_SESSION_METADATA_READ,
+    OperatorDefaultProfileMutationRequest, OperatorDefaultProfileMutationResponse,
+    OperatorRoutingMutationRequest, OperatorRoutingMutationResponse, OperatorRuntimeReloadRequest,
+    OperatorRuntimeReloadResponse, OperatorSessionAffinityMutationRequest,
+    OperatorSessionAffinityMutationResponse, OperatorSessionBindingMutationRequest,
+    OperatorSessionBindingMutationResponse, ProviderBalanceRefreshResponse,
 };
 use crate::request_chain::{RequestChainExport, RequestChainSelector};
 use crate::service_target::{
@@ -30,6 +39,8 @@ use crate::service_target::{
 };
 
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 4 * 1024;
+const LOCAL_OPERATOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCAL_OPERATOR_BALANCE_REFRESH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneEndpoint {
@@ -242,7 +253,7 @@ impl LocalOperatorClient {
             anyhow::bail!("local operator token is empty");
         }
         let admin_token = load_admin_token(&endpoint)?;
-        let client = control_plane_http_client(Duration::from_secs(60))?;
+        let client = control_plane_http_client(LOCAL_OPERATOR_REQUEST_TIMEOUT)?;
         Ok(Self {
             endpoint,
             client,
@@ -317,6 +328,76 @@ impl LocalOperatorClient {
         Ok(response)
     }
 
+    pub async fn read_operator_session_metadata(
+        &self,
+        session_keys: Vec<String>,
+    ) -> Result<LocalOperatorSessionMetadataResponse, ControlPlaneError> {
+        let mut seen = std::collections::HashSet::with_capacity(session_keys.len());
+        let session_keys = session_keys
+            .into_iter()
+            .filter(|key| seen.insert(key.clone()))
+            .collect::<Vec<_>>();
+        if session_keys.is_empty() {
+            return self.read_operator_session_metadata_batch(Vec::new()).await;
+        }
+
+        let mut service_name = None::<String>;
+        let mut sessions = std::collections::HashMap::new();
+        for batch in session_keys.chunks(LOCAL_OPERATOR_SESSION_METADATA_BATCH_MAX) {
+            let response = self
+                .read_operator_session_metadata_batch(batch.to_vec())
+                .await?;
+            if service_name
+                .as_deref()
+                .is_some_and(|expected| expected != response.service_name)
+            {
+                return Err(ControlPlaneError::InvalidPayload {
+                    reason:
+                        "local operator daemon changed service identity between metadata batches"
+                            .to_string(),
+                });
+            }
+            service_name.get_or_insert_with(|| response.service_name.clone());
+            for (key, session) in response.sessions {
+                if sessions.insert(key, session).is_some() {
+                    return Err(ControlPlaneError::InvalidPayload {
+                        reason: "local operator daemon duplicated session metadata between batches"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(LocalOperatorSessionMetadataResponse {
+            service_name: service_name.unwrap_or_default(),
+            sessions,
+        })
+    }
+
+    async fn read_operator_session_metadata_batch(
+        &self,
+        session_keys: Vec<String>,
+    ) -> Result<LocalOperatorSessionMetadataResponse, ControlPlaneError> {
+        let requested = session_keys
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let response = self
+            .post_json_classified::<_, LocalOperatorSessionMetadataResponse>(
+                LOCAL_V1_SESSION_METADATA_READ,
+                &LocalOperatorSessionMetadataRequest { session_keys },
+            )
+            .await?;
+        if response.sessions.iter().any(|(key, session)| {
+            !requested.contains(key) || session.raw_session_id.trim().is_empty()
+        }) {
+            return Err(ControlPlaneError::InvalidPayload {
+                reason: "local operator daemon returned invalid session metadata".to_string(),
+            });
+        }
+        Ok(response)
+    }
+
     pub async fn mutate_operator_routing(
         &self,
         request: &OperatorRoutingMutationRequest,
@@ -330,6 +411,43 @@ impl LocalOperatorClient {
         request: &OperatorSessionAffinityMutationRequest,
     ) -> Result<OperatorSessionAffinityMutationResponse, ControlPlaneError> {
         self.post_json_classified(LOCAL_V1_SESSION_AFFINITY_MUTATION, request)
+            .await
+    }
+
+    pub async fn mutate_operator_session_binding(
+        &self,
+        request: &OperatorSessionBindingMutationRequest,
+    ) -> Result<OperatorSessionBindingMutationResponse, ControlPlaneError> {
+        self.post_json_classified(LOCAL_V1_SESSION_BINDING_MUTATION, request)
+            .await
+    }
+
+    pub async fn mutate_operator_default_profile(
+        &self,
+        request: &OperatorDefaultProfileMutationRequest,
+    ) -> Result<OperatorDefaultProfileMutationResponse, ControlPlaneError> {
+        self.post_json_classified(LOCAL_V1_DEFAULT_PROFILE_MUTATION, request)
+            .await
+    }
+
+    pub async fn reload_runtime(&self) -> Result<OperatorRuntimeReloadResponse, ControlPlaneError> {
+        self.post_json_classified(LOCAL_V1_RUNTIME_RELOAD, &OperatorRuntimeReloadRequest {})
+            .await
+    }
+
+    pub async fn inspect_relay_capabilities(
+        &self,
+        request: &CodexRelayCapabilitiesRequest,
+    ) -> Result<CodexRelayCapabilitiesResponse, ControlPlaneError> {
+        self.post_json_classified(LOCAL_V1_RELAY_CAPABILITIES, request)
+            .await
+    }
+
+    pub async fn run_relay_live_smoke(
+        &self,
+        request: &CodexRelayLiveSmokeRequest,
+    ) -> Result<CodexRelayLiveSmokeResponse, ControlPlaneError> {
+        self.post_json_classified(LOCAL_V1_RELAY_LIVE_SMOKE, request)
             .await
     }
 
@@ -374,6 +492,7 @@ impl LocalOperatorClient {
         let mut request = self
             .client
             .post(url)
+            .timeout(local_operator_request_timeout(path))
             .header(
                 LOCAL_OPERATOR_SESSION_HEADER,
                 session.response.session_id.as_str(),
@@ -457,6 +576,14 @@ impl LocalOperatorClient {
             client_nonce,
             response,
         })
+    }
+}
+
+fn local_operator_request_timeout(path: &str) -> Duration {
+    if matches!(path, LOCAL_V1_BALANCE_REFRESH | LOCAL_V1_RELAY_LIVE_SMOKE) {
+        LOCAL_OPERATOR_BALANCE_REFRESH_TIMEOUT
+    } else {
+        LOCAL_OPERATOR_REQUEST_TIMEOUT
     }
 }
 
@@ -677,6 +804,26 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn long_running_local_operator_actions_have_a_longer_timeout() {
+        assert_eq!(
+            local_operator_request_timeout(LOCAL_V1_BALANCE_REFRESH),
+            LOCAL_OPERATOR_BALANCE_REFRESH_TIMEOUT
+        );
+        assert_eq!(
+            local_operator_request_timeout(LOCAL_V1_RELAY_LIVE_SMOKE),
+            LOCAL_OPERATOR_BALANCE_REFRESH_TIMEOUT
+        );
+        assert!(
+            LOCAL_OPERATOR_BALANCE_REFRESH_TIMEOUT > LOCAL_OPERATOR_REQUEST_TIMEOUT,
+            "provider sweeps and relay smoke tests can exceed the default local action timeout"
+        );
+        assert_eq!(
+            local_operator_request_timeout(LOCAL_V1_ROUTING_MUTATION),
+            LOCAL_OPERATOR_REQUEST_TIMEOUT
+        );
+    }
 
     struct ScopedEnv {
         _lock: MutexGuard<'static, ()>,

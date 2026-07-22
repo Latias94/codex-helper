@@ -1,20 +1,22 @@
 use ratatui::Frame;
 use ratatui::prelude::{Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
 use crate::tui::ProviderOption;
 use crate::tui::i18n;
 use crate::tui::model::{
-    Palette, Snapshot, balance_snapshot_rank, provider_balance_brief_lang,
-    provider_balance_compact_lang, shorten_middle,
+    Palette, Snapshot, provider_balance_brief_lang, provider_balance_compact_lang,
+    provider_endpoint_balance_snapshot, shorten_middle,
 };
 use crate::tui::state::UiState;
-use crate::tui::view::widgets::centered_rect;
+use crate::tui::view::widgets::{centered_rect, max_wrapped_vertical_scroll};
 
 pub(in crate::tui::view) fn render_provider_info_modal(
     f: &mut Frame<'_>,
     p: Palette,
-    ui: &UiState,
+    ui: &mut UiState,
     snapshot: &Snapshot,
     providers: &[ProviderOption],
 ) {
@@ -125,15 +127,11 @@ pub(in crate::tui::view) fn render_provider_info_modal(
                     candidate.provider_id == provider.name && candidate.endpoint_id == endpoint_id
                 })
             });
-            let balance = snapshot
-                .provider_balances
-                .get(provider.name.as_str())
-                .and_then(|balances| {
-                    balances
-                        .iter()
-                        .filter(|balance| balance.provider_endpoint.endpoint_id == endpoint_id)
-                        .min_by_key(|balance| balance_snapshot_rank(balance))
-                });
+            let balance = provider_endpoint_balance_snapshot(
+                &snapshot.provider_balances,
+                provider.name.as_str(),
+                endpoint_id,
+            );
             let capacity = match (endpoint.capacity.active, endpoint.capacity.limit) {
                 (Some(active), Some(limit)) => format!("{active}/{limit}"),
                 (None, Some(limit)) => format!("-/{limit}"),
@@ -291,6 +289,9 @@ pub(in crate::tui::view) fn render_provider_info_modal(
         )));
     }
 
+    let inner = block.inner(area);
+    let max_scroll = max_wrapped_vertical_scroll(&lines, inner.width, inner.height);
+    ui.provider_info_scroll = ui.provider_info_scroll.min(max_scroll);
     f.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -299,4 +300,11 @@ pub(in crate::tui::view) fn render_provider_info_modal(
             .wrap(Wrap { trim: false }),
         area,
     );
+    if max_scroll > 0 {
+        let mut scrollbar = ScrollbarState::new(usize::from(max_scroll) + 1)
+            .position(usize::from(ui.provider_info_scroll));
+        let widget =
+            Scrollbar::new(ScrollbarOrientation::VerticalRight).style(Style::default().fg(p.focus));
+        f.render_stateful_widget(widget, area, &mut scrollbar);
+    }
 }

@@ -357,7 +357,8 @@ for (const marker of [
   "macos-keychain",
   "gnome-keyring",
   "kwallet",
-  "actions/download-artifact@v8",
+  "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+  "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
   "tools/native-credential-smoke.mjs",
   "Verify artifact run identity",
   "release-prerequisites:",
@@ -365,16 +366,58 @@ for (const marker of [
   "bash tools/docker-mounted-secret-smoke.sh codex-helper-server:release-gate",
   "native-evidence-signoff:",
   "tools/verify-native-credential-evidence.mjs",
+  "native-credential-release-signoff.json",
+  "artifacts-native-credential-release-signoff-",
+  "schema v1 runtime smoke is diagnostic-only",
 ]) {
   if (!nativeSmokeWorkflow.includes(marker)) {
     failures.push(`native credential release workflow is missing ${marker}`);
   }
+}
+for (const marker of [
+  "github.rest.actions.listWorkflowRuns",
+  'workflow_id: "ci.yml"',
+  'head_sha: candidateSha',
+  'status: "completed"',
+  "compareWorkflowRunsNewestFirst",
+  "latestRankRuns.length !== 1",
+  'latestRun.conclusion !== "success"',
+  "github.rest.checks.listForSuite",
+  "check_suite_id: latestRun.check_suite_id",
+  "run.check_suite?.id === latestRun.check_suite_id",
+  "matchingRuns.length !== 1",
+  'checkRun.status !== "completed" || checkRun.conclusion !== "success"',
+  '"fmt + clippy"',
+  '"test-build (ubuntu-24.04)"',
+  '"test-build (macos-15)"',
+  '"test-build (windows-2025)"',
+]) {
+  if (!nativeSmokeWorkflow.includes(marker)) {
+    failures.push(`native credential release workflow CI binding is missing ${marker}`);
+  }
+}
+if (nativeSmokeWorkflow.includes("github.rest.checks.listForRef")) {
+  failures.push(
+    "native credential release workflow must bind checks to the latest ci.yml suite, not all checks for a ref",
+  );
 }
 if (/\bcargo\s+(?:build|install)\b/.test(nativeSmokeWorkflow)) {
   failures.push("native credential release smoke must consume the current cargo-dist artifact");
 }
 if (/^    if:/m.test(nativeSmokeWorkflow)) {
   failures.push("native credential release jobs must not have a job-level skip condition");
+}
+const signoffJob = nativeSmokeWorkflow.slice(
+  nativeSmokeWorkflow.indexOf("  native-evidence-signoff:"),
+);
+const signoffSteps = [...signoffJob.matchAll(/^      - name: (.+)$/gm)].map(
+  (match) => match[1],
+);
+if (signoffSteps.at(-1) !== "Upload release signoff manifest") {
+  failures.push("native credential release signoff upload must be the final job step");
+}
+if (nativeSmokeWorkflow.includes("native-credential-release-signoff/signoff.json")) {
+  failures.push("native credential release signoff must use the unique attested filename");
 }
 
 const evidenceVerifier = read("tools/verify-native-credential-evidence.mjs");
@@ -386,6 +429,12 @@ for (const marker of [
   "native-credential-release",
   "verifySidecar",
   "MAX_EVIDENCE_AGE_MS",
+  "REQUIRED_RELEASE_ASSURANCE_CASES",
+  "schema v1 is diagnostic-only",
+  "windows_relogin_persistence",
+  "macos_sleep_wake",
+  "linux_collection_locked",
+  "observation_plus_24_hours",
   "--self-test",
 ]) {
   if (!evidenceVerifier.includes(marker)) {
@@ -408,6 +457,19 @@ if (
 ) {
   failures.push("cargo-dist native smoke cannot read current-run artifacts safely");
 }
+for (const marker of [
+  'github-release = "announce"',
+  "github-attestations = true",
+  'github-attestations-phase = "announce"',
+  'github-attestations-filters = ["native-credential-release-signoff.json"]',
+  '"actions/attest" = "f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6"',
+  '"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"',
+  '"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"',
+]) {
+  if (!distWorkspace.includes(marker)) {
+    failures.push(`cargo-dist native release gate is missing ${marker}`);
+  }
+}
 for (const target of [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",
@@ -429,10 +491,30 @@ for (const marker of [
   "artifacts_matrix.include != null",
   '"actions": "read"',
   '"contents": "read"',
+  '"attestations": "write"',
+  '"id-token": "write"',
+  "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
+  "artifacts/native-credential-release-signoff.json",
 ]) {
   if (!generatedRelease.includes(marker)) {
     failures.push(`generated cargo-dist workflow is missing native gate: ${marker}`);
   }
+}
+const announceIndex = generatedRelease.indexOf("  announce:");
+const attestIndex = generatedRelease.indexOf("      - name: Attest", announceIndex);
+const releaseIndex = generatedRelease.indexOf(
+  "      - name: Create GitHub Release",
+  announceIndex,
+);
+if (announceIndex < 0 || attestIndex < 0 || releaseIndex <= attestIndex) {
+  failures.push("generated cargo-dist workflow must attest native signoff before creating release");
+}
+const hostSection = generatedRelease.slice(
+  generatedRelease.indexOf("  host:"),
+  announceIndex,
+);
+if (hostSection.includes("Create GitHub Release")) {
+  failures.push("generated cargo-dist host phase must not create the GitHub Release");
 }
 
 const ciWorkflow = read(".github/workflows/ci.yml");

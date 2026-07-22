@@ -5,7 +5,7 @@ use axum::http::Method;
 use crate::logging::{
     CodexBridgeLog, HttpDebugLog, RetryInfo, ServiceTierLog, log_committed_request_with_debug,
 };
-use crate::runtime_store::AttemptHandle;
+use crate::runtime_store::{AttemptHandle, RequestAccountingScope};
 use crate::state::{
     FinishRequestParams, ProxyState, RouteDecisionProvenance, SessionIdentitySource,
     SessionRouteAffinitySuccess,
@@ -62,15 +62,29 @@ impl RequestObserver {
     }
 
     pub(super) async fn publish_terminal_once(&self, publication: RequestPublication) -> bool {
-        self.publish_terminal(publication, true).await
+        self.publish_terminal_with_accounting(publication, RequestAccountingScope::Economic)
+            .await
     }
 
     pub(super) async fn publish_non_economic_terminal_once(
         &self,
-        mut publication: RequestPublication,
+        publication: RequestPublication,
     ) -> bool {
-        publication.usage = None;
-        self.publish_terminal(publication, false).await
+        self.publish_terminal_with_accounting(publication, RequestAccountingScope::NonEconomic)
+            .await
+    }
+
+    pub(super) async fn publish_terminal_with_accounting(
+        &self,
+        mut publication: RequestPublication,
+        accounting: RequestAccountingScope,
+    ) -> bool {
+        let include_in_economics = accounting == RequestAccountingScope::Economic;
+        if !include_in_economics {
+            publication.usage = None;
+        }
+        self.publish_terminal(publication, include_in_economics)
+            .await
     }
 
     async fn publish_terminal(
@@ -105,6 +119,12 @@ impl RequestObserver {
             route_affinity_success,
         } = publication;
 
+        let mut retry_for_runtime = retry.clone();
+        if let Some(retry) = retry_for_runtime.as_mut() {
+            for attempt in &mut retry.route_attempts {
+                attempt.http_debug = None;
+            }
+        }
         let finish = FinishRequestParams {
             id: request_id,
             winning_attempt,
@@ -114,7 +134,7 @@ impl RequestObserver {
             observed_service_tier: service_tier.actual.clone(),
             reported_model,
             usage: usage.clone(),
-            retry: retry.clone(),
+            retry: retry_for_runtime,
             ttfb_ms,
             streaming,
         };
@@ -451,6 +471,7 @@ mod tests {
             ..RouteDecisionProvenance::default()
         });
         publication.http_debug = Some(HttpDebugLog {
+            route_attempt_index: Some(0),
             request_body_len: Some(2),
             upstream_request_body_len: Some(2),
             upstream_headers_ms: Some(5),
@@ -461,6 +482,7 @@ mod tests {
             upstream_cf_ray: None,
             client_uri: "/v1/responses".to_string(),
             upstream_origin: Some(poisoned.to_string()),
+            upstream_uri: Some(poisoned.to_string()),
             client_headers: Vec::new(),
             upstream_request_headers: Vec::new(),
             auth_resolution: None,
@@ -485,10 +507,14 @@ mod tests {
             assert!(text.contains("https://relay.example.test:8443"));
             assert!(!text.contains("upstream_base_url"));
             assert!(!text.contains("station_name"));
-            for secret in ["user:secret", "secret-path", "token=hidden", "fragment"] {
+            for secret in ["user:secret", "token=hidden", "fragment"] {
                 assert!(!text.contains(secret), "{} leaked {secret}", path.display());
             }
         }
+        let debug_text =
+            std::fs::read_to_string(temp_home.join("logs").join("requests_debug.jsonl"))
+                .expect("read sanitized HTTP debug log");
+        assert!(debug_text.contains(r#""upstream_uri":"/private/secret-path""#));
     }
 
     fn test_publication(request_id: u64, streaming: bool, status_code: u16) -> RequestPublication {

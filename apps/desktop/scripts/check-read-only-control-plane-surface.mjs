@@ -87,6 +87,7 @@ const allowedReadOnlyCapabilityFields = new Map([
     "src/lib/api/admin-types.ts",
     new Map([
       ["refresh_provider_balances", /^\s{2}refresh_provider_balances: boolean;$/m],
+      ["reload_runtime", /^\s{2}reload_runtime: boolean;$/m],
     ]),
   ],
 ]);

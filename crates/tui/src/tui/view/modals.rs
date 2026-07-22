@@ -1,24 +1,470 @@
+use std::collections::BTreeMap;
+
 use ratatui::Frame;
-use ratatui::prelude::{Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
+use ratatui::widgets::{
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+};
 
 use crate::codex_integration::{CodexStartupReadinessIssue, CodexStartupReadinessSeverity};
+use crate::dashboard_core::ControlProfileOption;
 use crate::proxy::{OperatorEndpointMode, OperatorRoutingCommand, OperatorSessionAffinityCommand};
 use crate::tui::Language;
 use crate::tui::i18n::{self, msg};
 use crate::tui::model::{Palette, shorten_middle};
 use crate::tui::state::UiState;
-use crate::tui::types::RoutingActionChoice;
+use crate::tui::types::{
+    RoutingActionChoice, SessionBindingInputKind, SessionEffortChoice, SessionServiceTierChoice,
+};
 
-use super::widgets::centered_rect;
+use super::widgets::{centered_rect, max_wrapped_vertical_scroll};
 
 mod help;
 pub(super) use help::render_help_modal;
 #[cfg(test)]
-use help::{current_page_help_lines, help_quit_line_for_tests, help_text_for_tests};
+use help::{
+    current_page_help_lines, help_quit_line_for_tests, help_text_for_tests,
+    language_help_line_for_tests,
+};
 
 mod provider_info;
 pub(super) use provider_info::render_provider_info_modal;
+
+fn profile_option_to_service_profile(
+    profile: &ControlProfileOption,
+) -> crate::config::ServiceControlProfile {
+    crate::config::ServiceControlProfile {
+        extends: profile.extends.clone(),
+        model: profile.model.clone(),
+        reasoning_effort: profile.reasoning_effort.clone(),
+        service_tier: profile.service_tier.clone(),
+    }
+}
+
+fn resolve_profile_from_options(
+    profile_name: &str,
+    profiles: &[ControlProfileOption],
+) -> anyhow::Result<crate::config::ServiceControlProfile> {
+    let catalog = profiles
+        .iter()
+        .map(|profile| {
+            (
+                profile.name.clone(),
+                profile_option_to_service_profile(profile),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    crate::config::resolve_service_profile_from_catalog(&catalog, profile_name)
+}
+
+fn profile_route_summary(profile: &crate::config::ServiceControlProfile) -> String {
+    format!(
+        "model={}  reasoning={}  tier={}",
+        profile.model.as_deref().unwrap_or("<auto>"),
+        profile.reasoning_effort.as_deref().unwrap_or("<auto>"),
+        profile.service_tier.as_deref().unwrap_or("<auto>"),
+    )
+}
+
+fn profile_declared_summary(profile: &ControlProfileOption, language: Language) -> String {
+    let mut parts = Vec::new();
+    if let Some(extends) = profile.extends.as_deref() {
+        parts.push(format!("extends={extends}"));
+    }
+    parts.push(format!(
+        "model={}",
+        profile.model.as_deref().unwrap_or("<auto>")
+    ));
+    parts.push(format!(
+        "reasoning={}",
+        profile.reasoning_effort.as_deref().unwrap_or("<auto>")
+    ));
+    parts.push(format!(
+        "tier={}",
+        profile.service_tier.as_deref().unwrap_or("<auto>")
+    ));
+    format!(
+        "{} {}",
+        match language {
+            Language::Zh => "声明：",
+            Language::En => "declared:",
+        },
+        shorten_middle(parts.join("  ").as_str(), 72)
+    )
+}
+
+fn profile_resolved_summary(
+    profile_name: &str,
+    profiles: &[ControlProfileOption],
+    language: Language,
+) -> (String, bool) {
+    match resolve_profile_from_options(profile_name, profiles) {
+        Ok(profile) => (
+            format!(
+                "{} {}",
+                match language {
+                    Language::Zh => "生效：",
+                    Language::En => "resolved:",
+                },
+                shorten_middle(profile_route_summary(&profile).as_str(), 72)
+            ),
+            false,
+        ),
+        Err(error) => (
+            format!(
+                "{} {}",
+                match language {
+                    Language::Zh => "解析失败：",
+                    Language::En => "resolve failed:",
+                },
+                shorten_middle(error.to_string().as_str(), 72)
+            ),
+            true,
+        ),
+    }
+}
+
+fn profile_label(
+    profile: &ControlProfileOption,
+    configured_default: Option<&str>,
+    runtime_default: Option<&str>,
+    effective_default: Option<&str>,
+) -> String {
+    let mut markers = Vec::new();
+    if profile.is_default {
+        markers.push("default");
+    }
+    if configured_default == Some(profile.name.as_str()) {
+        markers.push("configured");
+    }
+    if runtime_default == Some(profile.name.as_str()) {
+        markers.push("runtime");
+    }
+    if effective_default == Some(profile.name.as_str()) {
+        markers.push("effective");
+    }
+    if profile.fast_mode {
+        markers.push("fast");
+    }
+    if markers.is_empty() {
+        profile.name.clone()
+    } else {
+        format!("{} [{}]", profile.name, markers.join(" "))
+    }
+}
+
+fn profile_menu_item(
+    p: Palette,
+    profile: &ControlProfileOption,
+    profiles: &[ControlProfileOption],
+    language: Language,
+    configured_default: Option<&str>,
+    runtime_default: Option<&str>,
+    effective_default: Option<&str>,
+) -> ListItem<'static> {
+    let (resolved, resolve_failed) =
+        profile_resolved_summary(profile.name.as_str(), profiles, language);
+    ListItem::new(Text::from(vec![
+        Line::from(profile_label(
+            profile,
+            configured_default,
+            runtime_default,
+            effective_default,
+        )),
+        Line::from(Span::styled(
+            profile_declared_summary(profile, language),
+            Style::default().fg(p.muted),
+        )),
+        Line::from(Span::styled(
+            resolved,
+            Style::default().fg(if resolve_failed { p.bad } else { p.accent }),
+        )),
+    ]))
+}
+
+fn render_selection_menu(
+    f: &mut Frame<'_>,
+    p: Palette,
+    title: &str,
+    items: Vec<ListItem<'static>>,
+    selected: usize,
+    footer: &str,
+) {
+    let area = centered_rect(82, 72, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.panel));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let mut state = ListState::default();
+    state.select((!items.is_empty()).then_some(selected.min(items.len().saturating_sub(1))));
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(p.muted)),
+        rows[1],
+    );
+    f.render_stateful_widget(
+        List::new(items)
+            .style(Style::default().fg(p.text))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(32, 39, 48))
+                    .fg(p.text)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ")
+            .highlight_spacing(HighlightSpacing::Always),
+        rows[0],
+        &mut state,
+    );
+}
+
+fn render_session_text_modal(
+    f: &mut Frame<'_>,
+    p: Palette,
+    title: &str,
+    lines: Vec<Line<'static>>,
+) {
+    let area = centered_rect(64, 58, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.panel));
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().fg(p.text))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+pub(super) fn render_session_profile_menu(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
+    let (profiles, configured_default, effective_default, runtime_default) =
+        if let Some(snapshot) = ui.profile_menu_snapshot.as_ref() {
+            (
+                snapshot.options.as_slice(),
+                snapshot.configured_default_profile.as_deref(),
+                snapshot.effective_default_profile.as_deref(),
+                snapshot.runtime_default_profile_override.as_deref(),
+            )
+        } else {
+            (
+                ui.profile_options.as_slice(),
+                ui.configured_default_profile.as_deref(),
+                ui.effective_default_profile.as_deref(),
+                ui.runtime_default_profile_override.as_deref(),
+            )
+        };
+    let mut items = vec![ListItem::new(match ui.language {
+        Language::Zh => "清除 profile 绑定",
+        Language::En => "Clear profile binding",
+    })];
+    items.extend(profiles.iter().map(|profile| {
+        profile_menu_item(
+            p,
+            profile,
+            profiles,
+            ui.language,
+            configured_default,
+            runtime_default,
+            effective_default,
+        )
+    }));
+    let footer = match ui.language {
+        Language::Zh => "Enter 应用    Esc 取消",
+        Language::En => "Enter apply    Esc cancel",
+    };
+    render_selection_menu(
+        f,
+        p,
+        match ui.language {
+            Language::Zh => "会话 profile 绑定",
+            Language::En => "Session profile binding",
+        },
+        items,
+        ui.session_profile_menu_idx,
+        footer,
+    );
+}
+
+pub(super) fn render_default_profile_menu(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
+    let (profiles, configured_default, effective_default, runtime_default) =
+        if let Some(snapshot) = ui.profile_menu_snapshot.as_ref() {
+            (
+                snapshot.options.as_slice(),
+                snapshot.configured_default_profile.as_deref(),
+                snapshot.effective_default_profile.as_deref(),
+                snapshot.runtime_default_profile_override.as_deref(),
+            )
+        } else {
+            (
+                ui.profile_options.as_slice(),
+                ui.configured_default_profile.as_deref(),
+                ui.effective_default_profile.as_deref(),
+                ui.runtime_default_profile_override.as_deref(),
+            )
+        };
+    let mut items = vec![ListItem::new(match ui.language {
+        Language::Zh => "清除（无默认 profile）",
+        Language::En => "Clear (no default profile)",
+    })];
+    items.extend(profiles.iter().map(|profile| {
+        profile_menu_item(
+            p,
+            profile,
+            profiles,
+            ui.language,
+            configured_default,
+            runtime_default,
+            effective_default,
+        )
+    }));
+    let footer = match ui.language {
+        Language::Zh => "Enter 应用    Esc 取消",
+        Language::En => "Enter apply    Esc cancel",
+    };
+    let runtime = matches!(
+        ui.overlay,
+        crate::tui::types::Overlay::RuntimeDefaultProfileMenu
+    );
+    render_selection_menu(
+        f,
+        p,
+        match (ui.language, runtime) {
+            (Language::Zh, false) => "配置默认 profile",
+            (Language::Zh, true) => "运行时默认 profile",
+            (Language::En, false) => "Configured default profile",
+            (Language::En, true) => "Runtime default profile",
+        },
+        items,
+        ui.settings_profile_menu_idx,
+        footer,
+    );
+}
+
+pub(super) fn render_session_model_menu(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
+    let mut items = vec![ListItem::new(match ui.language {
+        Language::Zh => "清除 model 覆盖",
+        Language::En => "Clear model override",
+    })];
+    items.extend(
+        ui.session_model_options
+            .iter()
+            .map(|model| ListItem::new(model.clone())),
+    );
+    items.push(ListItem::new(match ui.language {
+        Language::Zh => "自定义 model...",
+        Language::En => "Custom model...",
+    }));
+    let footer = match ui.language {
+        Language::Zh => "Enter 应用    Esc 取消",
+        Language::En => "Enter apply    Esc cancel",
+    };
+    render_selection_menu(
+        f,
+        p,
+        match ui.language {
+            Language::Zh => "会话 model",
+            Language::En => "Session model",
+        },
+        items,
+        ui.session_model_menu_idx,
+        footer,
+    );
+}
+
+pub(super) fn render_session_effort_menu(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
+    let items = SessionEffortChoice::ALL
+        .iter()
+        .map(|choice| ListItem::new(choice.label(ui.language)))
+        .collect::<Vec<_>>();
+    let footer = match ui.language {
+        Language::Zh => "Enter 应用    Esc 取消",
+        Language::En => "Enter apply    Esc cancel",
+    };
+    render_selection_menu(
+        f,
+        p,
+        match ui.language {
+            Language::Zh => "会话 reasoning effort",
+            Language::En => "Session reasoning effort",
+        },
+        items,
+        ui.session_effort_menu_idx,
+        footer,
+    );
+}
+
+pub(super) fn render_session_service_tier_menu(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
+    let mut items = SessionServiceTierChoice::ALL
+        .iter()
+        .map(|choice| ListItem::new(choice.label(ui.language)))
+        .collect::<Vec<_>>();
+    items.push(ListItem::new(match ui.language {
+        Language::Zh => "自定义 service tier...",
+        Language::En => "Custom service tier...",
+    }));
+    let footer = match ui.language {
+        Language::Zh => "fast 会以 priority 发送到上游    Enter 应用    Esc 取消",
+        Language::En => "fast is sent upstream as priority    Enter apply    Esc cancel",
+    };
+    render_selection_menu(
+        f,
+        p,
+        match ui.language {
+            Language::Zh => "会话 fast / service tier",
+            Language::En => "Session fast / service tier",
+        },
+        items,
+        ui.session_service_tier_menu_idx,
+        footer,
+    );
+}
+
+pub(super) fn render_session_binding_input(f: &mut Frame<'_>, p: Palette, ui: &UiState) {
+    let (title, field) = match (ui.language, ui.session_binding_input_kind) {
+        (Language::Zh, SessionBindingInputKind::Model) => ("自定义会话 model", "model"),
+        (Language::En, SessionBindingInputKind::Model) => ("Custom session model", "model"),
+        (Language::Zh, SessionBindingInputKind::ServiceTier) => {
+            ("自定义会话 service tier", "service_tier")
+        }
+        (Language::En, SessionBindingInputKind::ServiceTier) => {
+            ("Custom session service tier", "service_tier")
+        }
+    };
+    let mut lines = vec![Line::from(format!("{field}: {}", ui.session_binding_input))];
+    if let Some(hint) = ui.session_binding_input_hint.as_deref() {
+        lines.push(Line::from(Span::styled(
+            match ui.language {
+                Language::Zh => format!("当前有效值：{hint}"),
+                Language::En => format!("Current effective value: {hint}"),
+            },
+            Style::default().fg(p.muted),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(match ui.language {
+        Language::Zh => "Enter 应用（空值表示清除）    Esc 返回",
+        Language::En => "Enter apply (empty clears)    Esc back",
+    }));
+    render_session_text_modal(f, p, title, lines);
+}
 
 pub(super) fn render_routing_actions_modal(
     f: &mut Frame<'_>,
@@ -743,30 +1189,7 @@ pub(super) fn render_session_transcript_modal(f: &mut Frame<'_>, p: Palette, ui:
 }
 
 fn transcript_max_scroll(lines: &[Line<'_>], text_width: u16, viewport_height: u16) -> u16 {
-    if text_width == 0 || viewport_height == 0 {
-        return 0;
-    }
-    wrapped_visual_line_count(lines, usize::from(text_width))
-        .saturating_sub(usize::from(viewport_height))
-        .min(usize::from(u16::MAX)) as u16
-}
-
-fn wrapped_visual_line_count(lines: &[Line<'_>], text_width: usize) -> usize {
-    if text_width == 0 {
-        return 0;
-    }
-
-    lines
-        .iter()
-        .map(|line| {
-            let width = line.width();
-            if width == 0 {
-                1
-            } else {
-                width.div_ceil(text_width)
-            }
-        })
-        .sum()
+    max_wrapped_vertical_scroll(lines, text_width, viewport_height)
 }
 
 pub(super) fn render_startup_alert_modal(f: &mut Frame<'_>, p: Palette, ui: &UiState) {

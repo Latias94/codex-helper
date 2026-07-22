@@ -52,6 +52,13 @@ export type ApiUsageEvidence = {
   aggregate_status?: ApiEconomicsStatus;
 };
 
+export type ApiCacheTokenInclusion = "unknown" | "separate" | "included_in_input";
+
+export type ApiCacheAccountingConvention = {
+  cache_read: ApiCacheTokenInclusion;
+  cache_write: ApiCacheTokenInclusion;
+};
+
 export type ApiSelectedPriceTier = {
   tier_type: string;
   threshold_tokens: number;
@@ -97,11 +104,17 @@ export type ApiOperatorProfileSummary = {
   fast_mode: boolean;
 };
 
+export type ApiEffectiveDefaultProfileSource = "none" | "configured" | "runtime_override";
+
 export type ApiOperatorRuntimeSummary = {
   runtime_loaded_at_ms: number | null;
   runtime_source_mtime_ms: number | null;
   configured_default_profile: string | null;
   default_profile: string | null;
+  runtime_default_profile_override: string | null;
+  default_profile_source: ApiEffectiveDefaultProfileSource;
+  default_profile_control_revision: number;
+  profile_catalog_key: string;
   default_profile_summary: ApiOperatorProfileSummary | null;
   operator_actions?: ApiOperatorActionCapabilities;
 };
@@ -110,6 +123,11 @@ export type ApiOperatorActionCapabilities = {
   refresh_provider_balances: boolean;
   mutate_routing: boolean;
   mutate_session_affinity: boolean;
+  mutate_session_binding: boolean;
+  reload_runtime: boolean;
+  mutate_default_profile: boolean;
+  inspect_relay_capabilities: boolean;
+  run_relay_live_smoke: boolean;
 };
 
 export type ApiOperatorSummaryCounts = {
@@ -130,11 +148,60 @@ export type ApiRouteValueSource =
 
 export type ApiSessionContinuityMode = "default_profile" | "manual_profile";
 
+export type ApiSessionBindingProjection = {
+  revision: string;
+  profile_name?: string;
+  model?: string;
+  reasoning_effort?: string;
+  service_tier?: string;
+  continuity_mode?: ApiSessionContinuityMode;
+};
+
 export type ApiRetryProfileName =
   | "balanced"
   | "same-upstream"
   | "aggressive-failover"
   | "cost-primary";
+
+export type ApiRetryStrategy = "failover" | "same_upstream";
+export type ApiReasoningGuardAction = "observe" | "block" | "retry";
+export type ApiReasoningGuardStreamMode = "off" | "observe" | "strict-buffer";
+export type ApiReasoningGuardRetryExhaustedAction = "pass" | "block";
+
+export type ApiOperatorRetryLayerSummary = {
+  max_attempts: number;
+  backoff_ms: number;
+  backoff_max_ms: number;
+  jitter_ms: number;
+  on_status: string;
+  on_class: string[];
+  strategy: ApiRetryStrategy;
+};
+
+export type ApiOperatorReasoningGuardSummary = {
+  enabled: boolean;
+  reasoning_equals: number[];
+  boundary_sequence_max_n: number;
+  paths: string[];
+  action: ApiReasoningGuardAction;
+  stream_mode: ApiReasoningGuardStreamMode;
+  max_guard_retries: number;
+  on_retry_exhausted: ApiReasoningGuardRetryExhaustedAction;
+  log_matches: boolean;
+};
+
+export type ApiOperatorRetryPolicySummary = {
+  upstream: ApiOperatorRetryLayerSummary;
+  provider: ApiOperatorRetryLayerSummary;
+  never_on_status: string;
+  never_on_class: string[];
+  cloudflare_challenge_cooldown_secs: number;
+  cloudflare_timeout_cooldown_secs: number;
+  transport_cooldown_secs: number;
+  cooldown_backoff_factor: number;
+  cooldown_backoff_max_secs: number;
+  reasoning_guard: ApiOperatorReasoningGuardSummary;
+};
 
 export type ApiResolvedRouteValue = {
   value: string;
@@ -169,6 +236,7 @@ export type ApiOperatorRetrySummary = {
   configured_profile: ApiRetryProfileName | null;
   upstream_max_attempts: number;
   provider_max_attempts: number;
+  policy?: ApiOperatorRetryPolicySummary;
   recent_retried_requests: number;
   recent_cross_provider_failovers: number;
   recent_same_provider_retries: number;
@@ -494,6 +562,7 @@ export type ApiOperatorSessionSummary = {
   avg_output_tokens_per_second?: number;
   binding_profile_name?: string;
   binding_continuity_mode?: ApiSessionContinuityMode;
+  binding: ApiSessionBindingProjection;
   last_route_decision?: ApiOperatorRouteDecision;
   route_affinity?: ApiOperatorSessionRouteAffinitySummary;
   effective_model?: ApiResolvedRouteValue;
@@ -606,6 +675,7 @@ export type ApiOperatorRouteAttemptSummary = {
 
 export type ApiOperatorRequestSummary = {
   id: number;
+  trace_key?: string;
   session_key?: string;
   model?: string;
   reasoning_effort?: string;
@@ -616,6 +686,7 @@ export type ApiOperatorRequestSummary = {
   route_path?: string[];
   upstream_origin?: string;
   usage?: ApiUsageMetrics;
+  cache_accounting_convention: ApiCacheAccountingConvention;
   cost?: ApiCostBreakdown;
   retry?: ApiOperatorRetrySummaryView;
   provider_signal_codes?: string[];
@@ -1017,6 +1088,7 @@ export type ApiOperatorProviderBalanceSummary = {
   usage_rate?: ApiProviderUsageRateSnapshot;
   usage_model_stats?: ApiProviderUsageModelStat[];
   alert_codes?: ApiProviderUsageAlertKind[];
+  error?: string;
 };
 
 export type ApiOperatorRevisionBundle = {

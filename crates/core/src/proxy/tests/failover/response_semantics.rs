@@ -101,6 +101,111 @@ fn official_openai_test_proxy_service(
     ProxyService::new(client, Arc::new(config), "codex")
 }
 
+async fn spawn_official_https_authorization_capture() -> (
+    std::net::SocketAddr,
+    Arc<std::sync::Mutex<Option<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    const CERTIFICATE_DER: &str = concat!(
+        "MIIBszCCAVmgAwIBAgIUUg3keFcU1xXWK8BNVb1KynPulV8wCgYIKoZIzj0EAwIw",
+        "JjEkMCIGA1UEAwwbUnVzdGxzIFJvYnVzdCBSb290IC0gUnVuZyAyMCAXDTc1MDEw",
+        "MTAwMDAwMFoYDzQwOTYwMTAxMDAwMDAwWjAhMR8wHQYDVQQDDBZyY2dlbiBzZWxm",
+        "IHNpZ25lZCBjZXJ0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEud6w4gtZ0xbw",
+        "J3E69SSMy5TZfdIifl9L5ZY+hgEe4UiUsBWS32f6Y5NR5Jo8FO1f6o13b3+FvVHR",
+        "EHCGdvppL6NoMGYwFQYDVR0RBA4wDIIKZm9vYmFyLmNvbTAdBgNVHSUEFjAUBggr",
+        "BgEFBQcDAQYIKwYBBQUHAwIwHQYDVR0OBBYEFELvxbj5tD75n4pYFvJyr+c8qVEi",
+        "MA8GA1UdEwEB/wQFMAMBAQAwCgYIKoZIzj0EAwIDSAAwRQIhALxSSdUsrRFnwNMu",
+        "/doBqI8i8u5HdohVAheFTDwObkOMAiASSjULUtkWSD15u/7Sr01Wm9J1MpqW1pob",
+        "BVqU3CNRlA=="
+    );
+    const PRIVATE_KEY_DER: &str = concat!(
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTbAQpfjAT46fgF4B",
+        "mP15n37woNG5ZNJmwcqsred/7tmhRANCAAS53rDiC1nTFvAncTr1JIzLlNl90iJ+",
+        "X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv"
+    );
+    let certificate = CertificateDer::from(
+        base64::engine::general_purpose::STANDARD
+            .decode(CERTIFICATE_DER)
+            .expect("decode test certificate"),
+    );
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        base64::engine::general_purpose::STANDARD
+            .decode(PRIVATE_KEY_DER)
+            .expect("decode test private key"),
+    ));
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], private_key)
+        .expect("build test TLS server config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test TLS upstream");
+    let addr = listener.local_addr().expect("test TLS upstream address");
+    let seen_authorization = Arc::new(std::sync::Mutex::new(None));
+    let authorization_for_task = Arc::clone(&seen_authorization);
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept test TLS connection");
+        let mut stream = acceptor
+            .accept(stream)
+            .await
+            .expect("accept test TLS request");
+        let mut request = Vec::new();
+        let header_end = loop {
+            if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let read = stream
+                .read_buf(&mut request)
+                .await
+                .expect("read test TLS request headers");
+            assert!(read > 0, "test TLS request ended before its headers");
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let read = stream
+                .read_buf(&mut request)
+                .await
+                .expect("read test TLS request body");
+            assert!(read > 0, "test TLS request ended before its body");
+        }
+        let authorization = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_string())
+        });
+        *authorization_for_task
+            .lock()
+            .expect("authorization capture lock") = authorization;
+
+        let body = r#"{"id":"resp-official-auth","object":"response","model":"gpt-5.6-sol"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write test TLS response");
+        stream.shutdown().await.expect("shutdown test TLS response");
+    });
+    (addr, seen_authorization, handle)
+}
+
 #[tokio::test]
 async fn proxy_official_sol_maps_ultra_to_max_from_captured_contract() {
     let upstream_hits = Arc::new(AtomicUsize::new(0));
@@ -232,6 +337,45 @@ async fn official_passthrough_persists_keyed_account_identity_not_raw_header_dig
             .and_then(|terminal| terminal.terminal.payload.as_ref())
             .and_then(|payload| payload.provider_epoch.as_ref()),
         Some(provider_epoch)
+    );
+}
+
+#[tokio::test]
+async fn official_unconfigured_route_forwards_the_codex_authorization_header_end_to_end() {
+    const CODEX_AUTHORIZATION: &str = "Bearer official-onboarding-auth-canary";
+    let (upstream_addr, seen_authorization, upstream_handle) =
+        spawn_official_https_authorization_capture().await;
+    let client = crate::proxy::upstream_http_client_builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .resolve("api.openai.com", upstream_addr)
+        .build()
+        .expect("build official HTTPS test client");
+    let config = make_helper_config(
+        vec![crate::proxy::tests::harness::upstream_config(
+            "https://api.openai.com/v1",
+        )],
+        retry_config(1, "", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = spawn_proxy_service(ProxyService::new(client, Arc::new(config), "codex"));
+
+    let response = local_http_test_client()
+        .post(proxy.responses_url())
+        .header("authorization", CODEX_AUTHORIZATION)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5.6-sol","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send official authorization passthrough request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.expect("read proxy response");
+    upstream_handle.await.expect("test TLS upstream task");
+    assert_eq!(
+        seen_authorization
+            .lock()
+            .expect("authorization capture lock")
+            .as_deref(),
+        Some(CODEX_AUTHORIZATION)
     );
 }
 
@@ -1536,6 +1680,20 @@ async fn models_status_failover_does_not_poison_inference_health_or_affinity() {
             .await
             .is_none()
     );
+    assert_eq!(
+        state
+            .get_usage_rollup_view("codex", 12, 0)
+            .await
+            .loaded
+            .requests_total,
+        0
+    );
+    assert!(
+        !state
+            .list_session_stats("codex")
+            .await
+            .contains_key(session_id)
+    );
 
     let runtime = state
         .route_plan_runtime_state_for_provider_endpoints("codex")
@@ -1578,6 +1736,683 @@ async fn models_status_failover_does_not_poison_inference_health_or_affinity() {
     assert_eq!(body["provider"].as_str(), Some("primary"));
     assert_eq!(primary_responses_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_responses_hits.load(Ordering::SeqCst), 0);
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn non_post_responses_failure_is_request_local_and_non_economic() {
+    let primary_get_hits = Arc::new(AtomicUsize::new(0));
+    let primary_post_hits = Arc::new(AtomicUsize::new(0));
+    let primary_get_counter = primary_get_hits.clone();
+    let primary_post_counter = primary_post_hits.clone();
+    let primary = spawn_test_upstream(
+        axum::Router::new().route(
+            "/v1/compat/responses",
+            get(move || {
+                let hits = primary_get_counter.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "GET is unsupported" })),
+                    )
+                }
+            })
+            .post(move || {
+                let hits = primary_post_counter.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "provider": "primary" }))
+                }
+            }),
+        ),
+    );
+
+    let backup_get_hits = Arc::new(AtomicUsize::new(0));
+    let backup_post_hits = Arc::new(AtomicUsize::new(0));
+    let backup_get_counter = backup_get_hits.clone();
+    let backup_post_counter = backup_post_hits.clone();
+    let backup = spawn_test_upstream(
+        axum::Router::new().route(
+            "/v1/compat/responses",
+            get(move || {
+                let hits = backup_get_counter.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "provider": "backup" }))
+                }
+            })
+            .post(move || {
+                let hits = backup_post_counter.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "provider": "backup" }))
+                }
+            }),
+        ),
+    );
+
+    let config = request_local_models_config(
+        vec![primary.upstream_config(), backup.upstream_config()],
+        request_local_models_retry_config("503", Vec::new()),
+    );
+    let service = proxy_service(config);
+    let state = service.state.clone();
+    let proxy = spawn_proxy_service(service);
+    let client = local_http_test_client();
+    let session_id = "invalid-get-responses";
+
+    let response = client
+        .get(proxy.url("/compat/responses"))
+        .header("session-id", session_id)
+        .send()
+        .await
+        .expect("send request-local GET responses request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("read GET response");
+    assert_eq!(body["provider"].as_str(), Some("backup"));
+    assert_eq!(primary_get_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_get_hits.load(Ordering::SeqCst), 1);
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let primary_health =
+        runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(primary_health.failure_count, 0);
+    assert!(!primary_health.cooldown_active);
+    assert!(
+        state
+            .peek_session_route_affinity(session_id)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        state
+            .get_usage_rollup_view("codex", 12, 0)
+            .await
+            .loaded
+            .requests_total,
+        0
+    );
+    assert!(
+        !state
+            .list_session_stats("codex")
+            .await
+            .contains_key(session_id)
+    );
+
+    let response = client
+        .post(proxy.url("/compat/responses"))
+        .header("content-type", "application/json")
+        .header("session-id", session_id)
+        .body(r#"{"model":"gpt-5","input":"still primary"}"#)
+        .send()
+        .await
+        .expect("send route-facing POST responses request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("read POST response");
+    assert_eq!(body["provider"].as_str(), Some("primary"));
+    assert_eq!(primary_post_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_post_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        state
+            .get_usage_rollup_view("codex", 12, 0)
+            .await
+            .loaded
+            .requests_total,
+        1
+    );
+    assert_eq!(
+        state.list_session_stats("codex").await[session_id].turns_total,
+        1
+    );
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn unsupported_models_on_the_only_upstream_does_not_blackhole_inference() {
+    let models_hits = Arc::new(AtomicUsize::new(0));
+    let responses_hits = Arc::new(AtomicUsize::new(0));
+    let models_counter = models_hits.clone();
+    let responses_counter = responses_hits.clone();
+    let upstream = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/models",
+                get(move || {
+                    let hits = models_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({ "error": "models unsupported" })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = responses_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "provider": "only" }))
+                    }
+                }),
+            ),
+    );
+    let config = request_local_models_config(
+        vec![upstream.upstream_config()],
+        request_local_models_retry_config("503", Vec::new()),
+    );
+    let service = proxy_service(config);
+    let state = service.state.clone();
+    let proxy = spawn_proxy_service(service);
+    let client = local_http_test_client();
+    let session_id = "unsupported-models-only-upstream";
+
+    let models = client
+        .get(proxy.url("/models"))
+        .header("session-id", session_id)
+        .send()
+        .await
+        .expect("send unsupported models request");
+    assert_eq!(models.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = models
+        .bytes()
+        .await
+        .expect("read unsupported models response");
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let health = runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(health.failure_count, 0);
+    assert!(!health.cooldown_active);
+    assert_eq!(
+        state
+            .get_usage_rollup_view("codex", 12, 0)
+            .await
+            .loaded
+            .requests_total,
+        0
+    );
+    assert!(
+        !state
+            .list_session_stats("codex")
+            .await
+            .contains_key(session_id)
+    );
+
+    let inference = client
+        .post(proxy.responses_url())
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"still usable"}"#)
+        .send()
+        .await
+        .expect("send inference after unsupported models");
+    assert_eq!(inference.status(), StatusCode::OK);
+    let body: serde_json::Value = inference.json().await.expect("read inference response");
+    assert_eq!(body["provider"].as_str(), Some("only"));
+    assert_eq!(models_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn resource_and_unknown_status_failover_do_not_poison_inference_health_or_affinity() {
+    let primary_local_hits = Arc::new(AtomicUsize::new(0));
+    let primary_responses_hits = Arc::new(AtomicUsize::new(0));
+    let primary_files_counter = primary_local_hits.clone();
+    let primary_unknown_counter = primary_local_hits.clone();
+    let primary_responses_counter = primary_responses_hits.clone();
+    let primary = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/files/file-1",
+                get(move || {
+                    let hits = primary_files_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({ "error": "files unsupported" })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/future-resource",
+                get(move || {
+                    let hits = primary_unknown_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({ "error": "resource unsupported" })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = primary_responses_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "provider": "primary" }))
+                    }
+                }),
+            ),
+    );
+
+    let backup_local_hits = Arc::new(AtomicUsize::new(0));
+    let backup_responses_hits = Arc::new(AtomicUsize::new(0));
+    let backup_files_counter = backup_local_hits.clone();
+    let backup_unknown_counter = backup_local_hits.clone();
+    let backup_responses_counter = backup_responses_hits.clone();
+    let backup = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/files/file-1",
+                get(move || {
+                    let hits = backup_files_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "provider": "backup" }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/future-resource",
+                get(move || {
+                    let hits = backup_unknown_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "provider": "backup" }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = backup_responses_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "provider": "backup" }))
+                    }
+                }),
+            ),
+    );
+
+    let config = request_local_models_config(
+        vec![primary.upstream_config(), backup.upstream_config()],
+        request_local_models_retry_config("503", Vec::new()),
+    );
+    let service = proxy_service(config);
+    let state = service.state.clone();
+    let proxy = spawn_proxy_service(service);
+    let client = local_http_test_client();
+    let session_id = "resource-request-local-status";
+
+    for path in ["/files/file-1", "/future-resource"] {
+        let response = client
+            .get(proxy.url(path))
+            .header("session-id", session_id)
+            .send()
+            .await
+            .expect("send request-local resource request");
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body: serde_json::Value = response.json().await.expect("read resource response");
+        assert_eq!(body["provider"].as_str(), Some("backup"), "{path}");
+
+        let finished = find_finished_request(&state, 10, |request| request.path == path)
+            .await
+            .expect("finished request-local resource request");
+        let first_failure = finished
+            .retry
+            .as_ref()
+            .expect("resource retry trace")
+            .route_attempts
+            .iter()
+            .find(|attempt| attempt.status_code == Some(StatusCode::SERVICE_UNAVAILABLE.as_u16()))
+            .expect("resource failure attempt");
+        assert_eq!(first_failure.cooldown_secs, None, "{path}");
+        assert_eq!(first_failure.cooldown_reason, None, "{path}");
+        assert!(
+            first_failure
+                .provider_signals
+                .iter()
+                .all(|signal| !signal.route_facing),
+            "{path}"
+        );
+    }
+
+    assert_eq!(primary_local_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_local_hits.load(Ordering::SeqCst), 2);
+    assert!(
+        state
+            .peek_session_route_affinity(session_id)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        state
+            .get_usage_rollup_view("codex", 12, 0)
+            .await
+            .loaded
+            .requests_total,
+        0
+    );
+    assert!(
+        !state
+            .list_session_stats("codex")
+            .await
+            .contains_key(session_id)
+    );
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let primary_health =
+        runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(primary_health.failure_count, 0);
+    assert!(!primary_health.cooldown_active);
+
+    let response = client
+        .post(proxy.responses_url())
+        .header("content-type", "application/json")
+        .header("session-id", session_id)
+        .body(r#"{"model":"gpt-5","input":"hi"}"#)
+        .send()
+        .await
+        .expect("send inference request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("read inference response");
+    assert_eq!(body["provider"].as_str(), Some("primary"));
+    assert_eq!(primary_responses_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_responses_hits.load(Ordering::SeqCst), 0);
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn request_local_mutation_status_is_not_replayed_after_dispatch() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let primary_counter = primary_hits.clone();
+    let primary = spawn_test_upstream(axum::Router::new().route(
+        "/v1/files",
+        post(move || {
+            let hits = primary_counter.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": "temporary failure" })),
+                )
+            }
+        }),
+    ));
+
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let backup_counter = backup_hits.clone();
+    let backup = spawn_test_upstream(axum::Router::new().route(
+        "/v1/files",
+        post(move || {
+            let hits = backup_counter.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "provider": "backup" }))
+            }
+        }),
+    ));
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            2,
+            "503",
+            Vec::new(),
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "503",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        ..RetryConfig::default()
+    };
+    let service = proxy_service(request_local_models_config(
+        vec![primary.upstream_config(), backup.upstream_config()],
+        retry,
+    ));
+    let state = service.state.clone();
+    let proxy = spawn_proxy_service(service);
+
+    let response = local_http_test_client()
+        .post(proxy.url("/files"))
+        .header("content-type", "application/json")
+        .body(r#"{"purpose":"assistants","filename":"input.jsonl"}"#)
+        .send()
+        .await
+        .expect("send request-local mutation");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = response.bytes().await.expect("read mutation response");
+
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let primary_health =
+        runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(primary_health.failure_count, 0);
+    assert!(!primary_health.cooldown_active);
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn request_local_mutation_transport_failure_is_not_replayed() {
+    let unused_addr = reserve_unused_local_addr();
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let backup_counter = backup_hits.clone();
+    let backup = spawn_test_upstream(axum::Router::new().route(
+        "/v1/files",
+        post(move || {
+            let hits = backup_counter.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({ "provider": "backup" }))
+            }
+        }),
+    ));
+    let mut unreachable = backup.upstream_config();
+    unreachable.base_url = format!("http://{unused_addr}/v1");
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            2,
+            "",
+            vec!["upstream_transport_error".to_string()],
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "",
+            vec!["upstream_transport_error".to_string()],
+            RetryStrategy::Failover,
+        )),
+        ..RetryConfig::default()
+    };
+    let proxy = spawn_proxy_service(proxy_service(request_local_models_config(
+        vec![unreachable, backup.upstream_config()],
+        retry,
+    )));
+
+    let response = local_http_test_client()
+        .post(proxy.url("/files"))
+        .header("content-type", "application/json")
+        .body(r#"{"purpose":"assistants","filename":"input.jsonl"}"#)
+        .send()
+        .await
+        .expect("receive proxy transport failure response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _ = response.bytes().await.expect("read transport response");
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn request_local_json_body_is_forwarded_byte_for_byte() {
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel::<Bytes>();
+    let body_tx = Arc::new(std::sync::Mutex::new(Some(body_tx)));
+    let body_capture = body_tx.clone();
+    let upstream = spawn_test_upstream(axum::Router::new().route(
+        "/v1/files",
+        post(move |body: Bytes| {
+            let body_capture = body_capture.clone();
+            async move {
+                if let Some(sender) = body_capture.lock().expect("capture lock").take() {
+                    let _ = sender.send(body);
+                }
+                Json(serde_json::json!({ "id": "file-1" }))
+            }
+        }),
+    ));
+    let proxy = spawn_proxy_service(proxy_service(request_local_models_config(
+        vec![upstream.upstream_config()],
+        request_local_models_retry_config("", Vec::new()),
+    )));
+    let raw_body = "{\n  \"z\": 1,\n  \"purpose\": \"assistants\",\n  \"a\": [3, 2, 1]\n}\n";
+
+    let response = local_http_test_client()
+        .post(proxy.url("/files"))
+        .header("content-type", "application/json")
+        .body(raw_body)
+        .send()
+        .await
+        .expect("send request-local JSON");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.expect("read files response");
+    let observed = tokio::time::timeout(Duration::from_secs(1), body_rx)
+        .await
+        .expect("receive forwarded body")
+        .expect("body sender remains alive");
+    assert_eq!(observed.as_ref(), raw_body.as_bytes());
+
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn request_local_sse_streams_incrementally_without_shared_health_or_economic_state() {
+    let release_second_chunk = Arc::new(tokio::sync::Notify::new());
+    let upstream_release = Arc::clone(&release_second_chunk);
+    let upstream = spawn_test_upstream(axum::Router::new().route(
+        "/v1/files/events",
+        get(move || {
+            let upstream_release = Arc::clone(&upstream_release);
+            async move {
+                let first = stream::once(async {
+                    Ok::<Bytes, Infallible>(Bytes::from_static(b"data: first\n\n"))
+                });
+                let second = stream::once(async move {
+                    upstream_release.notified().await;
+                    Ok::<Bytes, Infallible>(Bytes::from_static(b"data: second\n\n"))
+                });
+                let mut response = Response::new(Body::from_stream(first.chain(second)));
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }
+        }),
+    ));
+    let service = proxy_service(request_local_models_config(
+        vec![upstream.upstream_config()],
+        request_local_models_retry_config("", Vec::new()),
+    ));
+    let state = Arc::clone(&service.state);
+    let proxy = spawn_proxy_service(service);
+    let client = local_http_test_client();
+    let session_id = "request-local-sse";
+
+    let mut send = tokio::spawn({
+        let client = client.clone();
+        let url = proxy.url("/files/events");
+        async move {
+            client
+                .get(url)
+                .header("accept", "text/event-stream")
+                .header("session-id", session_id)
+                .send()
+                .await
+        }
+    });
+    let mut response = tokio::time::timeout(Duration::from_secs(2), &mut send)
+        .await
+        .expect("request-local SSE headers must not wait for the complete upstream body")
+        .expect("join request-local SSE sender")
+        .expect("send request-local SSE request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let first = tokio::time::timeout(Duration::from_secs(2), response.chunk())
+        .await
+        .expect("first request-local SSE chunk must be forwarded incrementally")
+        .expect("read first request-local SSE chunk")
+        .expect("first request-local SSE chunk");
+    assert_eq!(first.as_ref(), b"data: first\n\n");
+
+    release_second_chunk.notify_one();
+    let second = response
+        .chunk()
+        .await
+        .expect("read second request-local SSE chunk")
+        .expect("second request-local SSE chunk");
+    assert_eq!(second.as_ref(), b"data: second\n\n");
+    assert!(
+        response
+            .chunk()
+            .await
+            .expect("read request-local SSE EOF")
+            .is_none()
+    );
+
+    let finished = find_finished_request(&state, 10, |request| request.path == "/files/events")
+        .await
+        .expect("finished request-local SSE request");
+    assert_eq!(finished.status_code, StatusCode::OK.as_u16());
+    assert!(finished.streaming);
+    assert_eq!(
+        state
+            .get_usage_rollup_view("codex", 12, 0)
+            .await
+            .loaded
+            .requests_total,
+        0
+    );
+    assert!(
+        !state
+            .list_session_stats("codex")
+            .await
+            .contains_key(session_id)
+    );
+    assert!(
+        state
+            .peek_session_route_affinity(session_id)
+            .await
+            .is_none()
+    );
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let health = runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(health.failure_count, 0);
+    assert!(!health.cooldown_active);
 
     proxy.handle.abort();
 }
@@ -1626,7 +2461,8 @@ async fn models_success_does_not_clear_existing_inference_failure_state() {
         .await
         .expect("send models request");
     assert_eq!(response.status(), StatusCode::OK);
-    let _ = response.bytes().await.expect("read models response");
+    let body = response.bytes().await.expect("read models response");
+    assert_openai_models_response(body.as_ref(), "gpt-5.6-sol");
 
     let runtime = state
         .route_plan_runtime_state_for_provider_endpoints("codex")
@@ -1639,47 +2475,75 @@ async fn models_success_does_not_clear_existing_inference_failure_state() {
 }
 
 #[tokio::test]
-async fn models_auth_failure_refreshes_credentials_without_cross_account_replay() {
-    let primary_hits = Arc::new(AtomicUsize::new(0));
-    let primary_counter = primary_hits.clone();
-    let primary = spawn_test_upstream(axum::Router::new().route(
-        "/v1/models",
-        get(move || {
-            let hits = primary_counter.clone();
-            async move {
-                hits.fetch_add(1, Ordering::SeqCst);
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({ "error": "credential rejected" })),
-                )
-            }
+async fn models_auth_failure_does_not_refresh_but_inference_auth_failure_does() {
+    let models_hits = Arc::new(AtomicUsize::new(0));
+    let models_counter = Arc::clone(&models_hits);
+    let inference_hits = Arc::new(AtomicUsize::new(0));
+    let inference_counter = Arc::clone(&inference_hits);
+    let upstream = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/models",
+                get(move || {
+                    let hits = Arc::clone(&models_counter);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({ "error": "credential rejected" })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = Arc::clone(&inference_counter);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({ "error": "credential rejected" })),
+                        )
+                    }
+                }),
+            ),
+    );
+    let mut upstream_config = upstream.upstream_config();
+    upstream_config.auth = UpstreamAuth {
+        auth_token_ref: Some(crate::config::CredentialRef::Native {
+            name: "relay.primary".to_string(),
         }),
-    ));
-    let backup_hits = Arc::new(AtomicUsize::new(0));
-    let backup_counter = backup_hits.clone();
-    let backup = spawn_test_upstream(axum::Router::new().route(
-        "/v1/models",
-        get(move || {
-            let hits = backup_counter.clone();
-            async move {
-                hits.fetch_add(1, Ordering::SeqCst);
-                Json(serde_json::json!({
-                    "object": "list",
-                    "data": [{ "id": "gpt-5.6-sol", "object": "model" }]
-                }))
-            }
-        }),
-    ));
+        ..UpstreamAuth::default()
+    };
     let config = request_local_models_config(
-        vec![primary.upstream_config(), backup.upstream_config()],
+        vec![upstream_config],
         request_local_models_retry_config("401", Vec::new()),
     );
-    let service = proxy_service(config);
+    let (credential_sources, credential_control) =
+        crate::credentials::CredentialSourceCapabilities::test_native(
+            crate::credentials::SecretValue::new(b"generation-a".to_vec())
+                .expect("valid initial credential"),
+        );
+    let runtime_store =
+        Arc::new(crate::runtime_store::RuntimeStore::open_in_memory().expect("open runtime store"));
+    let service = ProxyService::new_with_runtime_store_and_credential_sources(
+        Client::new(),
+        Arc::new(config),
+        "codex",
+        runtime_store,
+        credential_sources,
+    )
+    .expect("build credential-backed proxy");
     let state = service.state.clone();
+    assert_eq!(credential_control.read_count(), 1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let refresh_driver = service.spawn_credential_refresh_driver(shutdown_rx);
     let proxy = spawn_proxy_service(service);
     let session_id = "models-request-local-auth";
+    let client = local_http_test_client();
 
-    let response = local_http_test_client()
+    let response = client
         .get(proxy.url("/models"))
         .header("session-id", session_id)
         .send()
@@ -1687,8 +2551,14 @@ async fn models_auth_failure_refreshes_credentials_without_cross_account_replay(
         .expect("send models request");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let _ = response.bytes().await.expect("read auth failure response");
-    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(models_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(inference_hits.load(Ordering::SeqCst), 0);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        credential_control.read_count(),
+        1,
+        "request-local model catalog failures must not refresh shared credentials"
+    );
     assert!(
         state
             .peek_session_route_affinity(session_id)
@@ -1703,6 +2573,116 @@ async fn models_auth_failure_refreshes_credentials_without_cross_account_replay(
         runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
     assert_eq!(primary_health.failure_count, 0);
     assert!(!primary_health.cooldown_active);
+
+    let response = post_responses_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","input":"refresh credential"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let _ = response
+        .bytes()
+        .await
+        .expect("read inference auth failure response");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while credential_control.read_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("route-facing inference auth failure should refresh credentials");
+    assert_eq!(models_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(inference_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(credential_control.read_count(), 2);
+
+    shutdown_tx.send(true).expect("signal refresh shutdown");
+    refresh_driver.await.expect("join refresh driver");
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn models_auth_failure_can_fail_over_without_poisoning_inference_health() {
+    let primary_models_hits = Arc::new(AtomicUsize::new(0));
+    let primary_models_counter = primary_models_hits.clone();
+    let primary_inference_hits = Arc::new(AtomicUsize::new(0));
+    let primary_inference_counter = primary_inference_hits.clone();
+    let primary = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/models",
+                get(move || {
+                    let hits = primary_models_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({ "error": "catalog auth unsupported" })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = primary_inference_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "provider": "primary" }))
+                    }
+                }),
+            ),
+    );
+    let backup_models_hits = Arc::new(AtomicUsize::new(0));
+    let backup_models_counter = backup_models_hits.clone();
+    let backup = spawn_test_upstream(axum::Router::new().route(
+        "/v1/models",
+        get(move || {
+            let hits = backup_models_counter.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "object": "list",
+                    "data": [{ "id": "gpt-5.6-sol", "object": "model" }]
+                }))
+            }
+        }),
+    ));
+    let service = proxy_service(request_local_models_config(
+        vec![primary.upstream_config(), backup.upstream_config()],
+        request_local_models_retry_config("401", Vec::new()),
+    ));
+    let state = service.state.clone();
+    let proxy = spawn_proxy_service(service);
+    let client = local_http_test_client();
+
+    let response = client
+        .get(proxy.url("/models"))
+        .send()
+        .await
+        .expect("send models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.expect("read models response");
+    assert_openai_models_response(body.as_ref(), "gpt-5.6-sol");
+    assert_eq!(primary_models_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_models_hits.load(Ordering::SeqCst), 1);
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let primary_health =
+        runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(primary_health.failure_count, 0);
+    assert!(!primary_health.cooldown_active);
+
+    let inference = post_responses_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","input":"still use primary"}"#,
+    )
+    .await;
+    assert_eq!(inference.status(), StatusCode::OK);
+    assert_eq!(primary_inference_hits.load(Ordering::SeqCst), 1);
 
     proxy.handle.abort();
 }
@@ -1768,6 +2748,570 @@ async fn models_transport_failover_does_not_penalize_inference_health() {
     assert_eq!(transport_failure.cooldown_reason, None);
 
     proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn buffered_half_open_probe_singleflights_and_clears_on_success() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let first_dispatch_started = Arc::new(tokio::sync::Notify::new());
+    let release_first_dispatch = Arc::new(tokio::sync::Notify::new());
+
+    let hit_counter = Arc::clone(&upstream_hits);
+    let started = Arc::clone(&first_dispatch_started);
+    let release = Arc::clone(&release_first_dispatch);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hit_counter = Arc::clone(&hit_counter);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            async move {
+                let hit = hit_counter.fetch_add(1, Ordering::SeqCst);
+                if hit == 0 {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "provider": "half-open" })),
+                )
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            3,
+            "500-599",
+            Vec::new(),
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            3,
+            "500-599",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let source = HelperConfig {
+        retry,
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([(
+                "half-open".to_string(),
+                ProviderConfig {
+                    base_url: Some(format!("http://{upstream_addr}/v1")),
+                    inline_auth: UpstreamAuth::default(),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "half-open".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let state = Arc::clone(&proxy.state);
+    let endpoint = ProviderEndpointKey::new("codex", "half-open", "default");
+    let identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&endpoint)
+        .await;
+    state
+        .penalize_runtime_upstream_attempt(
+            "codex",
+            &identity,
+            30,
+            crate::endpoint_health::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let url = format!("http://{proxy_addr}/v1/responses");
+    let client = local_http_test_client();
+    let first_started = first_dispatch_started.notified();
+    tokio::pin!(first_started);
+    let first_client = client.clone();
+    let first_url = url.clone();
+    let first_request = tokio::spawn(async move {
+        first_client
+            .post(first_url)
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-5","input":"first"}"#)
+            .send()
+            .await
+            .expect("send first half-open request")
+            .status()
+    });
+    tokio::time::timeout(Duration::from_secs(2), &mut first_started)
+        .await
+        .expect("the half-open request should reach upstream");
+
+    let mut concurrent = tokio::task::JoinSet::new();
+    for request_index in 0..12 {
+        let client = client.clone();
+        let url = url.clone();
+        concurrent.spawn(async move {
+            client
+                .post(url)
+                .header("content-type", "application/json")
+                .body(format!(
+                    r#"{{"model":"gpt-5","input":"concurrent-{request_index}"}}"#
+                ))
+                .send()
+                .await
+                .expect("send concurrent half-open request")
+                .status()
+        });
+    }
+    while let Some(result) = tokio::time::timeout(Duration::from_secs(2), concurrent.join_next())
+        .await
+        .expect("concurrent requests should be rejected without waiting for upstream")
+    {
+        assert!(!result.expect("concurrent request task").is_success());
+    }
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    release_first_dispatch.notify_one();
+    assert_eq!(
+        first_request.await.expect("first request task"),
+        StatusCode::OK
+    );
+    let recovered = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"after-recovery"}"#)
+        .send()
+        .await
+        .expect("send recovered request");
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn failed_buffered_half_open_probe_is_not_repeated_in_the_same_epoch() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hit_counter = Arc::clone(&upstream_hits);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hit_counter = Arc::clone(&hit_counter);
+            async move {
+                hit_counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": "still unavailable" })),
+                )
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            3,
+            "503",
+            Vec::new(),
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            3,
+            "503",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let source = HelperConfig {
+        retry,
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([(
+                "half-open".to_string(),
+                ProviderConfig {
+                    base_url: Some(format!("http://{upstream_addr}/v1")),
+                    inline_auth: UpstreamAuth::default(),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "half-open".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let state = Arc::clone(&proxy.state);
+    let endpoint = ProviderEndpointKey::new("codex", "half-open", "default");
+    let identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&endpoint)
+        .await;
+    state
+        .penalize_runtime_upstream_attempt(
+            "codex",
+            &identity,
+            30,
+            crate::endpoint_health::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let url = format!("http://{proxy_addr}/v1/responses");
+    let client = local_http_test_client();
+
+    let first = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"first"}"#)
+        .send()
+        .await
+        .expect("send first failed half-open request");
+    assert!(!first.status().is_success());
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    let second = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"second"}"#)
+        .send()
+        .await
+        .expect("send second failed half-open request");
+    assert!(!second.status().is_success());
+    assert_eq!(
+        upstream_hits.load(Ordering::SeqCst),
+        1,
+        "the failed probe must consume its breaker epoch"
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn streaming_half_open_probe_singleflights_and_clears_only_after_protocol_success() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let first_dispatch_started = Arc::new(tokio::sync::Notify::new());
+    let first_chunk_received = Arc::new(tokio::sync::Notify::new());
+    let release_first_terminal = Arc::new(tokio::sync::Notify::new());
+
+    let hit_counter = Arc::clone(&upstream_hits);
+    let started = Arc::clone(&first_dispatch_started);
+    let release = Arc::clone(&release_first_terminal);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hit_counter = Arc::clone(&hit_counter);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            async move {
+                let hit = hit_counter.fetch_add(1, Ordering::SeqCst);
+                let body = if hit == 0 {
+                    started.notify_one();
+                    let first = stream::once(async {
+                        Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"probe\"}\n\n",
+                        ))
+                    });
+                    let terminal = stream::once(async move {
+                        release.notified().await;
+                        Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-probe\"}}\n\n",
+                        ))
+                    });
+                    Body::from_stream(first.chain(terminal))
+                } else {
+                    Body::from(
+                        "event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-recovered\"}}\n\n",
+                    )
+                };
+                let mut response = Response::new(body);
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            3,
+            "500-599",
+            Vec::new(),
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            3,
+            "500-599",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let source = HelperConfig {
+        retry,
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([(
+                "half-open".to_string(),
+                ProviderConfig {
+                    base_url: Some(format!("http://{upstream_addr}/v1")),
+                    inline_auth: UpstreamAuth::default(),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "half-open".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let state = Arc::clone(&proxy.state);
+    let endpoint = ProviderEndpointKey::new("codex", "half-open", "default");
+    let identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&endpoint)
+        .await;
+    state
+        .penalize_runtime_upstream_attempt(
+            "codex",
+            &identity,
+            30,
+            crate::endpoint_health::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let url = format!("http://{proxy_addr}/v1/responses");
+    let client = local_http_test_client();
+    let first_started = first_dispatch_started.notified();
+    tokio::pin!(first_started);
+    let first_chunk = first_chunk_received.notified();
+    tokio::pin!(first_chunk);
+    let first_client = client.clone();
+    let first_url = url.clone();
+    let first_chunk_signal = Arc::clone(&first_chunk_received);
+    let first_request = tokio::spawn(async move {
+        let mut response = first_client
+            .post(first_url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .body(r#"{"model":"gpt-5","input":"first","stream":true}"#)
+            .send()
+            .await
+            .expect("send first streaming half-open request");
+        let status = response.status();
+        let initial = response
+            .chunk()
+            .await
+            .expect("read first streaming probe chunk")
+            .expect("first streaming probe chunk");
+        assert!(String::from_utf8_lossy(initial.as_ref()).contains("response.output_text.delta"));
+        first_chunk_signal.notify_one();
+        let body = response.text().await.expect("read first streaming probe");
+        (status, body)
+    });
+    tokio::time::timeout(Duration::from_secs(2), &mut first_started)
+        .await
+        .expect("the streaming half-open request should reach upstream");
+    tokio::time::timeout(Duration::from_secs(2), &mut first_chunk)
+        .await
+        .expect("the first probe chunk should be forwarded before terminal success");
+
+    let mut concurrent = tokio::task::JoinSet::new();
+    for request_index in 0..12 {
+        let client = client.clone();
+        let url = url.clone();
+        concurrent.spawn(async move {
+            client
+                .post(url)
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .body(format!(
+                    r#"{{"model":"gpt-5","input":"concurrent-{request_index}","stream":true}}"#
+                ))
+                .send()
+                .await
+                .expect("send concurrent streaming half-open request")
+                .text()
+                .await
+                .expect("read concurrent route-unavailable stream")
+        });
+    }
+    while let Some(result) = tokio::time::timeout(Duration::from_secs(2), concurrent.join_next())
+        .await
+        .expect("concurrent streaming requests should not wait for upstream")
+    {
+        let body = result.expect("concurrent request task");
+        assert!(body.contains("response.failed"), "{body}");
+    }
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    release_first_terminal.notify_one();
+    let (status, body) = first_request.await.expect("first request task");
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("response.completed"), "{body}");
+
+    let recovered = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":"after-recovery","stream":true}"#)
+        .send()
+        .await
+        .expect("send recovered streaming request");
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let recovered_body = recovered.text().await.expect("read recovered stream");
+    assert!(
+        recovered_body.contains("response.completed"),
+        "{recovered_body}"
+    );
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn failed_streaming_half_open_probe_is_not_repeated_in_the_same_epoch() {
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hit_counter = Arc::clone(&upstream_hits);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hit_counter = Arc::clone(&hit_counter);
+            async move {
+                hit_counter.fetch_add(1, Ordering::SeqCst);
+                let mut response = Response::new(Body::from(
+                    "event: response.failed\n\
+data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed-probe\",\"error\":{\"message\":\"still unavailable\"}}}\n\n",
+                ));
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            3,
+            "500-599",
+            Vec::new(),
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            3,
+            "500-599",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let source = HelperConfig {
+        retry,
+        codex: ServiceRouteConfig {
+            providers: std::collections::BTreeMap::from([(
+                "half-open".to_string(),
+                ProviderConfig {
+                    base_url: Some(format!("http://{upstream_addr}/v1")),
+                    inline_auth: UpstreamAuth::default(),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            routing: Some(RouteGraphConfig::ordered_failover(vec![
+                "half-open".to_string(),
+            ])),
+            ..ServiceRouteConfig::default()
+        },
+        ..HelperConfig::default()
+    };
+    let proxy = ProxyService::new(Client::new(), Arc::new(source), "codex");
+    let state = Arc::clone(&proxy.state);
+    let endpoint = ProviderEndpointKey::new("codex", "half-open", "default");
+    let identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&endpoint)
+        .await;
+    state
+        .penalize_runtime_upstream_attempt(
+            "codex",
+            &identity,
+            30,
+            crate::endpoint_health::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+    let app = crate::proxy::router(proxy);
+    let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+    let url = format!("http://{proxy_addr}/v1/responses");
+    let client = local_http_test_client();
+
+    let first = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":"first","stream":true}"#)
+        .send()
+        .await
+        .expect("send first failed streaming half-open request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = first.text().await.expect("read first failed probe");
+    assert!(first_body.contains("response.failed"), "{first_body}");
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+    let second = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":"second","stream":true}"#)
+        .send()
+        .await
+        .expect("send second failed streaming half-open request");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = second.text().await.expect("read second failed probe");
+    assert!(second_body.contains("response.failed"), "{second_body}");
+    assert_eq!(
+        upstream_hits.load(Ordering::SeqCst),
+        1,
+        "the failed streaming probe must consume its breaker epoch"
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
 }
 
 #[tokio::test]
@@ -1849,10 +3393,14 @@ async fn proxy_codex_stream_route_unavailable_returns_retryable_response_failed_
     let primary_identity = proxy
         .runtime_identity_for_provider_endpoint_for_test(&primary_endpoint)
         .await;
+    // Capacity breakers intentionally cannot be bypassed by transient half-open probes.
     state
-        .penalize_runtime_upstream_attempt(
+        .penalize_runtime_upstream_attempt_for_domain(
             "codex",
             &primary_identity,
+            crate::endpoint_health::RuntimeHealthDomain::Capacity(
+                crate::endpoint_health::RouteCapability::Inference,
+            ),
             30,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,
@@ -1866,9 +3414,12 @@ async fn proxy_codex_stream_route_unavailable_returns_retryable_response_failed_
         .runtime_identity_for_provider_endpoint_for_test(&backup_endpoint)
         .await;
     state
-        .penalize_runtime_upstream_attempt(
+        .penalize_runtime_upstream_attempt_for_domain(
             "codex",
             &backup_identity,
+            crate::endpoint_health::RuntimeHealthDomain::Capacity(
+                crate::endpoint_health::RouteCapability::Inference,
+            ),
             30,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,
@@ -1984,10 +3535,14 @@ async fn proxy_codex_body_stream_route_unavailable_returns_retryable_response_fa
     let primary_identity = proxy
         .runtime_identity_for_provider_endpoint_for_test(&primary_endpoint)
         .await;
+    // Keep this fixture unprobeable so it continues to exercise route-unavailable SSE shaping.
     state
-        .penalize_runtime_upstream_attempt(
+        .penalize_runtime_upstream_attempt_for_domain(
             "codex",
             &primary_identity,
+            crate::endpoint_health::RuntimeHealthDomain::Capacity(
+                crate::endpoint_health::RouteCapability::Inference,
+            ),
             30,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,
@@ -2316,9 +3871,12 @@ async fn proxy_codex_stream_mixed_upstream_failure_and_cooldown_reports_route_un
         .runtime_identity_for_provider_endpoint_for_test(&cooldown_endpoint)
         .await;
     state
-        .penalize_runtime_upstream_attempt(
+        .penalize_runtime_upstream_attempt_for_domain(
             "codex",
             &cooldown_identity,
+            crate::endpoint_health::RuntimeHealthDomain::Capacity(
+                crate::endpoint_health::RouteCapability::Inference,
+            ),
             30,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,
@@ -2723,10 +4281,8 @@ async fn proxy_capacity_body_400_fails_over_by_overloaded_class() {
         .expect("first route attempt should be recorded");
     assert_eq!(first.status_code, Some(StatusCode::BAD_REQUEST.as_u16()));
     assert_eq!(first.error_class.as_deref(), Some("upstream_overloaded"));
-    assert_eq!(
-        first.cooldown_reason.as_deref(),
-        Some("upstream_overloaded")
-    );
+    assert_eq!(first.cooldown_secs, None);
+    assert_eq!(first.cooldown_reason, None);
 
     proxy.handle.abort();
 }
@@ -2831,10 +4387,8 @@ async fn proxy_new_api_saturated_group_429_fails_over_without_same_upstream_retr
         Some(StatusCode::TOO_MANY_REQUESTS.as_u16())
     );
     assert_eq!(first.error_class.as_deref(), Some("upstream_overloaded"));
-    assert_eq!(
-        first.cooldown_reason.as_deref(),
-        Some("upstream_overloaded")
-    );
+    assert_eq!(first.cooldown_secs, None);
+    assert_eq!(first.cooldown_reason, None);
     assert_eq!(first.provider_signals.len(), 1);
     assert_eq!(
         first.provider_signals[0].kind,
@@ -2842,6 +4396,72 @@ async fn proxy_new_api_saturated_group_429_fails_over_without_same_upstream_retr
     );
 
     proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn single_upstream_capacity_signal_does_not_immediately_blackhole_next_request() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_route = hits.clone();
+    let upstream = spawn_test_upstream(axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hits = hits_for_route.clone();
+            async move {
+                let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "error": {
+                                "type": "rate_limit_error",
+                                "message": "maximum concurrent requests reached"
+                            }
+                        })),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": "resp-capacity-recovered",
+                            "object": "response",
+                            "output": []
+                        })),
+                    )
+                }
+            }
+        }),
+    ));
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "429",
+            vec!["upstream_overloaded".to_string()],
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "429",
+            vec!["upstream_overloaded".to_string()],
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let proxy = spawn_test_proxy(make_helper_config(vec![upstream.upstream_config()], retry));
+    let client = local_http_test_client();
+
+    let saturated =
+        post_responses_json(&client, &proxy, r#"{"model":"gpt-5","input":"first"}"#).await;
+    assert!(!saturated.status().is_success());
+    let _ = saturated.bytes().await.expect("read capacity response");
+
+    let recovered =
+        post_responses_json(&client, &proxy, r#"{"model":"gpt-5","input":"second"}"#).await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let _ = recovered.bytes().await.expect("read recovered response");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -3563,7 +5183,7 @@ async fn proxy_does_not_retry_or_failover_on_400() {
 }
 
 #[tokio::test]
-async fn proxy_buffered_401_and_403_share_one_native_refresh_without_replay_or_failover() {
+async fn proxy_buffered_api_key_required_401_and_403_refresh_without_replay_or_failover() {
     const CREDENTIAL_CANARY: &str = "native-auth-failure-canary-3e9f64b10a7842cd";
     let unauthorized_hits = Arc::new(AtomicUsize::new(0));
     let forbidden_hits = Arc::new(AtomicUsize::new(0));
@@ -3588,7 +5208,15 @@ async fn proxy_buffered_401_and_403_share_one_native_refresh_without_replay_or_f
                     }
                     input => panic!("unexpected buffered auth test input: {input:?}"),
                 };
-                (status, Json(serde_json::json!({ "error": message })))
+                (
+                    status,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "API_KEY_REQUIRED",
+                            "message": format!("API key is required: {message}")
+                        }
+                    })),
+                )
             }
         }),
     ));
@@ -3695,6 +5323,408 @@ async fn proxy_buffered_401_and_403_share_one_native_refresh_without_replay_or_f
     shutdown_tx.send(true).expect("signal refresh shutdown");
     refresh_driver.await.expect("join refresh driver");
     assert_eq!(credential_control.read_count(), 2);
+}
+
+#[tokio::test]
+async fn buffered_non_auth_403_does_not_refresh_or_create_credential_wide_cooldown() {
+    let inference_hits = Arc::new(AtomicUsize::new(0));
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+    let inference_counter = Arc::clone(&inference_hits);
+    let compact_counter = Arc::clone(&compact_hits);
+    let upstream = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/responses",
+                post(move |body: String| {
+                    let inference_counter = Arc::clone(&inference_counter);
+                    async move {
+                        inference_counter.fetch_add(1, Ordering::SeqCst);
+                        let body: serde_json::Value = serde_json::from_str(&body)
+                            .expect("parse buffered non-auth 403 request body");
+                        let error = match body.get("input").and_then(|value| value.as_str()) {
+                            Some("model-permission") => serde_json::json!({
+                                "code": "model_not_found",
+                                "message": "The API key's project does not have access to model gpt-5"
+                            }),
+                            Some("project-permission") => serde_json::json!({
+                                "status": "PERMISSION_DENIED",
+                                "reason": "PROJECT_PERMISSION",
+                                "message": "Caller project is not authorized to use this endpoint"
+                            }),
+                            Some("content-policy") => serde_json::json!({
+                                "type": "content_filter",
+                                "reason": "SAFETY",
+                                "message": "Request blocked by content policy"
+                            }),
+                            input => panic!("unexpected non-auth 403 test input: {input:?}"),
+                        };
+                        (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": error })))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses/compact",
+                post(move || {
+                    let compact_counter = Arc::clone(&compact_counter);
+                    async move {
+                        compact_counter.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "output": [{
+                                "type": "compaction",
+                                "encrypted_content": "still-routable"
+                            }]
+                        }))
+                    }
+                }),
+            ),
+    );
+    let mut upstream_config = upstream.upstream_config();
+    upstream_config.auth = UpstreamAuth {
+        auth_token_ref: Some(crate::config::CredentialRef::Native {
+            name: "relay.primary".to_string(),
+        }),
+        ..UpstreamAuth::default()
+    };
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "",
+            Vec::new(),
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            1,
+            "",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let mut source = make_helper_config(vec![upstream_config], retry);
+    source
+        .codex
+        .routing
+        .as_mut()
+        .expect("route graph")
+        .affinity_policy = RouteAffinityPolicy::Off;
+    let (credential_sources, credential_control) =
+        crate::credentials::CredentialSourceCapabilities::test_native(
+            crate::credentials::SecretValue::new(b"generation-a".to_vec())
+                .expect("valid initial credential"),
+        );
+    let runtime_store =
+        Arc::new(crate::runtime_store::RuntimeStore::open_in_memory().expect("open runtime store"));
+    let proxy_service = ProxyService::new_with_runtime_store_and_credential_sources(
+        Client::new(),
+        Arc::new(source),
+        "codex",
+        runtime_store,
+        credential_sources,
+    )
+    .expect("build credential-backed proxy");
+    let retained = proxy_service.clone();
+    assert_eq!(credential_control.read_count(), 1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let refresh_driver = retained.spawn_credential_refresh_driver(shutdown_rx);
+    let proxy = spawn_proxy_service(proxy_service);
+    let client = local_http_test_client();
+
+    for input in ["model-permission", "project-permission", "content-policy"] {
+        let body = serde_json::json!({ "model": "gpt-5", "input": input }).to_string();
+        let response = post_responses_json(&client, &proxy, body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "input={input}");
+        let _ = response.bytes().await.expect("read non-auth 403 response");
+    }
+    assert_eq!(inference_hits.load(Ordering::SeqCst), 3);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        credential_control.read_count(),
+        1,
+        "authorization and policy failures must not schedule credential refresh"
+    );
+    let runtime = retained
+        .state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let health = runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"));
+    assert_eq!(health.failure_count, 0);
+    assert!(!health.cooldown_active);
+
+    let compact = post_compact_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","input":[{"role":"user","content":"compact me"}]}"#,
+    )
+    .await;
+    assert_eq!(compact.status(), StatusCode::OK);
+    let _ = compact.bytes().await.expect("read compact response");
+    assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+
+    shutdown_tx.send(true).expect("signal refresh shutdown");
+    refresh_driver.await.expect("join refresh driver");
+    proxy.handle.abort();
+}
+
+#[tokio::test]
+async fn buffered_quota_403_fails_over_without_refresh_or_cross_capability_cooldown() {
+    let primary_inference_hits = Arc::new(AtomicUsize::new(0));
+    let primary_compact_hits = Arc::new(AtomicUsize::new(0));
+    let primary_inference_counter = primary_inference_hits.clone();
+    let primary_compact_counter = primary_compact_hits.clone();
+    let primary = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = primary_inference_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "type": "billing_error",
+                                    "code": "insufficient_quota",
+                                    "message": "insufficient balance or billing issue"
+                                }
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses/compact",
+                post(move || {
+                    let hits = primary_compact_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "provider": "primary",
+                            "output": [{
+                                "type": "compaction",
+                                "encrypted_content": "primary-summary"
+                            }]
+                        }))
+                    }
+                }),
+            ),
+    );
+
+    let backup_inference_hits = Arc::new(AtomicUsize::new(0));
+    let backup_compact_hits = Arc::new(AtomicUsize::new(0));
+    let backup_inference_counter = backup_inference_hits.clone();
+    let backup_compact_counter = backup_compact_hits.clone();
+    let backup = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = backup_inference_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "id": "resp-quota-backup",
+                            "object": "response",
+                            "provider": "backup",
+                            "output": []
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses/compact",
+                post(move || {
+                    let hits = backup_compact_counter.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "provider": "backup",
+                            "output": [{
+                                "type": "compaction",
+                                "encrypted_content": "backup-summary"
+                            }]
+                        }))
+                    }
+                }),
+            ),
+    );
+
+    let mut primary_config = primary.upstream_config();
+    primary_config.auth = UpstreamAuth {
+        auth_token_ref: Some(crate::config::CredentialRef::Native {
+            name: "relay.primary".to_string(),
+        }),
+        ..UpstreamAuth::default()
+    };
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            1,
+            "",
+            vec!["upstream_rate_limited".to_string()],
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "",
+            vec!["upstream_rate_limited".to_string()],
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let mut source = make_helper_config(vec![primary_config, backup.upstream_config()], retry);
+    source
+        .codex
+        .routing
+        .as_mut()
+        .expect("route graph")
+        .affinity_policy = RouteAffinityPolicy::Off;
+    let (credential_sources, credential_control) =
+        crate::credentials::CredentialSourceCapabilities::test_native(
+            crate::credentials::SecretValue::new(b"generation-a".to_vec())
+                .expect("valid initial credential"),
+        );
+    let runtime_store =
+        Arc::new(crate::runtime_store::RuntimeStore::open_in_memory().expect("open runtime store"));
+    let proxy_service = ProxyService::new_with_runtime_store_and_credential_sources(
+        Client::new(),
+        Arc::new(source),
+        "codex",
+        runtime_store,
+        credential_sources,
+    )
+    .expect("build credential-backed proxy");
+    let retained = proxy_service.clone();
+    assert_eq!(credential_control.read_count(), 1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let refresh_driver = retained.spawn_credential_refresh_driver(shutdown_rx);
+    let proxy = spawn_proxy_service(proxy_service);
+    let client = local_http_test_client();
+
+    let inference = post_responses_json(&client, &proxy, r#"{"model":"gpt-5","input":"hi"}"#).await;
+    assert_eq!(inference.status(), StatusCode::OK);
+    let inference_body: serde_json::Value = inference
+        .json()
+        .await
+        .expect("read failover inference response");
+    assert_eq!(inference_body["provider"].as_str(), Some("backup"));
+    assert_eq!(primary_inference_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_inference_hits.load(Ordering::SeqCst), 1);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        credential_control.read_count(),
+        1,
+        "quota evidence must not schedule a credential refresh"
+    );
+    let runtime = retained
+        .state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    assert!(
+        runtime
+            .provider_endpoint(&ProviderEndpointKey::new("codex", "test", "default"))
+            .cooldown_active,
+        "quota evidence should cool the inference capability"
+    );
+
+    let compact = post_compact_json(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5","input":[{"role":"user","content":"compact me"}]}"#,
+    )
+    .await;
+    assert_eq!(compact.status(), StatusCode::OK);
+    let compact_body: serde_json::Value = compact.json().await.expect("read compact response");
+    assert_eq!(compact_body["provider"].as_str(), Some("primary"));
+    assert_eq!(primary_compact_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_compact_hits.load(Ordering::SeqCst), 0);
+
+    shutdown_tx.send(true).expect("signal refresh shutdown");
+    refresh_driver.await.expect("join refresh driver");
+}
+
+#[tokio::test]
+async fn auth_failure_is_not_replayed_but_next_request_avoids_the_bad_credential() {
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let primary_counter = primary_hits.clone();
+    let primary = spawn_test_upstream(axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hits = primary_counter.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "authentication_error",
+                            "message": "credential rejected"
+                        }
+                    })),
+                )
+            }
+        }),
+    ));
+    let backup_hits = Arc::new(AtomicUsize::new(0));
+    let backup_counter = backup_hits.clone();
+    let backup = spawn_test_upstream(axum::Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let hits = backup_counter.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "id": "resp-backup-auth",
+                    "object": "response",
+                    "output": []
+                }))
+            }
+        }),
+    ));
+    let retry = RetryConfig {
+        upstream: Some(retry_layer_config(
+            2,
+            "401,403",
+            Vec::new(),
+            RetryStrategy::SameUpstream,
+        )),
+        provider: Some(retry_layer_config(
+            2,
+            "401,403",
+            Vec::new(),
+            RetryStrategy::Failover,
+        )),
+        transport_cooldown_secs: Some(30),
+        cooldown_backoff_factor: Some(1),
+        cooldown_backoff_max_secs: Some(0),
+        ..RetryConfig::default()
+    };
+    let proxy = spawn_test_proxy(make_helper_config(
+        vec![primary.upstream_config(), backup.upstream_config()],
+        retry,
+    ));
+    let client = local_http_test_client();
+
+    let rejected =
+        post_responses_json(&client, &proxy, r#"{"model":"gpt-5","input":"first"}"#).await;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let _ = rejected.bytes().await.expect("read auth failure");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+
+    let recovered =
+        post_responses_json(&client, &proxy, r#"{"model":"gpt-5","input":"second"}"#).await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let _ = recovered.bytes().await.expect("read backup response");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

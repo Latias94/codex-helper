@@ -10,18 +10,25 @@ use axum::{Json, Router};
 use super::admin::{AdminAccessConfig, require_admin_access};
 use super::admin_api_error::{AdminApiHttpError, AdminApiResult};
 use super::control_plane_manifest::{
-    LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_OPERATOR_SESSION,
-    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_SERVICE_RUNTIME_READ, LOCAL_V1_SESSION_AFFINITY_MUTATION,
+    LOCAL_V1_BALANCE_REFRESH, LOCAL_V1_CREDENTIAL_REFRESH, LOCAL_V1_DEFAULT_PROFILE_MUTATION,
+    LOCAL_V1_OPERATOR_SESSION, LOCAL_V1_RELAY_CAPABILITIES, LOCAL_V1_RELAY_LIVE_SMOKE,
+    LOCAL_V1_ROUTING_MUTATION, LOCAL_V1_RUNTIME_RELOAD, LOCAL_V1_SERVICE_RUNTIME_READ,
+    LOCAL_V1_SESSION_AFFINITY_MUTATION, LOCAL_V1_SESSION_BINDING_MUTATION,
+    LOCAL_V1_SESSION_METADATA_READ,
 };
 use super::{
-    OperatorRoutingMutationRequest, OperatorSessionAffinityMutationRequest,
-    ProviderBalanceRefreshResponse, ProxyService,
+    CodexRelayCapabilitiesRequest, CodexRelayLiveSmokeRequest,
+    OperatorDefaultProfileMutationRequest, OperatorRoutingMutationRequest,
+    OperatorRuntimeReloadRequest, OperatorSessionAffinityMutationRequest,
+    OperatorSessionBindingMutationRequest, ProviderBalanceRefreshResponse, ProxyService,
 };
 
 pub(crate) const LOCAL_OPERATOR_SESSION_HEADER: &str = "x-codex-helper-local-session";
 pub(crate) const LOCAL_OPERATOR_NONCE_HEADER: &str = "x-codex-helper-local-nonce";
 pub(crate) const LOCAL_OPERATOR_TIMESTAMP_HEADER: &str = "x-codex-helper-local-timestamp";
 pub(crate) const LOCAL_OPERATOR_SIGNATURE_HEADER: &str = "x-codex-helper-local-signature";
+
+const MAX_LOCAL_SESSION_KEY_BYTES: usize = 128;
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct LocalBalanceRefreshRequest {
@@ -44,17 +51,80 @@ pub(super) fn local_operator_routes(proxy: ProxyService) -> Router {
         .route(LOCAL_V1_BALANCE_REFRESH, post(refresh_balances))
         .route(LOCAL_V1_CREDENTIAL_REFRESH, post(refresh_credential))
         .route(LOCAL_V1_SERVICE_RUNTIME_READ, post(read_service_runtime))
+        .route(LOCAL_V1_SESSION_METADATA_READ, post(read_session_metadata))
         .route(LOCAL_V1_ROUTING_MUTATION, post(mutate_routing))
         .route(
             LOCAL_V1_SESSION_AFFINITY_MUTATION,
             post(mutate_session_affinity),
         )
+        .route(
+            LOCAL_V1_SESSION_BINDING_MUTATION,
+            post(mutate_session_binding),
+        )
+        .route(
+            LOCAL_V1_DEFAULT_PROFILE_MUTATION,
+            post(mutate_default_profile),
+        )
+        .route(LOCAL_V1_RUNTIME_RELOAD, post(reload_runtime))
+        .route(
+            LOCAL_V1_RELAY_CAPABILITIES,
+            post(inspect_relay_capabilities),
+        )
+        .route(LOCAL_V1_RELAY_LIVE_SMOKE, post(run_relay_live_smoke))
         .with_state(state)
         .layer(middleware::from_fn(require_local_operator_loopback))
         .layer(middleware::from_fn_with_state(
             AdminAccessConfig::from_env(),
             require_admin_access,
         ))
+}
+
+async fn read_session_metadata(
+    State(state): State<LocalOperatorRouteState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AdminApiResult<crate::dashboard_core::LocalOperatorSessionMetadataResponse> {
+    authorize_local_operator_action(&state, &headers, LOCAL_V1_SESSION_METADATA_READ, &body)?;
+    let request =
+        serde_json::from_slice::<crate::dashboard_core::LocalOperatorSessionMetadataRequest>(&body)
+            .map_err(|_| {
+                AdminApiHttpError::bad_request(
+                    "local_operator_invalid_json",
+                    "invalid local operator session metadata request",
+                )
+            })?;
+    if request.session_keys.len() > crate::dashboard_core::LOCAL_OPERATOR_SESSION_METADATA_BATCH_MAX
+        || request.session_keys.iter().any(|key| {
+            key.is_empty()
+                || key.len() > MAX_LOCAL_SESSION_KEY_BYTES
+                || !key.starts_with("session:")
+        })
+    {
+        return Err(AdminApiHttpError::bad_request(
+            "local_operator_invalid_session_keys",
+            "local operator session metadata request contains invalid session keys",
+        ));
+    }
+    let requested = request
+        .session_keys
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let capture = state
+        .proxy
+        .operator_read_capture()
+        .await
+        .map_err(AdminApiHttpError::from)?;
+    let sessions = capture
+        .local_sessions
+        .into_iter()
+        .filter(|(key, _)| requested.contains(key))
+        .collect();
+    Ok(Json(
+        crate::dashboard_core::LocalOperatorSessionMetadataResponse {
+            service_name: state.proxy.service_name.to_string(),
+            sessions,
+        },
+    ))
 }
 
 async fn read_service_runtime(
@@ -211,6 +281,112 @@ async fn mutate_session_affinity(
     state
         .proxy
         .mutate_operator_session_affinity(request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn mutate_session_binding(
+    State(state): State<LocalOperatorRouteState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AdminApiResult<super::OperatorSessionBindingMutationResponse> {
+    authorize_local_operator_action(&state, &headers, LOCAL_V1_SESSION_BINDING_MUTATION, &body)?;
+    let request = serde_json::from_slice::<OperatorSessionBindingMutationRequest>(&body).map_err(
+        |error| {
+            AdminApiHttpError::bad_request(
+                "local_operator_invalid_json",
+                format!("invalid local operator session binding request: {error}"),
+            )
+        },
+    )?;
+    state
+        .proxy
+        .mutate_operator_session_binding(request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn mutate_default_profile(
+    State(state): State<LocalOperatorRouteState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AdminApiResult<super::OperatorDefaultProfileMutationResponse> {
+    authorize_local_operator_action(&state, &headers, LOCAL_V1_DEFAULT_PROFILE_MUTATION, &body)?;
+    let request = serde_json::from_slice::<OperatorDefaultProfileMutationRequest>(&body).map_err(
+        |error| {
+            AdminApiHttpError::bad_request(
+                "local_operator_invalid_json",
+                format!("invalid local operator default profile request: {error}"),
+            )
+        },
+    )?;
+    state
+        .proxy
+        .mutate_operator_default_profile(request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn reload_runtime(
+    State(state): State<LocalOperatorRouteState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AdminApiResult<super::OperatorRuntimeReloadResponse> {
+    authorize_local_operator_action(&state, &headers, LOCAL_V1_RUNTIME_RELOAD, &body)?;
+    let request =
+        serde_json::from_slice::<OperatorRuntimeReloadRequest>(&body).map_err(|error| {
+            AdminApiHttpError::bad_request(
+                "local_operator_invalid_json",
+                format!("invalid local operator runtime reload request: {error}"),
+            )
+        })?;
+    state
+        .proxy
+        .operator_runtime_reload(request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn inspect_relay_capabilities(
+    State(state): State<LocalOperatorRouteState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AdminApiResult<super::CodexRelayCapabilitiesResponse> {
+    authorize_local_operator_action(&state, &headers, LOCAL_V1_RELAY_CAPABILITIES, &body)?;
+    let request =
+        serde_json::from_slice::<CodexRelayCapabilitiesRequest>(&body).map_err(|error| {
+            AdminApiHttpError::bad_request(
+                "local_operator_invalid_json",
+                format!("invalid local operator relay capabilities request: {error}"),
+            )
+        })?;
+    state
+        .proxy
+        .codex_relay_capabilities(request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn run_relay_live_smoke(
+    State(state): State<LocalOperatorRouteState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AdminApiResult<super::CodexRelayLiveSmokeResponse> {
+    authorize_local_operator_action(&state, &headers, LOCAL_V1_RELAY_LIVE_SMOKE, &body)?;
+    let request = serde_json::from_slice::<CodexRelayLiveSmokeRequest>(&body).map_err(|error| {
+        AdminApiHttpError::bad_request(
+            "local_operator_invalid_json",
+            format!("invalid local operator relay live-smoke request: {error}"),
+        )
+    })?;
+    state
+        .proxy
+        .codex_relay_live_smoke(request)
         .await
         .map(Json)
         .map_err(Into::into)

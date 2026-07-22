@@ -3049,6 +3049,7 @@ mod tests {
     }
 
     fn test_logical_terminal_payload() -> LogicalRequestTerminalPayload {
+        let cache_accounting_convention = crate::usage::CacheAccountingConvention::SEPARATE;
         LogicalRequestTerminalPayload {
             finished_request: crate::state::FinishedRequest {
                 id: 1,
@@ -3065,7 +3066,10 @@ mod tests {
                 route_decision: None,
                 usage: None,
                 cost: crate::pricing::CostBreakdown::unknown(),
-                accounting: Default::default(),
+                accounting: crate::state::RequestAccountingFacts {
+                    cache_accounting_convention,
+                    ..Default::default()
+                },
                 retry: None,
                 provider_signals: Vec::new(),
                 policy_actions: Vec::new(),
@@ -3093,7 +3097,7 @@ mod tests {
             effective_service_tier: None,
             actual_service_tier: None,
             pricing_service_tier: None,
-            cache_accounting_convention: crate::usage::CacheAccountingConvention::SEPARATE,
+            cache_accounting_convention,
             billable_usage: None,
             accounting_scope: RequestAccountingScope::Economic,
         }
@@ -4748,6 +4752,10 @@ mod tests {
         payload.mapped_model = Some("gpt-5.6-sol".to_string());
         payload.pricing_model = Some("gpt-5.6-sol".to_string());
         payload.cache_accounting_convention = convention;
+        payload
+            .finished_request
+            .accounting
+            .cache_accounting_convention = convention;
         payload.billable_usage = Some(usage.canonical_usage_buckets(convention));
         let terminal = LogicalRequestTerminal {
             outcome: LogicalRequestOutcome::Succeeded,

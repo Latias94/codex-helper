@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::{HelperConfig, RelayTargetConfig, ServiceKind};
+use crate::config::{CodexClientPatchOverrides, HelperConfig, RelayTargetConfig, ServiceKind};
 use crate::control_plane_client::{
     configured_local_admin_token_env, is_loopback_control_plane_base_url,
     normalize_admin_token_env, normalize_base_url, normalize_control_plane_base_url,
@@ -17,6 +17,7 @@ pub struct ResolvedRelayTarget {
     pub proxy_url: String,
     pub admin_url: Option<String>,
     pub admin_token_env: Option<String>,
+    pub client_patch: Option<CodexClientPatchOverrides>,
     pub built_in_local: bool,
 }
 
@@ -38,12 +39,18 @@ pub fn resolve_relay_target(cfg: &HelperConfig, name: &str) -> Result<ResolvedRe
     if name == "local" {
         let service = cfg.default_service.unwrap_or(ServiceKind::Codex);
         let port = default_proxy_port_for_service_kind(service);
+        let client_patch = cfg
+            .relay_targets
+            .get("local")
+            .and_then(|target| target.client_patch)
+            .filter(|patch| !patch.is_empty());
         return Ok(ResolvedRelayTarget {
             name,
             service,
             proxy_url: local_proxy_base_url(port),
             admin_url: Some(local_admin_base_url_for_proxy_port(port)),
             admin_token_env: configured_local_admin_token_env().map(str::to_string),
+            client_patch,
             built_in_local: true,
         });
     }
@@ -70,6 +77,7 @@ pub fn relay_target_config_from_args(
     proxy_url: String,
     admin_url: Option<String>,
     admin_token_env: Option<String>,
+    client_patch: Option<CodexClientPatchOverrides>,
 ) -> Result<RelayTargetConfig> {
     let proxy_url = normalize_base_url(&proxy_url)
         .ok_or_else(|| anyhow!("relay proxy URL must start with http:// or https://"))?;
@@ -91,6 +99,7 @@ pub fn relay_target_config_from_args(
         proxy_url,
         admin_url,
         admin_token_env,
+        client_patch: client_patch.filter(|patch| !patch.is_empty()),
     })
 }
 
@@ -130,6 +139,7 @@ fn resolve_configured_relay_target(
         proxy_url,
         admin_url,
         admin_token_env,
+        client_patch: target.client_patch,
         built_in_local: false,
     })
 }
@@ -158,8 +168,20 @@ mod tests {
 
     #[test]
     fn relay_target_resolves_builtin_local_from_default_service() {
+        let mut relay_targets = BTreeMap::new();
+        relay_targets.insert(
+            "local".to_string(),
+            RelayTargetConfig {
+                client_patch: Some(CodexClientPatchOverrides {
+                    responses_websocket: Some(true),
+                    ..CodexClientPatchOverrides::default()
+                }),
+                ..RelayTargetConfig::default()
+            },
+        );
         let cfg = HelperConfig {
             default_service: Some(ServiceKind::Codex),
+            relay_targets,
             ..HelperConfig::default()
         };
 
@@ -167,6 +189,12 @@ mod tests {
 
         assert_eq!(target.proxy_url, "http://127.0.0.1:3211");
         assert_eq!(target.admin_url.as_deref(), Some("http://127.0.0.1:4211"));
+        assert_eq!(
+            target
+                .client_patch
+                .and_then(|patch| patch.responses_websocket),
+            Some(true)
+        );
         assert!(target.is_local());
     }
 
@@ -180,6 +208,10 @@ mod tests {
                 proxy_url: "http://nas.local:3211/".to_string(),
                 admin_url: Some("https://nas.example:4211/".to_string()),
                 admin_token_env: Some("NAS_TOKEN".to_string()),
+                client_patch: Some(CodexClientPatchOverrides {
+                    preset: Some(crate::config::CodexClientPreset::OfficialRelay),
+                    ..CodexClientPatchOverrides::default()
+                }),
             },
         );
         let cfg = HelperConfig {
@@ -195,6 +227,10 @@ mod tests {
             Some("https://nas.example:4211")
         );
         assert_eq!(target.admin_token_env.as_deref(), Some("NAS_TOKEN"));
+        assert_eq!(
+            target.client_patch.and_then(|patch| patch.preset),
+            Some(crate::config::CodexClientPreset::OfficialRelay)
+        );
         assert!(!target.is_local());
     }
 
@@ -205,6 +241,7 @@ mod tests {
             "http://nas.example:3211".to_string(),
             Some("http://nas.example:4211".to_string()),
             Some("NAS_TOKEN".to_string()),
+            None,
         )
         .expect_err("remote admin HTTP must be rejected");
 
@@ -217,6 +254,7 @@ mod tests {
             Some(ServiceKind::Codex),
             "http://127.0.0.1:3211".to_string(),
             Some("https://relay.example:4211".to_string()),
+            None,
             None,
         )
         .expect_err("explicit remote admin URL must require a token environment variable");
@@ -234,6 +272,7 @@ mod tests {
             "https://relay.example:3211".to_string(),
             None,
             Some("RELAY_ADMIN_TOKEN".to_string()),
+            None,
         )
         .expect_err("remote proxy must require an explicit admin authority");
 
@@ -276,6 +315,7 @@ mod tests {
             "https://relay.example:3211".to_string(),
             Some(discovered_admin_url),
             None,
+            None,
         )
         .expect_err("discovered remote admin URL must require a token environment variable");
 
@@ -292,6 +332,7 @@ mod tests {
             "https://relay.example:3211".to_string(),
             Some("https://relay.example:4211".to_string()),
             Some("Bearer token".to_string()),
+            None,
         )
         .expect_err("remote admin token must name an environment variable");
 
@@ -308,6 +349,7 @@ mod tests {
             "https://relay.example:3211".to_string(),
             Some("https://relay.example:4211".to_string()),
             Some(" RELAY_ADMIN_TOKEN ".to_string()),
+            None,
         )
         .expect("remote HTTPS admin with a valid token environment variable");
 
@@ -348,6 +390,7 @@ mod tests {
         let target = relay_target_config_from_args(
             Some(ServiceKind::Codex),
             "http://127.0.0.1:3211".to_string(),
+            None,
             None,
             None,
         )

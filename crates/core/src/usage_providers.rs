@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::future::Future;
 use std::io::Read as _;
 use std::panic::AssertUnwindSafe;
@@ -10,6 +11,7 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
@@ -42,6 +44,10 @@ use crate::runtime_store::{
 use crate::state::{ProviderBalanceSnapshotPublication, ProxyState};
 
 const USAGE_PROVIDER_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+const USAGE_PROVIDER_RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
+const USAGE_PROVIDER_TEMPLATE_MAX_DEPTH: usize = 32;
+const USAGE_PROVIDER_TEMPLATE_MAX_SEGMENTS: usize = 4_096;
+const USAGE_PROVIDER_TEMPLATE_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -161,8 +167,44 @@ impl UsageProviderExtractConfig {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize, Default)]
+#[serde(transparent)]
+struct UsageProviderTemplateMap(BTreeMap<String, String>);
+
+impl UsageProviderTemplateMap {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(String::as_str)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter()
+    }
+
+    fn remove(&mut self, name: &str) -> Option<String> {
+        self.0.remove(name)
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, name: String, value: String) -> Option<String> {
+        self.0.insert(name, value)
+    }
+}
+
+impl fmt::Debug for UsageProviderTemplateMap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UsageProviderTemplateMap")
+            .field("keys", &self.0.keys().collect::<Vec<_>>())
+            .field("value_count", &self.0.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct UsageProviderConfig {
     id: String,
     kind: ProviderKind,
@@ -194,25 +236,55 @@ struct UsageProviderConfig {
     quota_reset_timezone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quota_divisor: Option<u64>,
+    #[serde(default, skip_serializing_if = "UsageProviderTemplateMap::is_empty")]
+    headers: UsageProviderTemplateMap,
+    #[serde(default, skip_serializing_if = "UsageProviderTemplateMap::is_empty")]
+    variables: UsageProviderTemplateMap,
     #[serde(default, skip_serializing_if = "UsageProviderExtractConfig::is_empty")]
     extract: UsageProviderExtractConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
 struct UsageProvidersFile {
     #[serde(default)]
     providers: Vec<UsageProviderConfig>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawUsageProvidersFile {
+    #[serde(default)]
+    providers: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageProviderConfigDiagnostic {
+    pub provider_id: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UsageProviderCatalog {
+    providers: UsageProvidersFile,
+    revision: String,
+    rejected: Vec<UsageProviderConfigDiagnostic>,
+}
+
 pub(crate) struct UsageProviderCredentialCatalog {
     references: Vec<NamedCredentialReference>,
     revision: String,
+    provider_catalog: Arc<UsageProviderCatalog>,
 }
 
 impl UsageProviderCredentialCatalog {
-    pub(crate) fn into_parts(self) -> (Vec<NamedCredentialReference>, String) {
-        (self.references, self.revision)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<NamedCredentialReference>,
+        String,
+        Arc<UsageProviderCatalog>,
+    ) {
+        (self.references, self.revision, self.provider_catalog)
     }
 }
 
@@ -226,13 +298,19 @@ struct UsageProviderEndpointRef {
 pub(crate) struct UsageProviderRuntimeCapture {
     config: Arc<HelperConfig>,
     credentials: Arc<CredentialGeneration>,
+    provider_catalog: Arc<UsageProviderCatalog>,
 }
 
 impl UsageProviderRuntimeCapture {
-    pub(crate) fn new(config: Arc<HelperConfig>, credentials: Arc<CredentialGeneration>) -> Self {
+    pub(crate) fn new(
+        config: Arc<HelperConfig>,
+        credentials: Arc<CredentialGeneration>,
+        provider_catalog: Arc<UsageProviderCatalog>,
+    ) -> Self {
         Self {
             config,
             credentials,
+            provider_catalog,
         }
     }
 }
@@ -277,6 +355,10 @@ impl UsageProviderTarget {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageProviderRefreshSummary {
     pub providers_configured: usize,
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub providers_rejected: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_providers: Vec<UsageProviderConfigDiagnostic>,
     pub providers_matched: usize,
     pub upstreams_matched: usize,
     pub attempted: usize,
@@ -1007,6 +1089,8 @@ fn default_provider_config(
         quota_pool_id: None,
         quota_reset_timezone: None,
         quota_divisor: None,
+        headers: UsageProviderTemplateMap::default(),
+        variables: UsageProviderTemplateMap::default(),
         extract,
     }
 }
@@ -1064,6 +1148,8 @@ fn auto_usage_provider(target: &UsageProviderTarget, kind: ProviderKind) -> Usag
         quota_pool_id: None,
         quota_reset_timezone: None,
         quota_divisor: None,
+        headers: UsageProviderTemplateMap::default(),
+        variables: UsageProviderTemplateMap::default(),
         extract: UsageProviderExtractConfig::default(),
     };
     if matches!(kind, ProviderKind::RightCodeAccountSummary) {
@@ -1415,11 +1501,11 @@ fn default_providers() -> UsageProvidersFile {
     }
 }
 
-fn load_providers_from_path(path: &std::path::Path) -> Result<UsageProvidersFile> {
+fn read_usage_provider_document(path: &std::path::Path) -> Result<Option<RawUsageProvidersFile>> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(default_providers());
+            return Ok(None);
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -1447,26 +1533,114 @@ fn load_providers_from_path(path: &std::path::Path) -> Result<UsageProvidersFile
         );
     }
 
-    let file: UsageProvidersFile = serde_json::from_slice(bytes.as_slice()).with_context(|| {
+    let file = serde_json::from_slice(bytes.as_slice()).with_context(|| {
         format!(
             "failed to parse usage provider configuration {}",
             path.display()
         )
     })?;
-    for provider in &file.providers {
-        validate_usage_provider_config(provider).with_context(|| {
-            format!(
-                "invalid usage provider '{}' in {}",
-                provider.id,
-                path.display()
-            )
-        })?;
-    }
-    Ok(file)
+    Ok(Some(file))
 }
 
-fn load_providers() -> Result<UsageProvidersFile> {
-    load_providers_from_path(&usage_providers_path())
+fn usage_provider_diagnostic_text(error: impl std::fmt::Display) -> String {
+    error.to_string().chars().take(512).collect()
+}
+
+fn usage_provider_id_hint(value: &serde_json::Value, index: usize) -> String {
+    value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| id.chars().filter(|ch| !ch.is_control()).take(96).collect())
+        .unwrap_or_else(|| format!("provider[{index}]"))
+}
+
+fn usage_provider_catalog_from_document(
+    document: RawUsageProvidersFile,
+) -> Result<UsageProviderCatalog> {
+    let mut providers = Vec::new();
+    let mut rejected = Vec::new();
+    let mut provider_ids = HashSet::new();
+    for (index, value) in document.providers.into_iter().enumerate() {
+        let provider_id = usage_provider_id_hint(&value, index);
+        let mut provider = match serde_json::from_value::<UsageProviderConfig>(value) {
+            Ok(provider) => provider,
+            Err(error) => {
+                rejected.push(UsageProviderConfigDiagnostic {
+                    provider_id,
+                    code: "invalid_schema".to_string(),
+                    message: usage_provider_diagnostic_text(error),
+                });
+                continue;
+            }
+        };
+        if let Err(error) = canonicalize_v0203_provider(&mut provider)
+            .and_then(|()| validate_usage_provider_config(&provider))
+        {
+            rejected.push(UsageProviderConfigDiagnostic {
+                provider_id,
+                code: "invalid_config".to_string(),
+                message: usage_provider_diagnostic_text(error),
+            });
+            continue;
+        }
+        if !provider_ids.insert(provider.id.clone()) {
+            rejected.push(UsageProviderConfigDiagnostic {
+                provider_id,
+                code: "duplicate_id".to_string(),
+                message: "a usage provider with this id was already accepted".to_string(),
+            });
+            continue;
+        }
+        providers.push(provider);
+    }
+    let providers = UsageProvidersFile { providers };
+    let revision = usage_provider_catalog_revision(&providers)?;
+    Ok(UsageProviderCatalog {
+        providers,
+        revision,
+        rejected,
+    })
+}
+
+fn default_usage_provider_catalog() -> Result<UsageProviderCatalog> {
+    let providers = default_providers();
+    for provider in &providers.providers {
+        validate_usage_provider_config(provider)
+            .with_context(|| format!("built-in usage provider '{}' is invalid", provider.id))?;
+    }
+    let revision = usage_provider_catalog_revision(&providers)?;
+    Ok(UsageProviderCatalog {
+        providers,
+        revision,
+        rejected: Vec::new(),
+    })
+}
+
+fn load_provider_catalog_from_path(path: &std::path::Path) -> Result<UsageProviderCatalog> {
+    match read_usage_provider_document(path)? {
+        Some(document) => usage_provider_catalog_from_document(document),
+        None => default_usage_provider_catalog(),
+    }
+}
+
+#[cfg(test)]
+fn load_providers_from_path(path: &std::path::Path) -> Result<UsageProvidersFile> {
+    let catalog = load_provider_catalog_from_path(path)?;
+    if let Some(rejected) = catalog.rejected.first() {
+        anyhow::bail!(
+            "failed to parse usage provider configuration {}: invalid usage provider '{}': {}",
+            path.display(),
+            rejected.provider_id,
+            rejected.message
+        );
+    }
+    Ok(catalog.providers)
+}
+
+fn load_provider_catalog() -> Result<UsageProviderCatalog> {
+    load_provider_catalog_from_path(&usage_providers_path())
 }
 
 fn usage_provider_catalog_revision(providers: &UsageProvidersFile) -> Result<String> {
@@ -1478,31 +1652,56 @@ fn usage_provider_catalog_revision(providers: &UsageProvidersFile) -> Result<Str
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
-fn load_providers_with_revision() -> Result<(UsageProvidersFile, String)> {
-    let providers = load_providers()?;
-    let revision = usage_provider_catalog_revision(&providers)?;
-    Ok((providers, revision))
+fn credential_generation_catalog_from_result(
+    loaded: Result<UsageProviderCatalog>,
+    previous: Option<&UsageProviderCatalog>,
+) -> UsageProviderCredentialCatalog {
+    let provider_catalog = loaded.unwrap_or_else(|error| {
+        warn!(
+            retained_last_known_good = previous.is_some(),
+            "usage provider configuration could not be loaded; retaining the last-known-good catalog when available: {error:#}"
+        );
+        let mut fallback = previous.cloned().unwrap_or_else(|| {
+            default_usage_provider_catalog().expect("built-in usage provider catalog must be valid")
+        });
+        fallback
+            .rejected
+            .retain(|diagnostic| diagnostic.code != "catalog_unavailable");
+        fallback.rejected.push(UsageProviderConfigDiagnostic {
+            provider_id: "catalog".to_string(),
+            code: "catalog_unavailable".to_string(),
+            message: usage_provider_diagnostic_text(error),
+        });
+        fallback
+    });
+    let revision = provider_catalog.revision.clone();
+    let references = credential_references_from_providers(&provider_catalog.providers);
+    UsageProviderCredentialCatalog {
+        references,
+        revision,
+        provider_catalog: Arc::new(provider_catalog),
+    }
 }
 
-pub(crate) fn credential_generation_catalog() -> UsageProviderCredentialCatalog {
-    let providers = if cfg!(test) {
-        default_providers()
+#[cfg(test)]
+pub(crate) fn usage_provider_credential_catalog_from_value_for_test(
+    document: serde_json::Value,
+) -> Result<UsageProviderCredentialCatalog> {
+    let document = serde_json::from_value::<RawUsageProvidersFile>(document)
+        .context("parse test usage provider catalog")?;
+    let catalog = usage_provider_catalog_from_document(document)?;
+    Ok(credential_generation_catalog_from_result(Ok(catalog), None))
+}
+
+pub(crate) fn credential_generation_catalog(
+    previous: Option<&UsageProviderCatalog>,
+) -> UsageProviderCredentialCatalog {
+    let loaded = if cfg!(test) {
+        default_usage_provider_catalog()
     } else {
-        load_providers().unwrap_or_else(|error| {
-            warn!(
-                "usage provider credentials will use built-in references until the next runtime reload because configuration could not be loaded: {error:#}"
-            );
-            default_providers()
-        })
+        load_provider_catalog()
     };
-    let revision = usage_provider_catalog_revision(&providers).unwrap_or_else(|error| {
-        warn!("failed to derive usage provider configuration revision: {error:#}");
-        "usage-provider-config:unavailable".to_string()
-    });
-    UsageProviderCredentialCatalog {
-        references: credential_references_from_providers(&providers),
-        revision,
-    }
+    credential_generation_catalog_from_result(loaded, previous)
 }
 
 pub(crate) fn usage_provider_source_revision_from_disk() -> [u8; 32] {
@@ -1574,6 +1773,17 @@ fn credential_references_from_providers(
                     service_name: service_name.to_string(),
                     name: name.to_string(),
                     lookup,
+                });
+            }
+        }
+        let template_references = usage_provider_template_environment_references(provider)
+            .expect("accepted usage provider templates must remain valid");
+        for name in template_references {
+            for service_name in ["codex", "claude"] {
+                references.insert(NamedCredentialReference {
+                    service_name: service_name.to_string(),
+                    name: name.clone(),
+                    lookup: NamedCredentialLookup::EnvironmentOnly,
                 });
             }
         }
@@ -1738,21 +1948,432 @@ fn usage_provider_env_name<'a>(
     Ok(Some(name))
 }
 
-fn reject_endpoint_template_syntax(provider: &UsageProviderConfig, endpoint: &str) -> Result<()> {
-    if endpoint.trim().contains("{{") || endpoint.trim().contains("}}") {
+enum UsageProviderTemplateSegment {
+    Literal(String),
+    NormalizedBaseUrl,
+    UpstreamBaseUrl,
+    UsageToken,
+    UnixNowSeconds,
+    UnixNowMillis,
+    UnixDaysAgo(u64),
+    Environment(String),
+}
+
+struct CompiledUsageProviderTemplate {
+    segments: Vec<UsageProviderTemplateSegment>,
+}
+
+impl CompiledUsageProviderTemplate {
+    fn contains_credentials(&self) -> bool {
+        self.segments.iter().any(|segment| {
+            matches!(
+                segment,
+                UsageProviderTemplateSegment::UsageToken
+                    | UsageProviderTemplateSegment::Environment(_)
+            )
+        })
+    }
+
+    fn environment_references(&self) -> impl Iterator<Item = &str> {
+        self.segments.iter().filter_map(|segment| match segment {
+            UsageProviderTemplateSegment::Environment(name) => Some(name.as_str()),
+            _ => None,
+        })
+    }
+}
+
+fn usage_provider_variable_name_is_valid(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 128
+        && (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn usage_provider_variable_name_is_reserved(name: &str) -> bool {
+    matches!(
+        name,
+        "baseUrl"
+            | "base_url"
+            | "upstreamBaseUrl"
+            | "upstream_base_url"
+            | "apiKey"
+            | "accessToken"
+            | "token"
+            | "unix_now"
+            | "unix_now_ms"
+    ) || name.starts_with("unix_days_ago:")
+        || name.starts_with("env:")
+}
+
+fn push_usage_provider_template_segment(
+    segments: &mut Vec<UsageProviderTemplateSegment>,
+    segment: UsageProviderTemplateSegment,
+) -> Result<()> {
+    if segments.len() >= USAGE_PROVIDER_TEMPLATE_MAX_SEGMENTS {
+        anyhow::bail!("template expands to too many segments");
+    }
+    segments.push(segment);
+    Ok(())
+}
+
+fn compile_usage_provider_template_inner(
+    provider: &UsageProviderConfig,
+    template: &str,
+    visiting_variables: &mut BTreeSet<String>,
+    depth: usize,
+) -> Result<CompiledUsageProviderTemplate> {
+    if depth > USAGE_PROVIDER_TEMPLATE_MAX_DEPTH {
+        anyhow::bail!("template variable expansion is too deeply nested");
+    }
+
+    let mut segments = Vec::new();
+    let mut remaining = template;
+    while let Some(open) = remaining.find("{{") {
+        if remaining[..open].contains("}}") {
+            anyhow::bail!("template contains an unmatched closing delimiter");
+        }
+        if open > 0 {
+            push_usage_provider_template_segment(
+                &mut segments,
+                UsageProviderTemplateSegment::Literal(remaining[..open].to_string()),
+            )?;
+        }
+        let after_open = &remaining[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            anyhow::bail!("template contains an unmatched opening delimiter");
+        };
+        let placeholder = after_open[..close].trim();
+        if placeholder.is_empty() || placeholder.contains("{{") {
+            anyhow::bail!("template contains an invalid placeholder");
+        }
+
+        let segment = match placeholder {
+            "baseUrl" | "base_url" => Some(UsageProviderTemplateSegment::NormalizedBaseUrl),
+            "upstreamBaseUrl" | "upstream_base_url" => {
+                Some(UsageProviderTemplateSegment::UpstreamBaseUrl)
+            }
+            "apiKey" | "accessToken" | "token" => Some(UsageProviderTemplateSegment::UsageToken),
+            "unix_now" => Some(UsageProviderTemplateSegment::UnixNowSeconds),
+            "unix_now_ms" => Some(UsageProviderTemplateSegment::UnixNowMillis),
+            _ => None,
+        };
+        if let Some(segment) = segment {
+            push_usage_provider_template_segment(&mut segments, segment)?;
+        } else if let Some(days) = placeholder.strip_prefix("unix_days_ago:") {
+            let days = days
+                .trim()
+                .parse::<u64>()
+                .context("unix_days_ago requires an unsigned day count")?;
+            push_usage_provider_template_segment(
+                &mut segments,
+                UsageProviderTemplateSegment::UnixDaysAgo(days),
+            )?;
+        } else if let Some(name) = placeholder.strip_prefix("env:") {
+            let name = name.trim();
+            if !is_valid_environment_variable_name(name) {
+                anyhow::bail!("template contains an invalid environment variable reference");
+            }
+            push_usage_provider_template_segment(
+                &mut segments,
+                UsageProviderTemplateSegment::Environment(name.to_string()),
+            )?;
+        } else if let Some(value) = provider.variables.get(placeholder) {
+            if !visiting_variables.insert(placeholder.to_string()) {
+                anyhow::bail!("template contains a cyclic custom variable reference");
+            }
+            let nested = compile_usage_provider_template_inner(
+                provider,
+                value,
+                visiting_variables,
+                depth + 1,
+            )?;
+            visiting_variables.remove(placeholder);
+            for segment in nested.segments {
+                push_usage_provider_template_segment(&mut segments, segment)?;
+            }
+        } else {
+            anyhow::bail!("template contains an unsupported placeholder");
+        }
+
+        remaining = &after_open[close + 2..];
+    }
+    if remaining.contains("}}") {
+        anyhow::bail!("template contains an unmatched closing delimiter");
+    }
+    if !remaining.is_empty() {
+        push_usage_provider_template_segment(
+            &mut segments,
+            UsageProviderTemplateSegment::Literal(remaining.to_string()),
+        )?;
+    }
+    Ok(CompiledUsageProviderTemplate { segments })
+}
+
+fn compile_usage_provider_template(
+    provider: &UsageProviderConfig,
+    surface: &str,
+    template: &str,
+) -> Result<CompiledUsageProviderTemplate> {
+    compile_usage_provider_template_inner(provider, template, &mut BTreeSet::new(), 0).with_context(
+        || {
+            format!(
+                "usage provider '{}' has an invalid {surface} template",
+                provider.id
+            )
+        },
+    )
+}
+
+fn validate_usage_provider_variables(provider: &UsageProviderConfig) -> Result<()> {
+    for (name, value) in provider.variables.iter() {
+        if name.trim() != name
+            || !usage_provider_variable_name_is_valid(name)
+            || usage_provider_variable_name_is_reserved(name)
+        {
+            anyhow::bail!(
+                "usage provider '{}' contains an invalid or reserved custom variable name",
+                provider.id
+            );
+        }
+        let mut visiting = BTreeSet::from([name.clone()]);
+        compile_usage_provider_template_inner(provider, value, &mut visiting, 1).with_context(
+            || {
+                format!(
+                    "usage provider '{}' contains an invalid custom variable template",
+                    provider.id
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn usage_provider_header_is_controlled_credential(name: &HeaderName) -> bool {
+    name == AUTHORIZATION || name.as_str().eq_ignore_ascii_case("x-api-key")
+}
+
+fn compiled_usage_provider_headers(
+    provider: &UsageProviderConfig,
+) -> Result<Vec<(HeaderName, CompiledUsageProviderTemplate)>> {
+    let mut compiled = Vec::new();
+    let mut names = HashSet::new();
+    for (name, template) in provider.headers.iter() {
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            anyhow::anyhow!(
+                "usage provider '{}' contains an invalid custom header name",
+                provider.id
+            )
+        })?;
+        if !names.insert(header_name.clone()) {
+            anyhow::bail!(
+                "usage provider '{}' contains duplicate custom header names",
+                provider.id
+            );
+        }
+        if template
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n'))
+        {
+            anyhow::bail!(
+                "usage provider '{}' contains an invalid custom header template",
+                provider.id
+            );
+        }
+        let template = compile_usage_provider_template(provider, "header", template)?;
+        if template.contains_credentials()
+            && !usage_provider_header_is_controlled_credential(&header_name)
+        {
+            anyhow::bail!(
+                "usage provider '{}' custom header '{}' contains credential-bearing template content; credentials are allowed only in Authorization or X-API-Key",
+                provider.id,
+                header_name
+            );
+        }
+        compiled.push((header_name, template));
+    }
+    Ok(compiled)
+}
+
+fn usage_provider_template_environment_references(
+    provider: &UsageProviderConfig,
+) -> Result<BTreeSet<String>> {
+    let mut references = BTreeSet::new();
+    for (_, template) in compiled_usage_provider_headers(provider)? {
+        references.extend(template.environment_references().map(str::to_string));
+    }
+    Ok(references)
+}
+
+fn canonicalize_v0203_endpoint(provider: &mut UsageProviderConfig) {
+    const OPENAI_COSTS_ENDPOINT: &str =
+        "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30";
+
+    let endpoint = provider.endpoint.trim();
+    if provider.kind == ProviderKind::OpenAiOrganizationCosts && endpoint == OPENAI_COSTS_ENDPOINT {
+        provider.endpoint = "https://api.openai.com/v1/organization/costs".to_string();
+        return;
+    }
+
+    for prefix in ["{{base_url}}", "{{baseUrl}}"] {
+        let Some(relative) = endpoint.strip_prefix(prefix) else {
+            continue;
+        };
+        if relative.starts_with('/') && !relative.contains("{{") && !relative.contains("}}") {
+            provider.endpoint = relative.to_string();
+        }
+        return;
+    }
+}
+
+fn legacy_new_api_user_environment_name(template: &str) -> Option<&str> {
+    let template = template.trim();
+    let environment_name = template.strip_prefix("{{env:")?.strip_suffix("}}")?.trim();
+    (!environment_name.is_empty()
+        && !environment_name.contains("{{")
+        && !environment_name.contains("}}")
+        && is_valid_environment_variable_name(environment_name))
+    .then_some(environment_name)
+}
+
+fn canonicalize_v0203_new_api_user_header(provider: &mut UsageProviderConfig) -> Result<()> {
+    if provider.kind != ProviderKind::NewApiUserSelf {
+        return Ok(());
+    }
+
+    let matching_headers = provider
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("new-api-user"))
+        .map(|(name, template)| (name.clone(), template.clone()))
+        .collect::<Vec<_>>();
+    if matching_headers.is_empty() {
+        return Ok(());
+    }
+    if matching_headers.len() != 1 {
         anyhow::bail!(
-            "usage provider '{}' endpoint templates are not supported; use a literal absolute URL or relative path",
+            "usage provider '{}' contains duplicate legacy New-Api-User headers",
             provider.id
         );
     }
+
+    let (header_name, template) = &matching_headers[0];
+    let Some(environment_name) = legacy_new_api_user_environment_name(template) else {
+        return Ok(());
+    };
+    if let Some(configured_name) = provider.new_api_user_id_env.as_deref() {
+        anyhow::ensure!(
+            configured_name.trim() == environment_name,
+            "usage provider '{}' legacy New-Api-User header conflicts with new_api_user_id_env",
+            provider.id
+        );
+    } else {
+        provider.new_api_user_id_env = Some(environment_name.to_string());
+    }
+    provider.headers.remove(header_name);
     Ok(())
+}
+
+fn canonicalize_v0203_provider(provider: &mut UsageProviderConfig) -> Result<()> {
+    canonicalize_v0203_endpoint(provider);
+    canonicalize_v0203_new_api_user_header(provider)
 }
 
 fn validate_usage_provider_config(provider: &UsageProviderConfig) -> Result<()> {
     usage_provider_env_name(provider, "token_env", provider.token_env.as_deref())?;
     new_api_user_id_env_name(provider)?;
-    reject_endpoint_template_syntax(provider, &provider.endpoint)?;
+    validate_usage_provider_variables(provider)?;
+    let endpoint = if provider.endpoint.trim().is_empty() {
+        provider.kind.default_endpoint().unwrap_or_default()
+    } else {
+        provider.endpoint.trim()
+    };
+    let endpoint = compile_usage_provider_template(provider, "endpoint", endpoint)?;
+    if endpoint.contains_credentials() {
+        anyhow::bail!(
+            "usage provider '{}' endpoint template may not contain credentials; move authentication to Authorization or X-API-Key",
+            provider.id
+        );
+    }
+    compiled_usage_provider_headers(provider)?;
     Ok(())
+}
+
+struct UsageProviderTemplateRenderContext<'a> {
+    normalized_base_url: &'a str,
+    upstream_base_url: &'a str,
+    token: &'a str,
+    credential: Option<&'a CapturedUpstreamCredential>,
+    now_secs: u64,
+    now_ms: u64,
+}
+
+fn render_usage_provider_template(
+    provider: &UsageProviderConfig,
+    template: &CompiledUsageProviderTemplate,
+    context: &UsageProviderTemplateRenderContext<'_>,
+) -> Result<Zeroizing<String>> {
+    let mut output = Zeroizing::new(String::new());
+    for segment in &template.segments {
+        match segment {
+            UsageProviderTemplateSegment::Literal(value) => output.push_str(value),
+            UsageProviderTemplateSegment::NormalizedBaseUrl => {
+                output.push_str(context.normalized_base_url)
+            }
+            UsageProviderTemplateSegment::UpstreamBaseUrl => {
+                output.push_str(context.upstream_base_url)
+            }
+            UsageProviderTemplateSegment::UsageToken => output.push_str(context.token),
+            UsageProviderTemplateSegment::UnixNowSeconds => {
+                output.push_str(&context.now_secs.to_string())
+            }
+            UsageProviderTemplateSegment::UnixNowMillis => {
+                output.push_str(&context.now_ms.to_string())
+            }
+            UsageProviderTemplateSegment::UnixDaysAgo(days) => output.push_str(
+                &context
+                    .now_secs
+                    .saturating_sub(days.saturating_mul(24 * 60 * 60))
+                    .to_string(),
+            ),
+            UsageProviderTemplateSegment::Environment(name) => {
+                let Some(credential) = context.credential else {
+                    anyhow::bail!(
+                        "usage provider '{}' requires a captured credential for a template environment reference",
+                        provider.id
+                    );
+                };
+                let Some(value) =
+                    credential.named_credential(NamedCredentialLookup::EnvironmentOnly, name)
+                else {
+                    anyhow::bail!(
+                        "usage provider '{}' requires environment variable '{}' in the captured credential generation",
+                        provider.id,
+                        name
+                    );
+                };
+                output.push_str(usage_token_text(&value));
+            }
+        }
+        if output.len() > USAGE_PROVIDER_TEMPLATE_OUTPUT_MAX_BYTES {
+            anyhow::bail!(
+                "usage provider '{}' template output exceeds the {} byte limit",
+                provider.id,
+                USAGE_PROVIDER_TEMPLATE_OUTPUT_MAX_BYTES
+            );
+        }
+    }
+    Ok(output)
+}
+
+fn provider_endpoint_template(provider: &UsageProviderConfig) -> &str {
+    if provider.endpoint.trim().is_empty() {
+        provider.kind.default_endpoint().unwrap_or_default()
+    } else {
+        provider.endpoint.trim()
+    }
 }
 
 fn resolve_new_api_user_id_with(
@@ -1938,15 +2559,7 @@ fn resolve_endpoint(
 ) -> Result<String> {
     let base_url = normalized_balance_base_url(upstream_base_url)
         .ok_or_else(|| anyhow::anyhow!("invalid upstream base_url for balance endpoint"))?;
-    let endpoint = if provider.endpoint.trim().is_empty() {
-        provider
-            .kind
-            .default_endpoint()
-            .unwrap_or_default()
-            .to_string()
-    } else {
-        provider.endpoint.trim().to_string()
-    };
+    let endpoint = provider_endpoint_template(provider);
     if endpoint.is_empty() {
         anyhow::bail!(
             "usage provider '{}' has no endpoint and kind {:?} has no default endpoint",
@@ -1954,15 +2567,34 @@ fn resolve_endpoint(
             provider.kind
         );
     }
-    reject_endpoint_template_syntax(provider, &endpoint)?;
 
-    let resolved = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint
+    let compiled = compile_usage_provider_template(provider, "endpoint", endpoint)?;
+    if compiled.contains_credentials() {
+        anyhow::bail!(
+            "usage provider '{}' endpoint template may not contain credentials; move authentication to Authorization or X-API-Key",
+            provider.id
+        );
+    }
+    let rendered = render_usage_provider_template(
+        provider,
+        &compiled,
+        &UsageProviderTemplateRenderContext {
+            normalized_base_url: &base_url,
+            upstream_base_url,
+            token,
+            credential: None,
+            now_secs: unix_now_secs(),
+            now_ms: unix_now_ms(),
+        },
+    )?;
+    let rendered = rendered.as_str();
+    let resolved = if rendered.starts_with("http://") || rendered.starts_with("https://") {
+        rendered.to_string()
     } else {
-        let path = if endpoint.starts_with('/') {
-            endpoint
+        let path = if rendered.starts_with('/') {
+            rendered.to_string()
         } else {
-            format!("/{endpoint}")
+            format!("/{rendered}")
         };
         format!("{base_url}{path}")
     };
@@ -2007,8 +2639,11 @@ fn provider_balance_refresh_target_key(
     let token_secret = token;
     let token = usage_token_text(token_secret);
     let new_api_user_id = resolve_new_api_user_id(provider, target).ok()?;
+    let headers =
+        provider_request_headers(provider, target, token_secret, new_api_user_id.as_deref())
+            .ok()?;
     let account_fingerprint =
-        state.derive_usage_account_fingerprint(token.as_bytes(), new_api_user_id.as_deref());
+        usage_provider_account_fingerprint(state, &headers, new_api_user_id.as_deref());
     let mut usage_endpoint = reqwest::Url::parse(
         resolve_endpoint(provider, &target.base_url, token)
             .ok()?
@@ -2045,8 +2680,19 @@ fn provider_balance_refresh_target_key(
 
 struct PreparedProviderPoll {
     endpoint: String,
-    new_api_user_id: Option<String>,
+    headers: HeaderMap,
     reservation: ProviderObservationReservation,
+}
+
+fn usage_provider_account_fingerprint(
+    state: &ProxyState,
+    headers: &HeaderMap,
+    new_api_user_id: Option<&str>,
+) -> String {
+    let authentication = state
+        .derive_provider_account_fingerprint(None, headers)
+        .to_string();
+    state.derive_usage_account_fingerprint(authentication.as_bytes(), new_api_user_id)
 }
 
 enum ProviderPollCommitGuard {
@@ -2186,16 +2832,18 @@ async fn prepare_provider_poll(
     state: &ProxyState,
     provider: &UsageProviderConfig,
     target: &UsageProviderTarget,
-    token: &str,
+    token: &SecretValue,
     adapter_code: &str,
     config_revision_override: Option<&str>,
     observed_at_ms: u64,
 ) -> Result<PreparedProviderPoll> {
-    let endpoint = resolve_endpoint(provider, &target.base_url, token)?;
+    let token_text = usage_token_text(token);
+    let endpoint = resolve_endpoint(provider, &target.base_url, token_text)?;
     let new_api_user_id = resolve_new_api_user_id(provider, target)?;
+    let headers = provider_request_headers(provider, target, token, new_api_user_id.as_deref())?;
     let provider_endpoint = target.endpoint.provider_endpoint.clone();
     let account_fingerprint =
-        state.derive_usage_account_fingerprint(token.as_bytes(), new_api_user_id.as_deref());
+        usage_provider_account_fingerprint(state, &headers, new_api_user_id.as_deref());
     let route_scope = target.route_scope();
     let scope = ProviderObservationScope::new(
         provider_endpoint,
@@ -2215,7 +2863,7 @@ async fn prepare_provider_poll(
         .context("failed to reserve provider observation")?;
     Ok(PreparedProviderPoll {
         endpoint,
-        new_api_user_id,
+        headers,
         reservation,
     })
 }
@@ -2549,10 +3197,11 @@ async fn resolve_new_api_quota_conversion(
 
 fn provider_request_headers(
     provider: &UsageProviderConfig,
+    target: &UsageProviderTarget,
     token: &SecretValue,
     new_api_user_id: Option<&str>,
-) -> Result<reqwest::header::HeaderMap> {
-    let mut headers = reqwest::header::HeaderMap::new();
+) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
     match provider.kind {
         ProviderKind::YescodeProfile => {
             headers.insert("X-API-Key", token.sensitive_header_value());
@@ -2565,6 +3214,39 @@ fn provider_request_headers(
         }
     }
 
+    let normalized_base_url = normalized_balance_base_url(&target.base_url).ok_or_else(|| {
+        anyhow::anyhow!(
+            "usage provider '{}' has an invalid upstream base URL for custom headers",
+            provider.id
+        )
+    })?;
+    let now_ms = unix_now_ms();
+    let context = UsageProviderTemplateRenderContext {
+        normalized_base_url: &normalized_base_url,
+        upstream_base_url: &target.base_url,
+        token: usage_token_text(token),
+        credential: Some(&target.credential),
+        now_secs: now_ms / 1_000,
+        now_ms,
+    };
+    for (name, template) in compiled_usage_provider_headers(provider)? {
+        let rendered = render_usage_provider_template(provider, &template, &context)?;
+        if rendered.trim().is_empty() {
+            continue;
+        }
+        let mut value = HeaderValue::from_bytes(rendered.as_bytes()).map_err(|_| {
+            anyhow::anyhow!(
+                "usage provider '{}' rendered an invalid value for custom header '{}'",
+                provider.id,
+                name
+            )
+        })?;
+        if usage_provider_header_is_controlled_credential(&name) {
+            value.set_sensitive(true);
+        }
+        headers.insert(name, value);
+    }
+
     if let Some(user_id) = new_api_user_id {
         if !matches!(provider.kind, ProviderKind::NewApiUserSelf) {
             anyhow::bail!(
@@ -2573,7 +3255,7 @@ fn provider_request_headers(
                 provider.kind
             );
         }
-        let value = reqwest::header::HeaderValue::from_str(user_id).with_context(|| {
+        let value = HeaderValue::from_str(user_id).with_context(|| {
             format!(
                 "usage provider '{}' has an invalid New-Api-User value",
                 provider.id
@@ -2588,8 +3270,7 @@ async fn poll_provider_http_json(
     client: &Client,
     provider: &UsageProviderConfig,
     endpoint: &str,
-    new_api_user_id: Option<&str>,
-    token: &SecretValue,
+    headers: HeaderMap,
 ) -> Result<serde_json::Value> {
     let origin = endpoint_origin(endpoint);
     let mut req = client
@@ -2601,7 +3282,7 @@ async fn poll_provider_http_json(
             concat!("codex-helper/", env!("CARGO_PKG_VERSION")),
         );
 
-    req = req.headers(provider_request_headers(provider, token, new_api_user_id)?);
+    req = req.headers(headers);
 
     let resp = req.send().await.with_context(|| {
         format!(
@@ -2625,21 +3306,14 @@ async fn poll_provider_http_json(
             provider.kind
         );
     }
-    let text = resp.text().await.with_context(|| {
-        format!(
-            "usage provider response read failed from {} via {:?}",
-            origin, provider.kind
-        )
-    })?;
-    serde_json::from_str(&text).with_context(|| {
-        format!(
-            "usage provider returned non-JSON response from {} via {:?} (content-type {}, {} bytes)",
-            origin,
-            provider.kind,
-            content_type,
-            text.len()
-        )
-    })
+    read_limited_json_response(resp, USAGE_PROVIDER_RESPONSE_BODY_LIMIT)
+        .await
+        .with_context(|| {
+            format!(
+                "usage provider returned an invalid JSON response from {} via {:?} (content-type {})",
+                origin, provider.kind, content_type
+            )
+        })
 }
 
 fn amount_from_json(value: &serde_json::Value) -> Option<UsdAmount> {
@@ -4586,7 +5260,7 @@ async fn refresh_provider_target(
         state.as_ref(),
         provider,
         target,
-        token,
+        token_secret,
         provider.kind.source_name(),
         None,
         fetched_at_ms,
@@ -4621,8 +5295,7 @@ async fn refresh_provider_target(
         client,
         provider,
         &prepared_poll.endpoint,
-        prepared_poll.new_api_user_id.as_deref(),
-        token_secret,
+        prepared_poll.headers,
     )
     .await
     {
@@ -5295,7 +5968,7 @@ async fn auto_probe_provider_target_with_token(
             state.as_ref(),
             &provider,
             target,
-            token,
+            token_secret,
             provider.kind.source_name(),
             None,
             fetched_at_ms,
@@ -5324,8 +5997,7 @@ async fn auto_probe_provider_target_with_token(
             client,
             &provider,
             &prepared_poll.endpoint,
-            prepared_poll.new_api_user_id.as_deref(),
-            token_secret,
+            prepared_poll.headers,
         )
         .await
         {
@@ -5472,7 +6144,7 @@ async fn auto_probe_provider_target_with_token(
             state.as_ref(),
             &provider,
             target,
-            token,
+            token_secret,
             "usage_provider:auto_balance",
             Some(auto_config_revision.as_str()),
             fetched_at_ms,
@@ -5489,8 +6161,7 @@ async fn auto_probe_provider_target_with_token(
             client,
             &provider,
             &prepared_poll.endpoint,
-            prepared_poll.new_api_user_id.as_deref(),
-            token_secret,
+            prepared_poll.headers,
         )
         .await
         {
@@ -5651,11 +6322,6 @@ pub(crate) async fn refresh_balances_for_service(
     service_name: &str,
     options: UsageProviderRefreshOptions<'_>,
 ) -> Result<UsageProviderRefreshSummary> {
-    // Tests should be hermetic and must not depend on real user `usage_providers.json`.
-    if cfg!(test) {
-        return Ok(UsageProviderRefreshSummary::default());
-    }
-
     let UsageProviderRefreshOptions {
         route_provider_id_filter,
         provider_id_filter,
@@ -5667,14 +6333,16 @@ pub(crate) async fn refresh_balances_for_service(
     let provider_id_filter = provider_id_filter
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let (providers_file, providers_revision) = load_providers_with_revision()?;
-    if runtime.credentials.named_catalog_revision() != providers_revision.as_str() {
-        anyhow::bail!(
-            "usage provider configuration changed; waiting for the runtime credential generation to reload"
-        );
-    }
+    let provider_catalog = Arc::clone(&runtime.provider_catalog);
+    let providers_file = &provider_catalog.providers;
+    debug_assert_eq!(
+        runtime.credentials.named_catalog_revision(),
+        provider_catalog.revision.as_str()
+    );
     let mut summary = UsageProviderRefreshSummary {
         providers_configured: providers_file.providers.len(),
+        providers_rejected: provider_catalog.rejected.len(),
+        rejected_providers: provider_catalog.rejected.clone(),
         ..UsageProviderRefreshSummary::default()
     };
 
@@ -5771,6 +6439,7 @@ pub(crate) fn enqueue_poll_for_captured_route_candidate(
     client: Client,
     state: Arc<ProxyState>,
     captured_target: CapturedRouteCandidate,
+    provider_catalog: Arc<UsageProviderCatalog>,
 ) {
     let current_target = UsageProviderTarget::from_captured_route_candidate(&captured_target);
     let key = RequestBalanceProbeKey::for_target(&current_target);
@@ -5792,7 +6461,13 @@ pub(crate) fn enqueue_poll_for_captured_route_candidate(
                 RequestBalanceQueueDue::Missing => return,
             }
 
-            match poll_for_codex_target(client.clone(), state.clone(), current_target.clone()).await
+            match poll_for_codex_target(
+                client.clone(),
+                state.clone(),
+                current_target.clone(),
+                Arc::clone(&provider_catalog),
+            )
+            .await
             {
                 RequestBalancePollOutcome::Attempted | RequestBalancePollOutcome::Skipped => {
                     return;
@@ -5811,23 +6486,12 @@ async fn poll_for_codex_target(
     client: Client,
     state: Arc<ProxyState>,
     current_target: UsageProviderTarget,
+    provider_catalog: Arc<UsageProviderCatalog>,
 ) -> RequestBalancePollOutcome {
-    // Tests should be hermetic and should not depend on any real user `usage_providers.json` on
-    // the machine running the suite. Disable provider polling during tests to avoid flakiness.
-    if cfg!(test) {
-        return RequestBalancePollOutcome::Skipped;
-    }
-
-    let (providers_file, providers_revision) = match load_providers_with_revision() {
-        Ok(providers_file) => providers_file,
-        Err(error) => {
-            warn!(
-                "skipping request-driven usage provider poll because configuration could not be loaded: {error:#}"
-            );
-            return RequestBalancePollOutcome::Skipped;
-        }
-    };
-    if !usage_provider_catalog_matches(&current_target.credential, &providers_revision) {
+    if !usage_provider_catalog_matches(
+        &current_target.credential,
+        provider_catalog.revision.as_str(),
+    ) {
         debug!(
             provider_endpoint_key = %current_target.endpoint.provider_endpoint.stable_key(),
             "skipping request-driven usage provider poll until the runtime captures the changed provider configuration"
@@ -5846,7 +6510,7 @@ async fn poll_for_codex_target(
     let mut configured_jobs = Vec::new();
     let mut next_cooldown = None::<Duration>;
 
-    for provider in &providers_file.providers {
+    for provider in &provider_catalog.providers.providers {
         if !domain_matches(&current_target.base_url, &provider.domains) {
             continue;
         }
@@ -5933,9 +6597,44 @@ mod tests {
     use crate::config::{ProviderConfig, ProviderEndpointConfig, RouteGraphConfig, UpstreamAuth};
     use crate::routing_ir::CompiledRouteGraph;
     use axum::routing::get;
+    use std::ffi::OsString;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
+
+    struct ScopedUsageProviderEnvironment {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedUsageProviderEnvironment {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: this test owns a unique environment variable name.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+
+        fn replace(&self, value: &str) {
+            // SAFETY: this test owns a unique environment variable name.
+            unsafe { std::env::set_var(self.name, value) };
+        }
+    }
+
+    impl Drop for ScopedUsageProviderEnvironment {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => {
+                    // SAFETY: this test owns a unique environment variable name.
+                    unsafe { std::env::set_var(self.name, value) };
+                }
+                None => {
+                    // SAFETY: this test owns a unique environment variable name.
+                    unsafe { std::env::remove_var(self.name) };
+                }
+            }
+        }
+    }
 
     fn assert_secret_canary_absent(surface: &str, rendered: &str, canary: &str) {
         let raw_sha256 = format!("{:x}", sha2::Sha256::digest(canary.as_bytes()));
@@ -6381,6 +7080,18 @@ mod tests {
                             .acquire()
                             .await
                             .expect("first request release semaphore");
+                        if uri.path().ends_with("/usage") {
+                            return axum::Json(serde_json::json!({
+                                "isValid": true,
+                                "mode": "quota_limited",
+                                "quota": {
+                                    "limit": 10,
+                                    "used": 10,
+                                    "remaining": 0,
+                                    "unit": "USD"
+                                }
+                            }));
+                        }
                         return axum::Json(serde_json::json!({ "balance": "0" }));
                     }
                     if uri.path().ends_with("/usage") {
@@ -6413,6 +7124,8 @@ mod tests {
             quota_pool_id: None,
             quota_reset_timezone: None,
             quota_divisor: None,
+            headers: UsageProviderTemplateMap::default(),
+            variables: UsageProviderTemplateMap::default(),
             extract: UsageProviderExtractConfig::default(),
         }
     }
@@ -6465,6 +7178,15 @@ mod tests {
     }
 
     fn usage_runtime_capture(cfg: HelperConfig) -> UsageProviderRuntimeCapture {
+        let provider_catalog = default_usage_provider_catalog()
+            .expect("build default usage provider catalog for test");
+        usage_runtime_capture_with_catalog(cfg, provider_catalog)
+    }
+
+    fn usage_runtime_capture_with_catalog(
+        cfg: HelperConfig,
+        provider_catalog: UsageProviderCatalog,
+    ) -> UsageProviderRuntimeCapture {
         let store = crate::runtime_store::RuntimeStore::open_in_memory()
             .expect("open usage runtime test store");
         let runtime = crate::credentials::CredentialRuntime::from_runtime_store(
@@ -6488,15 +7210,20 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        let named_credentials = credential_references_from_providers(&provider_catalog.providers);
         let credentials = runtime
-            .build_generation(inputs.iter().map(|(provider_endpoint, auth)| {
-                crate::credentials::CredentialCandidateInput {
-                    provider_endpoint: provider_endpoint.clone(),
-                    auth,
-                }
-            }))
+            .build_generation_with_named(
+                inputs.iter().map(|(provider_endpoint, auth)| {
+                    crate::credentials::CredentialCandidateInput {
+                        provider_endpoint: provider_endpoint.clone(),
+                        auth,
+                    }
+                }),
+                named_credentials,
+                provider_catalog.revision.as_str(),
+            )
             .expect("build usage credential generation");
-        UsageProviderRuntimeCapture::new(Arc::new(cfg), credentials)
+        UsageProviderRuntimeCapture::new(Arc::new(cfg), credentials, Arc::new(provider_catalog))
     }
 
     fn usage_provider_target(base_url: &str, provider_id: &str) -> UsageProviderTarget {
@@ -6696,6 +7423,10 @@ mod tests {
         let mut configured = provider("custom", ProviderKind::NewApiUserSelf);
         configured.token_env = Some("CUSTOM_USAGE_TOKEN".to_string());
         configured.new_api_user_id_env = Some("CUSTOM_USER_ID".to_string());
+        configured.headers.insert(
+            "Authorization".to_string(),
+            "Bearer {{env:CUSTOM_TEMPLATE_TOKEN}}".to_string(),
+        );
         let references = credential_references_from_providers(&UsageProvidersFile {
             providers: vec![configured],
         });
@@ -6722,11 +7453,125 @@ mod tests {
             "CUSTOM_USER_ID",
             NamedCredentialLookup::EnvironmentOnly
         ));
+        assert!(contains(
+            "claude",
+            "CUSTOM_TEMPLATE_TOKEN",
+            NamedCredentialLookup::EnvironmentOnly
+        ));
         assert!(!contains(
             "codex",
             "CUSTOM_USER_ID",
             NamedCredentialLookup::ServiceCredential
         ));
+    }
+
+    #[test]
+    fn template_environment_values_are_generation_captured_for_request_headers() {
+        const ENV_NAME: &str = "CODEX_HELPER_TEST_USAGE_TEMPLATE_TOKEN_61D6D223";
+        let environment = ScopedUsageProviderEnvironment::set(ENV_NAME, "template-generation-a");
+        let mut provider = provider("captured-template", ProviderKind::OpenAiBalanceHttpJson);
+        provider.headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer {{{{env:{ENV_NAME}}}}}"),
+        );
+        validate_usage_provider_config(&provider).expect("validate captured auth template");
+
+        let providers = UsageProvidersFile {
+            providers: vec![provider.clone()],
+        };
+        let references = credential_references_from_providers(&providers);
+        assert!(references.contains(&NamedCredentialReference {
+            service_name: "codex".to_string(),
+            name: ENV_NAME.to_string(),
+            lookup: NamedCredentialLookup::EnvironmentOnly,
+        }));
+
+        let store = crate::runtime_store::RuntimeStore::open_in_memory()
+            .expect("open usage template credential store");
+        let runtime = crate::credentials::CredentialRuntime::from_runtime_store(
+            crate::credentials::CredentialSourceCapabilities::server(),
+            &store,
+        )
+        .expect("build usage template credential runtime");
+        let provider_endpoint = ProviderEndpointKey::new("codex", "captured-template", "default");
+        let auth = UpstreamAuth {
+            auth_token: Some("stable-model-token".to_string().into()),
+            ..UpstreamAuth::default()
+        };
+        let candidates = || {
+            [crate::credentials::CredentialCandidateInput {
+                provider_endpoint: provider_endpoint.clone(),
+                auth: &auth,
+            }]
+        };
+        let generation_a = runtime
+            .build_generation_with_named(candidates(), references.clone(), "test:usage-template:v1")
+            .expect("build generation A");
+        let capture_target = |generation: &CredentialGeneration| UsageProviderTarget {
+            endpoint: UsageProviderEndpointRef {
+                provider_endpoint: provider_endpoint.clone(),
+                catalog_index: 0,
+            },
+            base_url: "https://example.com/v1".to_string(),
+            runtime_identity: generation
+                .bind_upstream_identity(provider_endpoint.clone(), "https://example.com/v1", None)
+                .expect("bind usage template identity"),
+            credential: generation
+                .capture_bound(&provider_endpoint)
+                .expect("capture usage template credential"),
+            tags: BTreeMap::new(),
+            supported_models: BTreeMap::new(),
+            model_mapping: BTreeMap::new(),
+        };
+        let target_a = capture_target(generation_a.as_ref());
+
+        environment.replace("template-generation-b");
+        let token_a = target_a
+            .credential
+            .preferred_usage_token()
+            .expect("generation A model token");
+        let headers_a = provider_request_headers(&provider, &target_a, &token_a, None)
+            .expect("render request headers from generation A");
+        assert_eq!(
+            headers_a
+                .get(AUTHORIZATION)
+                .expect("generation A authorization")
+                .as_bytes(),
+            b"Bearer template-generation-a"
+        );
+
+        let generation_b = runtime
+            .build_generation_from_previous_with_named(
+                candidates(),
+                references,
+                "test:usage-template:v1",
+                generation_a.as_ref(),
+            )
+            .expect("build generation B");
+        let target_b = capture_target(generation_b.as_ref());
+        let token_b = target_b
+            .credential
+            .preferred_usage_token()
+            .expect("generation B model token");
+        let headers_b = provider_request_headers(&provider, &target_b, &token_b, None)
+            .expect("render request headers from generation B");
+        assert_eq!(
+            headers_b
+                .get(AUTHORIZATION)
+                .expect("generation B authorization")
+                .as_bytes(),
+            b"Bearer template-generation-b"
+        );
+
+        assert_eq!(target_a.route_scope(), target_b.route_scope());
+        let state = ProxyState::new();
+        assert_ne!(
+            usage_provider_account_fingerprint(&state, &headers_a, None),
+            usage_provider_account_fingerprint(&state, &headers_b, None)
+        );
+        let rendered = format!("{target_a:?} {target_b:?} {headers_a:?} {headers_b:?}");
+        assert!(!rendered.contains("template-generation-a"));
+        assert!(!rendered.contains("template-generation-b"));
     }
 
     #[test]
@@ -6770,6 +7615,97 @@ mod tests {
                 "unexpected error: {detail}"
             );
         }
+
+        let mut configured = provider("invalid-template-env", ProviderKind::NewApiUserSelf);
+        configured.headers.insert(
+            "Authorization".to_string(),
+            "Bearer {{env:BAD=TOKEN}}".to_string(),
+        );
+        let error = validate_usage_provider_config(&configured)
+            .expect_err("invalid template environment reference must be rejected");
+        assert!(
+            format!("{error:#}").contains("invalid environment variable reference"),
+            "unexpected template environment error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn custom_usage_provider_variables_reject_cycles() {
+        let mut configured = provider("cyclic-variables", ProviderKind::NewApiUserSelf);
+        configured
+            .variables
+            .insert("first".to_string(), "{{second}}".to_string());
+        configured
+            .variables
+            .insert("second".to_string(), "{{first}}".to_string());
+
+        let error = validate_usage_provider_config(&configured)
+            .expect_err("cyclic custom variables must be rejected");
+
+        assert!(format!("{error:#}").contains("cyclic custom variable reference"));
+    }
+
+    #[test]
+    fn v0203_unknown_extensions_load_without_rewriting_operator_input() {
+        let (directory, path) = isolated_usage_provider_path("v0203-unknown-extensions");
+        let original = br#"{
+  "catalog_revision": "operator-v1",
+  "operator_metadata": {"managed_by": "external-tool"},
+  "providers": [{
+    "id": "custom-relay",
+    "kind": "openai_balance_http_json",
+    "domains": ["relay.example"],
+    "endpoint": "/usage",
+    "display_name": "Custom Relay",
+    "provider_metadata": {"poll_jitter_secs": 7}
+  }]
+}"#;
+        std::fs::write(&path, original).expect("write extended v0.20.3 config");
+
+        let catalog =
+            load_provider_catalog_from_path(&path).expect("load v0.20.3 extension fields");
+
+        assert!(catalog.rejected.is_empty());
+        assert_eq!(catalog.providers.providers.len(), 1);
+        assert_eq!(catalog.providers.providers[0].id, "custom-relay");
+        assert_eq!(catalog.providers.providers[0].endpoint, "/usage");
+        assert_eq!(
+            std::fs::read(&path)
+                .expect("read preserved extended v0.20.3 config")
+                .as_slice(),
+            original
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn unknown_extensions_do_not_bypass_endpoint_template_validation() {
+        let (directory, path) = isolated_usage_provider_path("unsafe-extended-endpoint");
+        let original = br#"{
+  "operator_metadata": {"managed_by": "external-tool"},
+  "providers": [{
+    "id": "unsafe-extended-endpoint",
+    "kind": "openai_balance_http_json",
+    "domains": ["relay.example"],
+    "endpoint": "https://relay.example/usage?credential={{token}}",
+    "provider_metadata": {"poll_jitter_secs": 7}
+  }]
+}"#;
+        std::fs::write(&path, original).expect("write unsafe extended config");
+
+        let error = load_providers_from_path(&path)
+            .expect_err("credential-bearing endpoint must remain invalid");
+
+        let detail = format!("{error:#}");
+        assert!(detail.contains("unsafe-extended-endpoint"));
+        assert!(detail.contains("endpoint template may not contain credentials"));
+        assert_eq!(
+            std::fs::read(&path)
+                .expect("read preserved unsafe extended config")
+                .as_slice(),
+            original
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
     }
 
     #[test]
@@ -6780,7 +7716,7 @@ mod tests {
     "id": "legacy-template",
     "kind": "new_api_user_self",
     "domains": ["example.com"],
-    "headers": {"New-Api-User": "42"}
+    "headers": {"X-Custom-Auth": "{{token}}"}
   }]
 }"#;
         std::fs::write(&path, original).expect("write invalid operator config");
@@ -6789,7 +7725,7 @@ mod tests {
 
         let detail = format!("{error:#}");
         assert!(detail.contains("failed to parse usage provider configuration"));
-        assert!(detail.contains("unknown field `headers`"));
+        assert!(detail.contains("allowed only in Authorization or X-API-Key"));
         assert_eq!(
             std::fs::read(&path)
                 .expect("read preserved operator config")
@@ -6821,19 +7757,21 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_templates_fail_during_operator_file_load_without_rewriting_input() {
-        for (id, kind, domains, endpoint) in [
+    fn v0203_builtin_endpoint_templates_load_as_canonical_literals_without_rewriting_input() {
+        for (id, kind, domains, endpoint, expected) in [
             (
-                "legacy-siliconflow",
+                "siliconflow",
                 "openai_balance_http_json",
                 vec!["api.siliconflow.cn"],
                 "{{base_url}}/v1/user/info",
+                "/v1/user/info",
             ),
             (
-                "legacy-openai-costs",
+                "openai-official-costs",
                 "openai_organization_costs",
                 vec!["api.openai.com"],
-                "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}",
+                "https://api.openai.com/v1/organization/costs?start_time={{unix_days_ago:30}}&limit=30",
+                "https://api.openai.com/v1/organization/costs",
             ),
         ] {
             let (directory, path) = isolated_usage_provider_path(id);
@@ -6848,25 +7786,207 @@ mod tests {
             .expect("serialize legacy operator config");
             std::fs::write(&path, &original).expect("write legacy operator config");
 
-            let error = load_providers_from_path(&path)
-                .expect_err("endpoint templates must fail during file load");
+            let loaded = load_providers_from_path(&path)
+                .expect("v0.20.3 built-in endpoint must remain compatible");
 
-            let detail = format!("{error:#}");
-            assert!(
-                detail.contains(id),
-                "error must identify provider: {detail}"
-            );
-            assert!(
-                detail.contains("endpoint templates are not supported")
-                    && detail.contains("literal absolute URL or relative path"),
-                "error must include migration guidance: {detail}"
-            );
+            assert_eq!(loaded.providers.len(), 1);
+            assert_eq!(loaded.providers[0].endpoint, expected);
             assert_eq!(
                 std::fs::read(&path).expect("read preserved operator config"),
                 original
             );
             std::fs::remove_dir_all(directory).expect("remove isolated test directory");
         }
+    }
+
+    #[test]
+    fn complete_v0203_builtin_fixture_loads_without_rewriting_operator_input() {
+        let (directory, path) = isolated_usage_provider_path("complete-v0203-fixture");
+        let original = include_bytes!("../tests/fixtures/usage-providers-v0.20.3.json");
+        std::fs::write(&path, original).expect("write v0.20.3 fixture");
+
+        let loaded = load_providers_from_path(&path).expect("load complete v0.20.3 fixture");
+
+        assert_eq!(loaded.providers.len(), 9);
+        let siliconflow = loaded
+            .providers
+            .iter()
+            .find(|provider| provider.id == "siliconflow")
+            .expect("SiliconFlow adapter");
+        assert_eq!(siliconflow.endpoint, "/v1/user/info");
+        assert_eq!(
+            resolve_endpoint(siliconflow, "https://api.siliconflow.cn/v1", "model-secret")
+                .expect("resolve SiliconFlow fixture endpoint"),
+            "https://api.siliconflow.cn/v1/user/info"
+        );
+        let openai = loaded
+            .providers
+            .iter()
+            .find(|provider| provider.id == "openai-official-costs")
+            .expect("OpenAI costs adapter");
+        assert_eq!(
+            openai.endpoint,
+            "https://api.openai.com/v1/organization/costs"
+        );
+        assert_eq!(
+            std::fs::read(&path)
+                .expect("read source fixture")
+                .as_slice(),
+            original.as_slice()
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn v0203_documented_new_api_user_header_loads_without_rewriting_input() {
+        let (directory, path) = isolated_usage_provider_path("v0203-new-api-user-header");
+        let original = br#"{
+  "providers": [{
+    "id": "rightcode",
+    "kind": "new_api_user_self",
+    "domains": ["www.right.codes"],
+    "endpoint": "{{base_url}}/api/user/self",
+    "token_env": "RIGHTCODE_NEWAPI_ACCESS_TOKEN",
+    "headers": {
+      "New-Api-User": "{{env:RIGHTCODE_NEWAPI_USER_ID}}"
+    }
+  }]
+}"#;
+        std::fs::write(&path, original).expect("write v0.20.3 operator config");
+
+        let loaded = load_providers_from_path(&path)
+            .expect("v0.20.3 documented New-Api-User header must remain compatible");
+
+        assert_eq!(loaded.providers.len(), 1);
+        let provider = &loaded.providers[0];
+        assert_eq!(
+            provider.new_api_user_id_env.as_deref(),
+            Some("RIGHTCODE_NEWAPI_USER_ID")
+        );
+        assert!(provider.headers.get("New-Api-User").is_none());
+        assert_eq!(
+            std::fs::read(&path)
+                .expect("read preserved operator config")
+                .as_slice(),
+            original
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn v0203_new_api_user_header_merges_with_the_same_typed_field() {
+        let (directory, path) = isolated_usage_provider_path("v0203-new-api-user-merge");
+        let original = br#"{
+  "providers": [{
+    "id": "rightcode",
+    "kind": "new_api_user_self",
+    "domains": ["www.right.codes"],
+    "new_api_user_id_env": "RIGHTCODE_NEWAPI_USER_ID",
+    "headers": {
+      "new-api-user": "  {{env: RIGHTCODE_NEWAPI_USER_ID }}  "
+    }
+  }]
+}"#;
+        std::fs::write(&path, original).expect("write mixed v0.20.3 operator config");
+
+        let loaded = load_providers_from_path(&path)
+            .expect("matching legacy and typed New API user references must merge");
+
+        assert_eq!(loaded.providers.len(), 1);
+        let provider = &loaded.providers[0];
+        assert_eq!(
+            provider.new_api_user_id_env.as_deref(),
+            Some("RIGHTCODE_NEWAPI_USER_ID")
+        );
+        assert!(provider.headers.get("new-api-user").is_none());
+        assert_eq!(
+            std::fs::read(&path)
+                .expect("read preserved mixed operator config")
+                .as_slice(),
+            original
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn conflicting_v0203_new_api_user_references_fail_closed_without_rewriting_input() {
+        const LEGACY_ENV: &str = "RIGHTCODE_LEGACY_USER_ID";
+        const TYPED_ENV: &str = "RIGHTCODE_TYPED_USER_ID";
+        let (directory, path) = isolated_usage_provider_path("v0203-new-api-user-conflict");
+        let original = format!(
+            r#"{{
+  "providers": [{{
+    "id": "rightcode-conflict",
+    "kind": "new_api_user_self",
+    "domains": ["www.right.codes"],
+    "new_api_user_id_env": "{TYPED_ENV}",
+    "headers": {{
+      "New-Api-User": "{{{{env:{LEGACY_ENV}}}}}"
+    }}
+  }}]
+}}"#
+        );
+        std::fs::write(&path, original.as_bytes()).expect("write conflicting operator config");
+
+        let error = load_providers_from_path(&path)
+            .expect_err("conflicting New API user references must fail closed");
+
+        let detail = format!("{error:#}");
+        assert!(detail.contains("rightcode-conflict"));
+        assert!(detail.contains("conflicts with new_api_user_id_env"));
+        assert!(!detail.contains(LEGACY_ENV));
+        assert!(!detail.contains(TYPED_ENV));
+        assert_eq!(
+            std::fs::read(&path)
+                .expect("read preserved conflicting config")
+                .as_slice(),
+            original.as_bytes()
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn credential_bearing_variable_chains_fail_without_rewriting_or_leaking_input() {
+        const CANARY: &str = "endpoint-secret-canary-e3814fc4";
+        let (directory, path) = isolated_usage_provider_path("unsafe-template");
+        let original = br#"{
+  "providers": [{
+    "id": "unsafe-template",
+    "kind": "openai_balance_http_json",
+    "domains": ["example.com"],
+    "endpoint": "https://example.com/usage?identity={{credentialA}}",
+    "variables": {
+      "credentialA": "{{credentialB}}",
+      "credentialB": "endpoint-secret-canary-e3814fc4-{{env:UPSTREAM_DASHBOARD_SECRET}}"
+    }
+  }]
+}"#;
+        std::fs::write(&path, original).expect("write operator config");
+
+        let error = load_providers_from_path(&path)
+            .expect_err("credential-bearing endpoint templates must fail during file load");
+
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("unsafe-template"),
+            "error must identify provider: {detail}"
+        );
+        assert!(
+            detail.contains("endpoint template may not contain credentials")
+                && detail.contains("Authorization or X-API-Key"),
+            "error must include migration guidance: {detail}"
+        );
+        assert!(
+            !detail.contains(CANARY),
+            "diagnostic leaked template content"
+        );
+        assert_eq!(
+            std::fs::read(&path)
+                .expect("read preserved operator config")
+                .as_slice(),
+            original
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
     }
 
     #[test]
@@ -6895,7 +8015,10 @@ mod tests {
     "id": "newapi-dashboard",
     "kind": "new_api_user_self",
     "domains": ["example.com"],
-    "new_api_user_id_env": "NEW_API_USER_ID"
+    "endpoint": "{{base_url}}/api/user/self?user={{userId}}",
+    "new_api_user_id_env": "NEW_API_USER_ID",
+    "headers": {"X-Usage-Tenant": "{{tenant}}"},
+    "variables": {"userId": "42", "tenant": "operator"}
   }]
 }"#;
         std::fs::write(&path, original).expect("write operator config");
@@ -6908,12 +8031,132 @@ mod tests {
             Some("NEW_API_USER_ID")
         );
         assert_eq!(
+            resolve_endpoint(
+                &providers.providers[0],
+                "https://example.com/v1",
+                "model-secret"
+            )
+            .expect("render safe operator endpoint"),
+            "https://example.com/api/user/self?user=42"
+        );
+        assert_eq!(
             std::fs::read(&path)
                 .expect("read preserved operator config")
                 .as_slice(),
             original
         );
         std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_captured_catalog_in_tests_instead_of_an_empty_shortcut() {
+        let runtime = usage_runtime_capture(HelperConfig::default());
+        let client = Client::builder().no_proxy().build().expect("build client");
+
+        let summary = refresh_balances_for_service(
+            &client,
+            runtime,
+            ProxyState::new(),
+            "codex",
+            UsageProviderRefreshOptions {
+                route_provider_id_filter: None,
+                provider_id_filter: None,
+                force: true,
+            },
+        )
+        .await
+        .expect("refresh captured catalog");
+
+        assert!(summary.providers_configured > 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_provider_is_isolated_while_valid_catalog_entries_remain_refreshable() {
+        let (directory, path) = isolated_usage_provider_path("partial-catalog");
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "providers": [
+                {
+                    "id": "valid",
+                    "kind": "openai_balance_http_json",
+                    "domains": ["valid.example"],
+                    "endpoint": "/usage"
+                },
+                {
+                    "id": "invalid",
+                    "kind": "openai_balance_http_json",
+                    "domains": ["invalid.example"],
+                    "endpoint": "https://invalid.example/usage",
+                    "headers": {
+                        "X-Legacy-Credential": "do-not-log-this-canary-{{token}}"
+                    }
+                }
+            ]
+        }))
+        .expect("serialize partial catalog");
+        std::fs::write(&path, &original).expect("write partial catalog");
+        let catalog = load_provider_catalog_from_path(&path).expect("load partial catalog");
+        let runtime = usage_runtime_capture_with_catalog(HelperConfig::default(), catalog);
+        let client = Client::builder().no_proxy().build().expect("build client");
+
+        let summary = refresh_balances_for_service(
+            &client,
+            runtime,
+            ProxyState::new(),
+            "codex",
+            UsageProviderRefreshOptions {
+                route_provider_id_filter: None,
+                provider_id_filter: None,
+                force: true,
+            },
+        )
+        .await
+        .expect("valid providers must continue refreshing");
+
+        assert_eq!(summary.providers_configured, 1);
+        assert_eq!(summary.providers_rejected, 1);
+        assert_eq!(summary.rejected_providers[0].provider_id, "invalid");
+        assert_eq!(summary.rejected_providers[0].code, "invalid_config");
+        assert!(
+            summary.rejected_providers[0]
+                .message
+                .contains("allowed only in Authorization or X-API-Key")
+        );
+        assert!(
+            !summary.rejected_providers[0]
+                .message
+                .contains("do-not-log-this-canary")
+        );
+        assert_eq!(std::fs::read(&path).expect("read source"), original);
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn catalog_load_failure_retains_last_known_good_custom_providers() {
+        let document: RawUsageProvidersFile = serde_json::from_value(serde_json::json!({
+            "providers": [{
+                "id": "custom-relay",
+                "kind": "openai_balance_http_json",
+                "domains": ["relay.example"],
+                "endpoint": "/usage"
+            }]
+        }))
+        .expect("parse custom catalog document");
+        let previous =
+            usage_provider_catalog_from_document(document).expect("build custom catalog");
+        let previous_revision = previous.revision.clone();
+
+        let (_, revision, retained) = credential_generation_catalog_from_result(
+            Err(anyhow::anyhow!("injected incomplete JSON document")),
+            Some(&previous),
+        )
+        .into_parts();
+
+        assert_eq!(revision, previous_revision);
+        assert_eq!(retained.providers.providers.len(), 1);
+        assert_eq!(retained.providers.providers[0].id, "custom-relay");
+        assert!(retained.rejected.iter().any(|diagnostic| {
+            diagnostic.provider_id == "catalog" && diagnostic.code == "catalog_unavailable"
+        }));
     }
 
     #[test]
@@ -7088,7 +8331,19 @@ mod tests {
             ),
             (
                 "{{unsupported}}/usage",
-                "endpoint templates are not supported",
+                "template contains an unsupported placeholder",
+            ),
+            (
+                "https://example.com/usage?credential={{token}}",
+                "endpoint template may not contain credentials",
+            ),
+            (
+                "https://example.com/usage?credential={{apiKey}}",
+                "endpoint template may not contain credentials",
+            ),
+            (
+                "https://example.com/usage?credential={{accessToken}}",
+                "endpoint template may not contain credentials",
             ),
             (
                 "https://example.com/usage?api_key=literal-secret",
@@ -7125,9 +8380,10 @@ mod tests {
             provider.endpoint = endpoint.to_string();
             let error = resolve_endpoint(&provider, "https://example.com/v1", "model-secret-token")
                 .expect_err(endpoint);
+            let error_chain = format!("{error:#}");
             assert!(
-                error.to_string().contains(expected),
-                "unexpected error for {endpoint}: {error:#}"
+                error_chain.contains(expected),
+                "unexpected error for {endpoint}: {error_chain}"
             );
         }
     }
@@ -7145,27 +8401,50 @@ mod tests {
     }
 
     #[test]
-    fn usage_provider_config_rejects_generic_headers_and_variables() {
-        for field in ["headers", "variables"] {
-            let mut input = serde_json::json!({
-                "id": "closed-config",
-                "kind": "new_api_user_self",
-                "domains": ["example.com"]
-            });
-            input
-                .as_object_mut()
-                .expect("provider config object")
-                .insert(field.to_string(), serde_json::json!({"arbitrary": "value"}));
+    fn usage_provider_config_accepts_safe_v0203_headers_and_variables() {
+        let mut provider = serde_json::from_value::<UsageProviderConfig>(serde_json::json!({
+            "id": "legacy-custom",
+            "kind": "new_api_user_self",
+            "domains": ["newapi.example.com"],
+            "endpoint": "{{baseUrl}}/api/user/self?user={{userId}}&at={{unix_now}}&from={{unix_days_ago:1}}",
+            "headers": {
+                "X-Usage-Context": "{{upstreamBaseUrl}}|{{upstream_base_url}}|{{userId}}|{{unix_now_ms}}"
+            },
+            "variables": {
+                "accountId": "42",
+                "userId": "{{accountId}}"
+            }
+        }))
+        .expect("parse v0.20.3 request customization");
+        validate_usage_provider_config(&provider).expect("validate safe legacy templates");
 
-            let error = serde_json::from_value::<UsageProviderConfig>(input)
-                .expect_err("generic request customization must be rejected");
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("unknown field `{field}`")),
-                "unexpected error for {field}: {error}"
-            );
-        }
+        let endpoint = resolve_endpoint(&provider, "https://newapi.example.com/v1", "model-secret")
+            .expect("render legacy endpoint");
+        assert!(endpoint.starts_with("https://newapi.example.com/api/user/self?user=42&at="));
+        assert!(endpoint.contains("&from="));
+        assert!(!endpoint.contains("{{"));
+
+        let target = usage_provider_target("https://newapi.example.com/v1", "legacy-custom");
+        let headers =
+            provider_request_headers(&provider, &target, &secret_value("model-secret"), None)
+                .expect("render legacy custom headers");
+        let context = headers
+            .get("X-Usage-Context")
+            .expect("custom context header");
+        let context = context.to_str().expect("text context header");
+        assert!(
+            context.starts_with("https://newapi.example.com/v1|https://newapi.example.com/v1|42|"),
+            "unexpected rendered context: {context}"
+        );
+        assert!(!context.contains("{{"));
+        assert!(!headers["X-Usage-Context"].is_sensitive());
+
+        provider.endpoint = "{{base_url}}/api/user/self".to_string();
+        assert_eq!(
+            resolve_endpoint(&provider, "https://newapi.example.com/v1", "model-secret")
+                .expect("render snake-case base URL alias"),
+            "https://newapi.example.com/api/user/self"
+        );
     }
 
     #[test]
@@ -7179,7 +8458,8 @@ mod tests {
         .expect("typed user id")
         .expect("configured user id");
         let token = secret_value("dashboard-token");
-        let headers = provider_request_headers(&provider, &token, Some(&user_id))
+        let target = usage_provider_target("https://newapi.example.com/v1", "newapi");
+        let headers = provider_request_headers(&provider, &target, &token, Some(&user_id))
             .expect("fixed provider headers");
 
         assert_eq!(
@@ -7206,13 +8486,55 @@ mod tests {
     fn usage_provider_api_key_header_is_sensitive() {
         const CANARY: &str = "yescode-secret-canary-f0f17b2c";
         let provider = provider("yescode", ProviderKind::YescodeProfile);
-        let headers = provider_request_headers(&provider, &secret_value(CANARY), None)
+        let target = usage_provider_target("https://yescode.example.com/v1", "yescode");
+        let headers = provider_request_headers(&provider, &target, &secret_value(CANARY), None)
             .expect("fixed provider headers");
         let value = headers.get("X-API-Key").expect("API key header");
 
         assert!(value.is_sensitive());
         assert_eq!(value.as_bytes(), CANARY.as_bytes());
         assert!(!format!("{headers:?}").contains(CANARY));
+    }
+
+    #[test]
+    fn credential_templates_are_confined_to_sensitive_authentication_headers() {
+        const CANARY: &str = "template-secret-canary-9dd279b2";
+        let mut provider = provider("custom-auth", ProviderKind::OpenAiBalanceHttpJson);
+        provider.headers.insert(
+            "Authorization".to_string(),
+            "Token {{accessToken}}".to_string(),
+        );
+        provider
+            .headers
+            .insert("X-API-Key".to_string(), "{{apiKey}}".to_string());
+        validate_usage_provider_config(&provider).expect("controlled auth templates");
+        let rendered_config = format!("{provider:?}");
+        assert!(!rendered_config.contains(CANARY));
+
+        let target = usage_provider_target("https://example.com/v1", "custom-auth");
+        let headers = provider_request_headers(&provider, &target, &secret_value(CANARY), None)
+            .expect("render controlled authentication headers");
+        for name in ["Authorization", "X-API-Key"] {
+            let value = headers.get(name).expect("custom auth header");
+            assert!(value.is_sensitive(), "{name} must remain debug-redacted");
+        }
+        assert_eq!(
+            headers["Authorization"].as_bytes(),
+            format!("Token {CANARY}").as_bytes()
+        );
+        assert_eq!(headers["X-API-Key"].as_bytes(), CANARY.as_bytes());
+        assert!(!format!("{headers:?}").contains(CANARY));
+
+        provider.headers.insert(
+            "X-Custom-Auth".to_string(),
+            format!("prefix-{CANARY}-{{{{token}}}}"),
+        );
+        assert!(!format!("{provider:?}").contains(CANARY));
+        let error = validate_usage_provider_config(&provider)
+            .expect_err("credential content outside controlled auth headers must fail");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("allowed only in Authorization or X-API-Key"));
+        assert!(!detail.contains(CANARY));
     }
 
     #[test]
@@ -7287,15 +8609,14 @@ mod tests {
             ProviderKind::YescodeProfile,
         ] {
             let provider = provider("redirect-boundary", kind);
-            let error = poll_provider_http_json(
-                &client,
-                &provider,
-                &endpoint,
-                None,
-                &secret_value("model-secret"),
-            )
-            .await
-            .expect_err("redirect must remain an upstream response");
+            let token = secret_value("model-secret");
+            let target =
+                usage_provider_target(&format!("http://{source_addr}/v1"), "redirect-boundary");
+            let headers = provider_request_headers(&provider, &target, &token, None)
+                .expect("provider request headers");
+            let error = poll_provider_http_json(&client, &provider, &endpoint, headers)
+                .await
+                .expect_err("redirect must remain an upstream response");
             assert!(
                 error.to_string().contains("HTTP 302"),
                 "unexpected redirect error: {error:#}"
@@ -7557,22 +8878,54 @@ mod tests {
         let client = crate::proxy::upstream_http_client_builder()
             .build()
             .expect("build upstream client");
+        let token = secret_value(CANARY);
+        let target = usage_provider_target(&format!("http://{addr}/v1"), "echo");
+        let headers = provider_request_headers(&provider, &target, &token, None)
+            .expect("provider request headers");
 
-        let error = poll_provider_http_json(
-            &client,
-            &provider,
-            &format!("http://{addr}/usage"),
-            None,
-            &secret_value(CANARY),
-        )
-        .await
-        .expect_err("401 response must fail");
+        let error =
+            poll_provider_http_json(&client, &provider, &format!("http://{addr}/usage"), headers)
+                .await
+                .expect_err("401 response must fail");
         let rendered = format!("{error:#}");
 
         assert!(rendered.contains("HTTP 401"));
         assert!(!rendered.contains(CANARY));
         assert!(!rendered.contains("INVALID_TOKEN"));
         assert!(!rendered.contains("rejected bearer"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_provider_success_response_has_a_bounded_body() {
+        let app = axum::Router::new().fallback(get(|| async {
+            axum::Json(serde_json::json!({
+                "balance": 1,
+                "padding": "x".repeat(1024 * 1024),
+            }))
+        }));
+        let (addr, handle) = spawn_axum_server(app).await;
+        let provider = provider("oversized", ProviderKind::OpenAiBalanceHttpJson);
+        let client = crate::proxy::upstream_http_client_builder()
+            .build()
+            .expect("build upstream client");
+        let token = secret_value("model-secret");
+        let target = usage_provider_target(&format!("http://{addr}/v1"), "oversized");
+        let headers = provider_request_headers(&provider, &target, &token, None)
+            .expect("provider request headers");
+
+        let result =
+            poll_provider_http_json(&client, &provider, &format!("http://{addr}/usage"), headers)
+                .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("oversized authenticated response must be rejected"),
+        };
+
+        assert!(
+            format!("{error:#}").contains("response body exceeds"),
+            "unexpected oversized response error: {error:#}"
+        );
         handle.abort();
     }
 
@@ -9741,7 +11094,7 @@ mod tests {
             state.as_ref(),
             &provider,
             &target,
-            "model-key",
+            &secret_value("model-key"),
             provider.kind.source_name(),
             None,
             1_000,
@@ -9788,7 +11141,7 @@ mod tests {
             state.as_ref(),
             &provider,
             &target,
-            "model-key",
+            &secret_value("model-key"),
             provider.kind.source_name(),
             None,
             2_000,
@@ -9882,7 +11235,7 @@ mod tests {
             state.as_ref(),
             &provider,
             &target_a,
-            "generation-a-token",
+            &secret_value("generation-a-token"),
             provider.kind.source_name(),
             None,
             fetched_at_ms,
@@ -9950,7 +11303,7 @@ mod tests {
             state.as_ref(),
             &provider,
             &target_a,
-            "generation-a-token",
+            &secret_value("generation-a-token"),
             provider.kind.source_name(),
             None,
             fetched_at_ms.saturating_add(2),
@@ -9969,7 +11322,7 @@ mod tests {
             state.as_ref(),
             &provider,
             &target_b,
-            "generation-b-token",
+            &secret_value("generation-b-token"),
             provider.kind.source_name(),
             None,
             fetched_at_ms.saturating_add(3),
@@ -10202,6 +11555,309 @@ mod tests {
         );
 
         clear_auto_probe_kind_state(&provider_endpoint.provider_id);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rotated_credential_scope_ignores_inflight_configured_completion() {
+        let provider_id = "configured-inflight-rotation";
+        clear_auto_probe_kind_state(provider_id);
+        let (addr, first_started, release_first, handle) = spawn_ordered_balance_server().await;
+        let base_url = format!("http://{addr}/v1");
+        let mut configured_provider = provider(provider_id, ProviderKind::OpenAiBalanceHttpJson);
+        configured_provider.domains = vec!["127.0.0.1".to_string()];
+        configured_provider.endpoint = format!("http://{addr}/user/balance");
+        let configured_provider = Arc::new(configured_provider);
+        let provider_endpoint =
+            ProviderEndpointKey::new("codex", "configured-inflight-route", "default");
+        let runtime_store = Arc::new(
+            crate::runtime_store::RuntimeStore::open_in_memory()
+                .expect("open shared runtime store"),
+        );
+        let credential_runtime = crate::credentials::CredentialRuntime::from_runtime_store(
+            crate::credentials::CredentialSourceCapabilities::server(),
+            runtime_store.as_ref(),
+        )
+        .expect("build shared credential runtime");
+        let auth_a = UpstreamAuth {
+            auth_token: Some("generation-a-token".to_string().into()),
+            ..UpstreamAuth::default()
+        };
+        let auth_b = UpstreamAuth {
+            auth_token: Some("generation-b-token".to_string().into()),
+            ..UpstreamAuth::default()
+        };
+        let target_a = usage_provider_target_from_credential_runtime(
+            &credential_runtime,
+            &provider_endpoint,
+            0,
+            &base_url,
+            &auth_a,
+        );
+        let target_b = usage_provider_target_from_credential_runtime(
+            &credential_runtime,
+            &provider_endpoint,
+            0,
+            &base_url,
+            &auth_b,
+        );
+        let state = ProxyState::new_with_runtime_store(Arc::clone(&runtime_store))
+            .expect("build shared proxy state");
+        state
+            .reconcile_runtime_upstream_identities(
+                std::slice::from_ref(target_a.runtime_identity()),
+                unix_now_ms(),
+            )
+            .await
+            .expect("publish generation A identity");
+
+        let slow_refresh = {
+            let client = Client::new();
+            let configured_provider = Arc::clone(&configured_provider);
+            let target = target_a.clone();
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let token = target.credential.preferred_usage_token();
+                refresh_provider_target(RefreshProviderTargetParams {
+                    client: &client,
+                    provider: configured_provider.as_ref(),
+                    target: &target,
+                    token: token.as_ref(),
+                    state: &state,
+                    interval_secs: 60,
+                    force: false,
+                })
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), first_started)
+            .await
+            .expect("generation A configured refresh should reach the server")
+            .expect("generation A configured refresh signal");
+
+        state
+            .reconcile_runtime_upstream_identities(
+                std::slice::from_ref(target_b.runtime_identity()),
+                unix_now_ms().saturating_add(1),
+            )
+            .await
+            .expect("publish generation B identity");
+        let balance_before = state.get_provider_balance_view("codex").await;
+        let quota_before = state.quota_registry_checkpoint().await;
+        assert!(
+            existing_usage_provider_target_suppression_decision(
+                &state,
+                provider_id,
+                &target_b,
+                unix_now_ms(),
+            )
+            .await
+            .is_none()
+        );
+
+        release_first.add_permits(1);
+        let older = tokio::time::timeout(Duration::from_secs(30), slow_refresh)
+            .await
+            .expect("generation A configured refresh should finish")
+            .expect("generation A configured refresh task");
+        assert_eq!(older, UsageProviderRefreshOutcome::Ignored);
+        assert_eq!(
+            state.get_provider_balance_view("codex").await,
+            balance_before
+        );
+        assert_eq!(state.quota_registry_checkpoint().await, quota_before);
+        for target in [&target_a, &target_b] {
+            assert!(
+                usage_provider_target_suppression_active(provider_id, target, Instant::now())
+                    .is_none()
+            );
+        }
+        assert!(
+            existing_usage_provider_target_suppression_decision(
+                &state,
+                provider_id,
+                &target_b,
+                unix_now_ms(),
+            )
+            .await
+            .is_none()
+        );
+
+        let token_b = target_b.credential.preferred_usage_token();
+        let refreshed_b = refresh_provider_target(RefreshProviderTargetParams {
+            client: &Client::new(),
+            provider: configured_provider.as_ref(),
+            target: &target_b,
+            token: token_b.as_ref(),
+            state: &state,
+            interval_secs: 60,
+            force: false,
+        })
+        .await;
+        assert_eq!(refreshed_b, UsageProviderRefreshOutcome::Refreshed);
+        let snapshot = state
+            .get_provider_balance_view("codex")
+            .await
+            .into_iter()
+            .find(|snapshot| {
+                provider_balance_snapshot_matches_target(snapshot, provider_id, &target_b)
+            })
+            .expect("generation B configured balance snapshot");
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("10"));
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert!(
+            state.quota_registry_checkpoint().await.generation > quota_before.generation,
+            "generation B should publish a quota observation"
+        );
+        assert!(
+            usage_provider_target_suppression_active(provider_id, &target_b, Instant::now())
+                .is_none()
+        );
+
+        clear_auto_probe_kind_state(provider_id);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn rotated_credential_scope_ignores_inflight_auto_completion() {
+        let provider_id = "auto-inflight-rotation";
+        clear_auto_probe_kind_state(provider_id);
+        let (addr, first_started, release_first, handle) = spawn_ordered_balance_server().await;
+        let base_url = format!("http://{addr}/v1");
+        let provider_endpoint = ProviderEndpointKey::new("codex", provider_id, "default");
+        let runtime_store = Arc::new(
+            crate::runtime_store::RuntimeStore::open_in_memory()
+                .expect("open shared runtime store"),
+        );
+        let credential_runtime = crate::credentials::CredentialRuntime::from_runtime_store(
+            crate::credentials::CredentialSourceCapabilities::server(),
+            runtime_store.as_ref(),
+        )
+        .expect("build shared credential runtime");
+        let auth_a = UpstreamAuth {
+            auth_token: Some("generation-a-token".to_string().into()),
+            ..UpstreamAuth::default()
+        };
+        let auth_b = UpstreamAuth {
+            auth_token: Some("generation-b-token".to_string().into()),
+            ..UpstreamAuth::default()
+        };
+        let target_a = usage_provider_target_from_credential_runtime(
+            &credential_runtime,
+            &provider_endpoint,
+            0,
+            &base_url,
+            &auth_a,
+        );
+        let target_b = usage_provider_target_from_credential_runtime(
+            &credential_runtime,
+            &provider_endpoint,
+            0,
+            &base_url,
+            &auth_b,
+        );
+        let state = ProxyState::new_with_runtime_store(Arc::clone(&runtime_store))
+            .expect("build shared proxy state");
+        state
+            .reconcile_runtime_upstream_identities(
+                std::slice::from_ref(target_a.runtime_identity()),
+                unix_now_ms(),
+            )
+            .await
+            .expect("publish generation A identity");
+
+        let slow_probe = {
+            let client = Client::new();
+            let target = target_a.clone();
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                auto_probe_provider_target(&client, &target, &state, "codex", false).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), first_started)
+            .await
+            .expect("generation A auto probe should reach the server")
+            .expect("generation A auto probe signal");
+
+        state
+            .reconcile_runtime_upstream_identities(
+                std::slice::from_ref(target_b.runtime_identity()),
+                unix_now_ms().saturating_add(1),
+            )
+            .await
+            .expect("publish generation B identity");
+        let balance_before = state.get_provider_balance_view("codex").await;
+        let quota_before = state.quota_registry_checkpoint().await;
+        let hint_before = remembered_auto_probe_kind(provider_id);
+        assert_eq!(hint_before, None);
+        assert!(
+            existing_usage_provider_target_suppression_decision(
+                &state,
+                provider_id,
+                &target_b,
+                unix_now_ms(),
+            )
+            .await
+            .is_none()
+        );
+
+        release_first.add_permits(1);
+        let older = tokio::time::timeout(Duration::from_secs(30), slow_probe)
+            .await
+            .expect("generation A auto probe should finish")
+            .expect("generation A auto probe task");
+        assert_eq!(older, UsageProviderRefreshOutcome::Ignored);
+        assert_eq!(
+            state.get_provider_balance_view("codex").await,
+            balance_before
+        );
+        assert_eq!(state.quota_registry_checkpoint().await, quota_before);
+        assert_eq!(remembered_auto_probe_kind(provider_id), hint_before);
+        for target in [&target_a, &target_b] {
+            assert!(
+                usage_provider_target_suppression_active(provider_id, target, Instant::now())
+                    .is_none()
+            );
+        }
+        assert!(
+            existing_usage_provider_target_suppression_decision(
+                &state,
+                provider_id,
+                &target_b,
+                unix_now_ms(),
+            )
+            .await
+            .is_none()
+        );
+
+        let refreshed_b =
+            auto_probe_provider_target(&Client::new(), &target_b, &state, "codex", false).await;
+        assert_eq!(refreshed_b, UsageProviderRefreshOutcome::Refreshed);
+        let snapshot = state
+            .get_provider_balance_view("codex")
+            .await
+            .into_iter()
+            .find(|snapshot| {
+                provider_balance_snapshot_matches_target(snapshot, provider_id, &target_b)
+            })
+            .expect("generation B auto balance snapshot");
+        assert_eq!(snapshot.source, ProviderKind::Sub2ApiUsage.source_name());
+        assert_eq!(snapshot.total_balance_usd.as_deref(), Some("10"));
+        assert_eq!(snapshot.exhausted, Some(false));
+        assert!(
+            state.quota_registry_checkpoint().await.generation > quota_before.generation,
+            "generation B should publish a quota observation"
+        );
+        assert_eq!(
+            remembered_auto_probe_kind(provider_id),
+            Some(ProviderKind::Sub2ApiUsage)
+        );
+        assert!(
+            usage_provider_target_suppression_active(provider_id, &target_b, Instant::now())
+                .is_none()
+        );
+
+        clear_auto_probe_kind_state(provider_id);
         handle.abort();
     }
 

@@ -9,15 +9,16 @@ use ratatui::widgets::{
 use crate::tui::ProviderOption;
 use crate::tui::i18n;
 use crate::tui::model::{
-    Palette, Snapshot, balance_snapshot_status_style, basename, duration_short, format_age,
-    format_observed_client_identity, format_tok_per_second, now_ms, session_control_posture_lang,
+    Palette, Snapshot, balance_snapshot_status_style, basename, dashboard_request_filtered_indices,
+    duration_short, format_age, format_observed_client_identity, format_tok_per_second, now_ms,
+    request_cache_hit_rate_label, session_control_posture_lang,
     session_observation_scope_label_lang, session_observed_provider_balance_brief_lang,
     session_observed_provider_balance_snapshot, session_transcript_host_status_lang, short_sid,
     shorten, shorten_middle, status_style, tokens_short, usage_line_lang,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
-use crate::tui::view::widgets::kv_line;
+use crate::tui::view::widgets::{kv_line, master_detail_fits, max_wrapped_vertical_scroll};
 
 pub(super) fn render_dashboard(
     f: &mut Frame<'_>,
@@ -27,9 +28,20 @@ pub(super) fn render_dashboard(
     providers: &[ProviderOption],
     area: Rect,
 ) {
+    let (direction, constraints) = if master_detail_fits(area, 40, 47, 70) {
+        (
+            Direction::Horizontal,
+            [Constraint::Percentage(40), Constraint::Percentage(60)],
+        )
+    } else {
+        (
+            Direction::Vertical,
+            [Constraint::Percentage(32), Constraint::Percentage(68)],
+        )
+    };
     let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .direction(direction)
+        .constraints(constraints)
         .split(area);
 
     render_sessions_panel(f, p, ui, snapshot, columns[0]);
@@ -45,8 +57,16 @@ fn render_sessions_panel(
 ) {
     let lang = ui.language;
     let l = |text| i18n::label(lang, text);
+    let manual_count = snapshot
+        .rows
+        .iter()
+        .filter(|row| row.binding.has_manual_values())
+        .count();
     let title = Span::styled(
-        l("Sessions"),
+        match lang {
+            crate::tui::Language::Zh => format!("{}（手动 {}）", l("Sessions"), manual_count),
+            crate::tui::Language::En => format!("{} (manual {})", l("Sessions"), manual_count),
+        },
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     );
     let focused = ui.focus == Focus::Sessions && ui.overlay == Overlay::None;
@@ -57,6 +77,8 @@ fn render_sessions_panel(
         .style(Style::default().bg(p.panel));
 
     let now = now_ms();
+    let compact = area.width < 70;
+    let tight = area.width < 60;
 
     let header = Row::new(vec![
         Cell::from(Span::styled(l("Session"), Style::default().fg(p.muted))),
@@ -75,16 +97,37 @@ fn render_sessions_panel(
         .iter()
         .map(|r| {
             let sid = r
-                .session_id
-                .as_deref()
-                .map(|s| short_sid(s, 18))
+                .display_session_id()
+                .map(|s| {
+                    short_sid(
+                        s,
+                        if tight {
+                            11
+                        } else if compact {
+                            14
+                        } else {
+                            18
+                        },
+                    )
+                })
                 .unwrap_or_else(|| l("unknown").to_string());
 
             let cwd = r
                 .cwd
                 .as_deref()
                 .map(basename)
-                .map(|s| shorten(s, 18))
+                .map(|s| {
+                    shorten(
+                        s,
+                        if tight {
+                            6
+                        } else if compact {
+                            10
+                        } else {
+                            18
+                        },
+                    )
+                })
                 .unwrap_or_else(|| "-".to_string());
 
             let active = if r.active_count > 0 {
@@ -122,6 +165,12 @@ fn render_sessions_panel(
                     Style::default().fg(p.good).add_modifier(Modifier::BOLD),
                 ));
             }
+            if r.binding.has_manual_values() {
+                badges.push(Span::styled(
+                    "M",
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ));
+            }
             let mut session_spans = vec![Span::styled(sid, Style::default().fg(p.text))];
             for b in badges {
                 session_spans.push(Span::raw(" "));
@@ -143,9 +192,28 @@ fn render_sessions_panel(
         })
         .collect::<Vec<_>>();
 
-    let table = Table::new(
-        rows,
-        [
+    let widths = if tight {
+        vec![
+            Constraint::Length(11),
+            Constraint::Min(6),
+            Constraint::Length(2),
+            Constraint::Length(4),
+            Constraint::Length(6),
+            Constraint::Length(4),
+            Constraint::Length(5),
+        ]
+    } else if compact {
+        vec![
+            Constraint::Length(14),
+            Constraint::Min(10),
+            Constraint::Length(2),
+            Constraint::Length(4),
+            Constraint::Length(6),
+            Constraint::Length(5),
+            Constraint::Length(5),
+        ]
+    } else {
+        vec![
             Constraint::Length(18),
             Constraint::Min(10),
             Constraint::Length(3),
@@ -153,12 +221,13 @@ fn render_sessions_panel(
             Constraint::Length(6),
             Constraint::Length(6),
             Constraint::Length(7),
-        ],
-    )
-    .header(header)
-    .block(block)
-    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
-    .highlight_spacing(HighlightSpacing::Always);
+        ]
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+        .highlight_spacing(HighlightSpacing::Always);
 
     f.render_stateful_widget(table, area, &mut ui.sessions_table);
 
@@ -179,9 +248,10 @@ fn render_details_and_requests(
     providers: &[ProviderOption],
     area: Rect,
 ) {
+    let details_height = area.height.saturating_sub(5).min(20);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(15), Constraint::Min(0)])
+        .constraints([Constraint::Length(details_height), Constraint::Min(5)])
         .split(area);
 
     render_session_details(f, p, ui, snapshot, chunks[0]);
@@ -191,7 +261,7 @@ fn render_details_and_requests(
 fn render_session_details(
     f: &mut Frame<'_>,
     p: Palette,
-    ui: &UiState,
+    ui: &mut UiState,
     snapshot: &Snapshot,
     area: Rect,
 ) {
@@ -200,8 +270,7 @@ fn render_session_details(
     let selected = snapshot.rows.get(ui.selected_session_idx);
     let sid = selected
         .map(|r| {
-            r.session_id
-                .as_deref()
+            r.display_session_id()
                 .unwrap_or_else(|| l("unknown"))
                 .to_string()
         })
@@ -228,6 +297,17 @@ fn render_session_details(
     let binding = selected
         .and_then(|r| r.binding_profile_name.as_deref())
         .unwrap_or("-");
+    let manual_binding = selected
+        .map(|row| {
+            format!(
+                "model={} effort={} tier={}",
+                row.binding.model.as_deref().unwrap_or("-"),
+                row.binding.reasoning_effort.as_deref().unwrap_or("-"),
+                row.binding.service_tier.as_deref().unwrap_or("-")
+            )
+        })
+        .unwrap_or_else(|| "model=- effort=- tier=-".to_string());
+    let has_manual_binding = selected.is_some_and(|row| row.binding.has_manual_values());
     let model = selected
         .and_then(|r| r.last_model.as_deref())
         .unwrap_or("-");
@@ -325,6 +405,16 @@ fn render_session_details(
         ),
         kv_line(
             p,
+            "manual",
+            manual_binding,
+            Style::default().fg(if has_manual_binding {
+                p.accent
+            } else {
+                p.muted
+            }),
+        ),
+        kv_line(
+            p,
             l("control"),
             posture
                 .as_ref()
@@ -395,11 +485,22 @@ fn render_session_details(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
+    let inner = block.inner(area);
+    let max_scroll = max_wrapped_vertical_scroll(&lines, inner.width, inner.height);
+    ui.dashboard_details_scroll = ui.dashboard_details_scroll.min(max_scroll);
     let content = Paragraph::new(Text::from(lines))
         .block(block)
         .style(Style::default().fg(p.text))
+        .scroll((ui.dashboard_details_scroll, 0))
         .wrap(Wrap { trim: true });
     f.render_widget(content, area);
+    if max_scroll > 0 {
+        let mut scrollbar = ScrollbarState::new(usize::from(max_scroll) + 1)
+            .position(usize::from(ui.dashboard_details_scroll));
+        let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(p.border));
+        f.render_stateful_widget(widget, area, &mut scrollbar);
+    }
 }
 
 fn render_requests_panel(
@@ -418,7 +519,7 @@ fn render_requests_panel(
             .rows
             .get(ui.selected_session_idx)
             .map(|r| {
-                let sid = r.session_id.as_deref().unwrap_or_else(|| l("unknown"));
+                let sid = r.display_session_id().unwrap_or_else(|| l("unknown"));
                 format!("{} [{}]", l("Requests"), sid)
             })
             .unwrap_or_else(|| l("Requests").to_string()),
@@ -430,49 +531,40 @@ fn render_requests_panel(
         .border_style(Style::default().fg(if focused { p.focus } else { p.border }))
         .style(Style::default().bg(p.panel));
 
-    let selected_row = snapshot.rows.get(ui.selected_session_idx);
-    let filtered = snapshot
-        .recent
-        .iter()
-        .filter(|r| {
-            let Some(selected_row) = selected_row else {
-                return true;
-            };
-            match (&selected_row.session_id, &r.session_key) {
-                (Some(sid), Some(rid)) => sid == rid,
-                (Some(_), None) => false,
-                (None, Some(_)) => false,
-                (None, None) => true,
-            }
-        })
-        .take(60)
-        .collect::<Vec<_>>();
+    let filtered = dashboard_request_filtered_indices(snapshot, ui.selected_session_idx);
 
-    let show_cache_hit = area.width >= 74;
-    let mut header_cells = vec![
-        Cell::from(Span::styled(l("Age"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("St"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("TTFB"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("Total"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("In"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("Out"), Style::default().fg(p.muted))),
-    ];
-    if show_cache_hit {
-        header_cells.push(Cell::from(Span::styled(
-            l("Hit%"),
-            Style::default().fg(p.muted),
-        )));
-    }
-    header_cells.extend([
-        Cell::from(Span::styled(l("CRead"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("CNew"), Style::default().fg(p.muted))),
-        Cell::from(Span::styled(l("Tok"), Style::default().fg(p.muted))),
-    ]);
+    let compact = area.width < 58;
+    let narrow = area.width < 90;
+    let header_cells = if compact {
+        vec![
+            Cell::from(Span::styled(l("Age"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("St"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("Total"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("Hit%"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("CRead"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("CNew"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("Tok"), Style::default().fg(p.muted))),
+        ]
+    } else {
+        vec![
+            Cell::from(Span::styled(l("Age"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("St"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("TTFB"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("Total"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("In"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("Out"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("Hit%"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("CRead"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("CNew"), Style::default().fg(p.muted))),
+            Cell::from(Span::styled(l("Tok"), Style::default().fg(p.muted))),
+        ]
+    };
     let header = Row::new(header_cells);
 
     let now = now_ms();
     let rows = filtered
         .iter()
+        .filter_map(|request_idx| snapshot.recent.get(*request_idx))
         .map(|r| {
             let age = format_age(now, Some(r.ended_at_ms));
             let status = Span::styled(
@@ -492,53 +584,88 @@ fn render_requests_panel(
             let output = usage
                 .map(|u| tokens_short(u.output_tokens))
                 .unwrap_or_else(|| "-".to_string());
-            let cache_read = "-";
-            let cache_new = "-";
-            let cache_hit = "-";
+            let cache_read = usage
+                .map(|u| tokens_short(u.cache_read_tokens_total()))
+                .unwrap_or_else(|| "-".to_string());
+            let cache_new = usage
+                .map(|u| tokens_short(u.cache_creation_tokens_total()))
+                .unwrap_or_else(|| "-".to_string());
+            let cache_hit = request_cache_hit_rate_label(r);
             let total_tokens = usage
                 .map(|u| tokens_short(u.total_tokens))
                 .unwrap_or_else(|| "-".to_string());
 
-            let mut cells = vec![
-                Cell::from(Span::styled(age, Style::default().fg(p.muted))),
-                Cell::from(Line::from(vec![status])),
-                Cell::from(Span::styled(ttfb, Style::default().fg(p.muted))),
-                Cell::from(Span::styled(total_dur, Style::default().fg(p.muted))),
-                Cell::from(input),
-                Cell::from(output),
-            ];
-            if show_cache_hit {
-                cells.push(Cell::from(Span::styled(
+            let has_cache_hit = cache_hit != "-";
+            let cache_hit = Cell::from(Span::styled(
+                cache_hit,
+                Style::default().fg(if has_cache_hit { p.accent } else { p.muted }),
+            ));
+            let cells = if compact {
+                vec![
+                    Cell::from(Span::styled(age, Style::default().fg(p.muted))),
+                    Cell::from(Line::from(vec![status])),
+                    Cell::from(Span::styled(total_dur, Style::default().fg(p.muted))),
                     cache_hit,
-                    Style::default().fg(p.muted),
-                )));
-            }
-            cells.extend([
-                Cell::from(cache_read),
-                Cell::from(cache_new),
-                Cell::from(Span::styled(total_tokens, Style::default().fg(p.accent))),
-            ]);
+                    Cell::from(cache_read),
+                    Cell::from(cache_new),
+                    Cell::from(Span::styled(total_tokens, Style::default().fg(p.accent))),
+                ]
+            } else {
+                vec![
+                    Cell::from(Span::styled(age, Style::default().fg(p.muted))),
+                    Cell::from(Line::from(vec![status])),
+                    Cell::from(Span::styled(ttfb, Style::default().fg(p.muted))),
+                    Cell::from(Span::styled(total_dur, Style::default().fg(p.muted))),
+                    Cell::from(input),
+                    Cell::from(output),
+                    cache_hit,
+                    Cell::from(cache_read),
+                    Cell::from(cache_new),
+                    Cell::from(Span::styled(total_tokens, Style::default().fg(p.accent))),
+                ]
+            };
 
             Row::new(cells).style(Style::default().bg(p.panel).fg(p.text))
         })
         .collect::<Vec<_>>();
 
-    let mut widths = vec![
-        Constraint::Length(6),
-        Constraint::Length(4),
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Length(6),
-        Constraint::Length(6),
-    ];
-    if show_cache_hit {
-        widths.push(Constraint::Length(6));
-    }
-    widths.extend([
-        Constraint::Length(7),
-        Constraint::Length(6),
-        Constraint::Length(6),
-    ]);
+    let widths = if compact {
+        vec![
+            Constraint::Length(6),
+            Constraint::Length(4),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Min(5),
+        ]
+    } else if narrow {
+        vec![
+            Constraint::Length(5),
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(4),
+            Constraint::Length(4),
+            Constraint::Length(7),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Min(4),
+        ]
+    } else {
+        vec![
+            Constraint::Length(6),
+            Constraint::Length(4),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Min(5),
+        ]
+    };
 
     let table = Table::new(rows, widths)
         .header(header)

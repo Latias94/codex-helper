@@ -1,15 +1,22 @@
-use crate::logging::{AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog};
+use axum::http::HeaderMap;
+
+use crate::logging::{
+    AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, make_body_preview,
+};
+
+use super::classify::classify_observed_upstream_response;
+use super::headers::header_map_to_entries;
 
 #[derive(Clone)]
 pub(super) struct HttpDebugBase {
+    pub(super) route_attempt_index: u32,
     pub(super) debug_max_body_bytes: usize,
     pub(super) warn_max_body_bytes: usize,
-    #[allow(dead_code)]
     pub(super) request_body_len: usize,
-    #[allow(dead_code)]
     pub(super) upstream_request_body_len: usize,
     pub(super) client_uri: String,
     pub(super) upstream_origin: Option<String>,
+    pub(super) upstream_uri: Option<String>,
     pub(super) client_headers: Vec<HeaderEntry>,
     pub(super) upstream_request_headers: Vec<HeaderEntry>,
     pub(super) auth_resolution: Option<AuthResolutionLog>,
@@ -17,6 +24,147 @@ pub(super) struct HttpDebugBase {
     pub(super) upstream_request_body_debug: Option<BodyPreview>,
     pub(super) client_body_warn: Option<BodyPreview>,
     pub(super) upstream_request_body_warn: Option<BodyPreview>,
+}
+
+pub(super) struct HttpDebugResponseParams<'a> {
+    pub(super) status_code: u16,
+    pub(super) response_headers: &'a HeaderMap,
+    pub(super) response_body: &'a [u8],
+    pub(super) response_preview_body: Option<&'a [u8]>,
+    pub(super) upstream_headers_ms: u64,
+    pub(super) upstream_first_chunk_ms: Option<u64>,
+    pub(super) upstream_body_read_ms: Option<u64>,
+    pub(super) for_warn: bool,
+}
+
+pub(super) struct HttpDebugTransportErrorParams<'a> {
+    pub(super) response_headers: Option<&'a HeaderMap>,
+    pub(super) upstream_headers_ms: Option<u64>,
+    pub(super) upstream_body_read_ms: Option<u64>,
+    pub(super) error_class: &'a str,
+    pub(super) error_hint: &'a str,
+    pub(super) upstream_error: String,
+    pub(super) for_warn: bool,
+}
+
+impl HttpDebugBase {
+    fn max_body_bytes(&self, for_warn: bool) -> usize {
+        if for_warn {
+            self.warn_max_body_bytes
+        } else {
+            self.debug_max_body_bytes
+        }
+    }
+
+    fn request_bodies(&self, for_warn: bool) -> (Option<BodyPreview>, Option<BodyPreview>) {
+        if for_warn {
+            (
+                self.client_body_warn.clone(),
+                self.upstream_request_body_warn.clone(),
+            )
+        } else {
+            (
+                self.client_body_debug.clone(),
+                self.upstream_request_body_debug.clone(),
+            )
+        }
+    }
+
+    pub(super) fn response_log(&self, params: HttpDebugResponseParams<'_>) -> Option<HttpDebugLog> {
+        let HttpDebugResponseParams {
+            status_code,
+            response_headers,
+            response_body,
+            response_preview_body,
+            upstream_headers_ms,
+            upstream_first_chunk_ms,
+            upstream_body_read_ms,
+            for_warn,
+        } = params;
+        let max = self.max_body_bytes(for_warn);
+        if max == 0 {
+            return None;
+        }
+        let response_content_type = response_headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok());
+        let (client_body, upstream_request_body) = self.request_bodies(for_warn);
+        let classified =
+            classify_observed_upstream_response(status_code, response_headers, response_body);
+        let response_preview_body = response_preview_body.unwrap_or(response_body);
+
+        Some(HttpDebugLog {
+            route_attempt_index: Some(self.route_attempt_index),
+            request_body_len: Some(self.request_body_len),
+            upstream_request_body_len: Some(self.upstream_request_body_len),
+            upstream_headers_ms: Some(upstream_headers_ms),
+            upstream_first_chunk_ms,
+            upstream_body_read_ms,
+            upstream_error_class: classified.class,
+            upstream_error_hint: classified.hint,
+            upstream_cf_ray: classified.cf_ray,
+            client_uri: self.client_uri.clone(),
+            upstream_origin: self.upstream_origin.clone(),
+            upstream_uri: self.upstream_uri.clone(),
+            client_headers: self.client_headers.clone(),
+            upstream_request_headers: self.upstream_request_headers.clone(),
+            auth_resolution: self.auth_resolution.clone(),
+            client_body,
+            upstream_request_body,
+            upstream_response_headers: Some(header_map_to_entries(response_headers)),
+            upstream_response_body: Some(make_body_preview(
+                response_preview_body,
+                response_content_type,
+                max,
+            )),
+            upstream_error: None,
+        })
+    }
+
+    pub(super) fn transport_error_log(
+        &self,
+        params: HttpDebugTransportErrorParams<'_>,
+    ) -> Option<HttpDebugLog> {
+        let HttpDebugTransportErrorParams {
+            response_headers,
+            upstream_headers_ms,
+            upstream_body_read_ms,
+            error_class,
+            error_hint,
+            upstream_error,
+            for_warn,
+        } = params;
+        if self.max_body_bytes(for_warn) == 0 {
+            return None;
+        }
+        let (client_body, upstream_request_body) = self.request_bodies(for_warn);
+
+        Some(HttpDebugLog {
+            route_attempt_index: Some(self.route_attempt_index),
+            request_body_len: Some(self.request_body_len),
+            upstream_request_body_len: Some(self.upstream_request_body_len),
+            upstream_headers_ms,
+            upstream_first_chunk_ms: None,
+            upstream_body_read_ms,
+            upstream_error_class: Some(error_class.to_string()),
+            upstream_error_hint: Some(error_hint.to_string()),
+            upstream_cf_ray: response_headers
+                .and_then(|headers| headers.get("cf-ray"))
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned),
+            client_uri: self.client_uri.clone(),
+            upstream_origin: self.upstream_origin.clone(),
+            upstream_uri: self.upstream_uri.clone(),
+            client_headers: self.client_headers.clone(),
+            upstream_request_headers: self.upstream_request_headers.clone(),
+            auth_resolution: self.auth_resolution.clone(),
+            client_body,
+            upstream_request_body,
+            upstream_response_headers: response_headers.map(header_map_to_entries),
+            upstream_response_body: None,
+            upstream_error: Some(upstream_error),
+        })
+    }
 }
 
 pub(super) fn format_reqwest_error_for_retry_chain(error: &reqwest::Error) -> String {
@@ -61,6 +209,7 @@ mod tests {
 
     fn make_http_debug_log(value: &str) -> HttpDebugLog {
         HttpDebugLog {
+            route_attempt_index: Some(0),
             request_body_len: Some(12),
             upstream_request_body_len: Some(12),
             upstream_headers_ms: Some(4),
@@ -71,6 +220,7 @@ mod tests {
             upstream_cf_ray: None,
             client_uri: "/v1/responses".to_string(),
             upstream_origin: Some("https://example.com".to_string()),
+            upstream_uri: Some("/v1/responses".to_string()),
             client_headers: vec![HeaderEntry {
                 name: "content-type".to_string(),
                 value: "application/json".to_string(),

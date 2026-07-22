@@ -238,13 +238,29 @@ impl<'de> Deserialize<'de> for CodexClientPatchConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct CodexClientPatchOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<CodexClientPreset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_websocket: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CodexCompactionStrategy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translate_models: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted_image_generation: Option<CodexHostedImageGenerationMode>,
+}
+
+impl CodexClientPatchOverrides {
+    pub const fn is_empty(&self) -> bool {
+        self.preset.is_none()
+            && self.responses_websocket.is_none()
+            && self.compaction.is_none()
+            && self.translate_models.is_none()
+            && self.hosted_image_generation.is_none()
+    }
 }
 
 impl CodexClientPatchConfig {
@@ -253,6 +269,25 @@ impl CodexClientPatchConfig {
             self.preset = preset;
             self.responses_websocket = false;
             self.compaction = CodexCompactionStrategy::Auto;
+        }
+        if let Some(responses_websocket) = overrides.responses_websocket {
+            self.responses_websocket = responses_websocket;
+        }
+        if let Some(compaction) = overrides.compaction {
+            self.compaction = compaction;
+        }
+        if let Some(translate_models) = overrides.translate_models {
+            self.translate_models = translate_models;
+        }
+        if let Some(hosted_image_generation) = overrides.hosted_image_generation {
+            self.hosted_image_generation = hosted_image_generation;
+        }
+        self
+    }
+
+    pub fn with_field_overrides(mut self, overrides: CodexClientPatchOverrides) -> Self {
+        if let Some(preset) = overrides.preset {
+            self.preset = preset;
         }
         if let Some(responses_websocket) = overrides.responses_websocket {
             self.responses_websocket = responses_websocket;
@@ -329,15 +364,12 @@ impl CodexClientPatchConfig {
             && self.hosted_image_generation != CodexHostedImageGenerationMode::Disabled;
         let auth_facade = match self.preset {
             CodexClientPreset::ChatGptBridge => CodexAuthFacadeStrategy::ChatGpt,
-            CodexClientPreset::ImagegenBridge | CodexClientPreset::OfficialImagegen
-                if self.hosted_image_generation != CodexHostedImageGenerationMode::Disabled =>
-            {
+            CodexClientPreset::ImagegenBridge | CodexClientPreset::OfficialImagegen => {
                 CodexAuthFacadeStrategy::EmptyChatGpt
             }
-            CodexClientPreset::Default
-            | CodexClientPreset::ImagegenBridge
-            | CodexClientPreset::OfficialRelay
-            | CodexClientPreset::OfficialImagegen => CodexAuthFacadeStrategy::Preserve,
+            CodexClientPreset::Default | CodexClientPreset::OfficialRelay => {
+                CodexAuthFacadeStrategy::Preserve
+            }
         };
 
         Ok(CompiledCodexClientPatch {
@@ -510,7 +542,33 @@ mod tests {
     }
 
     #[test]
-    fn official_imagegen_disabled_keeps_official_identity_without_image_marker() {
+    fn field_overrides_do_not_reset_unspecified_global_fields() {
+        let global = CodexClientPatchConfig {
+            preset: CodexClientPreset::OfficialImagegen,
+            responses_websocket: true,
+            compaction: CodexCompactionStrategy::RemoteV2,
+            translate_models: true,
+            hosted_image_generation: CodexHostedImageGenerationMode::Disabled,
+        };
+
+        let resolved = global.with_field_overrides(CodexClientPatchOverrides {
+            preset: Some(CodexClientPreset::OfficialRelay),
+            compaction: Some(CodexCompactionStrategy::RemoteV1),
+            ..CodexClientPatchOverrides::default()
+        });
+
+        assert_eq!(resolved.preset, CodexClientPreset::OfficialRelay);
+        assert!(resolved.responses_websocket);
+        assert_eq!(resolved.compaction, CodexCompactionStrategy::RemoteV1);
+        assert!(resolved.translate_models);
+        assert_eq!(
+            resolved.hosted_image_generation,
+            CodexHostedImageGenerationMode::Disabled
+        );
+    }
+
+    #[test]
+    fn official_imagegen_disabled_keeps_preset_auth_facade_without_image_marker() {
         let compiled = CodexClientPatchConfig {
             preset: CodexClientPreset::OfficialImagegen,
             hosted_image_generation: CodexHostedImageGenerationMode::Disabled,
@@ -524,8 +582,29 @@ mod tests {
             CodexProviderIdentity::OfficialOpenAi
         );
         assert!(!compiled.actor_marker);
-        assert_eq!(compiled.auth_facade, CodexAuthFacadeStrategy::Preserve);
+        assert_eq!(compiled.auth_facade, CodexAuthFacadeStrategy::EmptyChatGpt);
         assert_eq!(compiled.image_generation, CodexFeatureBoolPatch::Set(false));
+    }
+
+    #[test]
+    fn explicit_hosted_image_enable_remains_orthogonal_to_client_preset() {
+        for preset in [
+            CodexClientPreset::Default,
+            CodexClientPreset::ChatGptBridge,
+            CodexClientPreset::ImagegenBridge,
+            CodexClientPreset::OfficialRelay,
+            CodexClientPreset::OfficialImagegen,
+        ] {
+            let compiled = CodexClientPatchConfig {
+                preset,
+                hosted_image_generation: CodexHostedImageGenerationMode::Enabled,
+                ..CodexClientPatchConfig::default()
+            }
+            .compile()
+            .expect("hosted-image feature override");
+
+            assert_eq!(compiled.image_generation, CodexFeatureBoolPatch::Set(true));
+        }
     }
 
     #[test]

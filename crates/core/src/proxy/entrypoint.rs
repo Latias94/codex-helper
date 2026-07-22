@@ -10,7 +10,6 @@ use super::provider_execution::{
     execute_provider_chain_with_route_executor, log_retry_options,
 };
 use super::request_context::prepare_proxy_request;
-use super::request_failures::finish_failed_proxy_request;
 use super::retry::retry_info_for_failed_attempts;
 use super::route_unavailability::route_unavailable_response_for_request;
 
@@ -63,9 +62,11 @@ pub(crate) async fn handle_proxy(
     };
     let provider_execution =
         execute_provider_chain_with_route_executor(provider_chain_params).await;
-    let (route_attempts, last_err) = match provider_execution {
+    let (route_attempts, last_err, last_http_debug) = match provider_execution {
         ProviderExecutionOutcome::Return(response) => return Ok(response),
-        ProviderExecutionOutcome::Exhausted(state) => (state.route_attempts, state.last_err),
+        ProviderExecutionOutcome::Exhausted(state) => {
+            (state.route_attempts, state.last_err, state.last_http_debug)
+        }
     };
 
     let dur = start.elapsed().as_millis() as u64;
@@ -77,24 +78,28 @@ pub(crate) async fn handle_proxy(
         )
     });
 
-    let failure = finish_failed_proxy_request(super::request_failures::FailedProxyRequestParams {
-        proxy: &proxy,
-        method: &prepared.method,
-        path: prepared.uri.path(),
-        request_id: prepared.request_id,
-        status,
-        message: msg,
-        duration_ms: dur,
-        started_at_ms,
-        session_id: prepared.session_id.clone(),
-        session_identity_source: prepared.session_identity_source,
-        cwd: prepared.cwd.clone(),
-        effective_effort: prepared.effective_effort.clone(),
-        service_tier: prepared.base_service_tier.clone(),
-        codex_bridge: prepared.request_flavor.codex_bridge_log.clone(),
-        retry,
-        failure_route_attempts: route_attempts.clone(),
-    })
+    let failure = super::request_failures::finish_failed_proxy_request_with_accounting(
+        super::request_failures::FailedProxyRequestParams {
+            proxy: &proxy,
+            method: &prepared.method,
+            path: prepared.uri.path(),
+            request_id: prepared.request_id,
+            status,
+            message: msg,
+            duration_ms: dur,
+            started_at_ms,
+            session_id: prepared.session_id.clone(),
+            session_identity_source: prepared.session_identity_source,
+            cwd: prepared.cwd.clone(),
+            effective_effort: prepared.effective_effort.clone(),
+            service_tier: prepared.base_service_tier.clone(),
+            codex_bridge: prepared.request_flavor.codex_bridge_log.clone(),
+            retry,
+            http_debug: last_http_debug,
+            failure_route_attempts: route_attempts.clone(),
+        },
+        prepared.request_flavor.terminal_accounting,
+    )
     .await;
 
     if let Some(response) = route_unavailable_response_for_request(

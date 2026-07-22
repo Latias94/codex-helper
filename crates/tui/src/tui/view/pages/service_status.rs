@@ -4,19 +4,22 @@ use codex_helper_core::service_status::{
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::prelude::{Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
+use ratatui::widgets::{
+    Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, Wrap,
+};
 
 use crate::tui::Language;
 use crate::tui::i18n;
 use crate::tui::model::{Palette, Snapshot, duration_short, format_age, now_ms, shorten_middle};
 use crate::tui::state::UiState;
-use crate::tui::view::widgets::kv_line;
+use crate::tui::view::widgets::{kv_line, master_detail_fits, max_wrapped_vertical_scroll};
 
 pub(super) fn render_service_status_page(
     f: &mut Frame<'_>,
     p: Palette,
-    ui: &UiState,
+    ui: &mut UiState,
     snapshot: &Snapshot,
     area: Rect,
 ) {
@@ -25,20 +28,20 @@ pub(super) fn render_service_status_page(
     let status = snapshot.service_status.as_ref();
     let operator_status = ui.operator_read_model.as_ref().map(|model| model.status);
     let operator_ready = operator_status == Some(crate::dashboard_core::OperatorReadStatus::Ready);
-    render_status_table(f, p, ui.language, status, operator_ready, table_area);
-    render_details_panel(f, p, ui.language, status, operator_status, details_area);
+    render_status_table(f, p, ui, snapshot, operator_ready, table_area);
+    render_details_panel(f, p, ui, status, operator_status, details_area);
 }
 
 fn service_status_page_areas(area: Rect) -> (Rect, Rect) {
-    let (direction, constraints) = if area.width < 140 {
-        (
-            Direction::Vertical,
-            [Constraint::Percentage(68), Constraint::Percentage(32)],
-        )
-    } else {
+    let (direction, constraints) = if master_detail_fits(area, 66, 77, 41) {
         (
             Direction::Horizontal,
             [Constraint::Percentage(66), Constraint::Percentage(34)],
+        )
+    } else {
+        (
+            Direction::Vertical,
+            [Constraint::Percentage(68), Constraint::Percentage(32)],
         )
     };
     let chunks = Layout::default()
@@ -73,11 +76,13 @@ fn service_status_table_constraints(width: u16) -> [Constraint; 6] {
 fn render_status_table(
     f: &mut Frame<'_>,
     p: Palette,
-    lang: Language,
-    snapshot: Option<&ServiceStatusSnapshot>,
+    ui: &mut UiState,
+    model: &Snapshot,
     operator_ready: bool,
     area: Rect,
 ) {
+    let lang = ui.language;
+    let snapshot = model.service_status.as_ref();
     let l = |text| i18n::label(lang, text);
     let title = match snapshot {
         Some(snapshot) if snapshot.enabled && snapshot.configured => {
@@ -125,7 +130,11 @@ fn render_status_table(
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border))
+        .border_style(Style::default().fg(if ui.service_status_detail_focused {
+            p.border
+        } else {
+            p.accent
+        }))
         .style(Style::default().bg(p.panel));
 
     let header = Row::new([
@@ -155,10 +164,34 @@ fn render_status_table(
             ])]
         });
 
+    let visible_rows = usize::from(area.height.saturating_sub(3)).max(1);
+    ui.sync_service_status_table_viewport(model, visible_rows);
+    let row_count = service_status_row_count(snapshot);
     let table = Table::new(rows, service_status_table_constraints(area.width))
         .header(header)
-        .block(block);
-    f.render_widget(table, area);
+        .block(block)
+        .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(table, area, &mut ui.service_status_table);
+    if row_count > visible_rows {
+        let mut scrollbar =
+            ScrollbarState::new(row_count).position(ui.service_status_table.offset());
+        let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(p.border));
+        f.render_stateful_widget(widget, area, &mut scrollbar);
+    }
+}
+
+fn service_status_row_count(snapshot: Option<&ServiceStatusSnapshot>) -> usize {
+    snapshot
+        .map(|snapshot| {
+            snapshot
+                .probes
+                .iter()
+                .map(|probe| probe.services.len().max(1))
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 fn status_rows(
@@ -316,27 +349,70 @@ fn effective_status_label(
     )
 }
 
+#[derive(Clone, Copy)]
+struct SelectedStatusRow<'a> {
+    probe: &'a ServiceStatusProbeSnapshot,
+    service: Option<&'a ServiceStatusServiceSnapshot>,
+}
+
+fn selected_status_row(
+    snapshot: &ServiceStatusSnapshot,
+    selected_idx: usize,
+) -> Option<SelectedStatusRow<'_>> {
+    let mut row_idx = 0;
+    for probe in &snapshot.probes {
+        if probe.services.is_empty() {
+            if row_idx == selected_idx {
+                return Some(SelectedStatusRow {
+                    probe,
+                    service: None,
+                });
+            }
+            row_idx += 1;
+            continue;
+        }
+        for service in &probe.services {
+            if row_idx == selected_idx {
+                return Some(SelectedStatusRow {
+                    probe,
+                    service: Some(service),
+                });
+            }
+            row_idx += 1;
+        }
+    }
+    None
+}
+
 fn render_details_panel(
     f: &mut Frame<'_>,
     p: Palette,
-    lang: Language,
+    ui: &mut UiState,
     snapshot: Option<&ServiceStatusSnapshot>,
     operator_status: Option<crate::dashboard_core::OperatorReadStatus>,
     area: Rect,
 ) {
+    let lang = ui.language;
     let l = |text| i18n::label(lang, text);
-    let block = Block::default()
-        .title(Span::styled(
-            l("details"),
-            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border))
-        .style(Style::default().bg(p.panel));
+    let selected =
+        snapshot.and_then(|snapshot| selected_status_row(snapshot, ui.selected_service_status_idx));
+    let title = match selected {
+        Some(SelectedStatusRow {
+            probe,
+            service: Some(service),
+        }) => format!("{} / {} / {}", l("details"), probe.id, service.model),
+        Some(SelectedStatusRow {
+            probe,
+            service: None,
+        }) => format!("{} / {}", l("details"), probe.id),
+        None => l("details").to_string(),
+    };
 
     let mut lines = Vec::new();
     match snapshot {
-        Some(snapshot) => push_snapshot_details(&mut lines, p, lang, snapshot, operator_status),
+        Some(snapshot) => {
+            push_snapshot_details(&mut lines, p, lang, snapshot, operator_status, selected)
+        }
         None => {
             lines.push(Line::from(Span::styled(
                 match lang {
@@ -348,11 +424,45 @@ fn render_details_panel(
         }
     }
 
+    let text_width = area.width.saturating_sub(2);
+    let text_height = area.height.saturating_sub(2);
+    let max_scroll = max_wrapped_vertical_scroll(&lines, text_width, text_height);
+    ui.service_status_detail_scroll = ui.service_status_detail_scroll.min(max_scroll);
+    ui.service_status_detail_available = max_scroll > 0;
+    if !ui.service_status_detail_available {
+        ui.service_status_detail_focused = false;
+    }
+    let block = Block::default()
+        .title(Span::styled(
+            shorten_middle(&title, usize::from(area.width.saturating_sub(2))),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if ui.service_status_detail_focused {
+            p.accent
+        } else {
+            p.border
+        }))
+        .style(Style::default().bg(p.panel));
+
     let content = Paragraph::new(Text::from(lines))
         .block(block)
         .style(Style::default().fg(p.text))
+        .scroll((ui.service_status_detail_scroll, 0))
         .wrap(Wrap { trim: false });
     f.render_widget(content, area);
+    if max_scroll > 0 {
+        let mut scrollbar = ScrollbarState::new(usize::from(max_scroll) + 1)
+            .position(usize::from(ui.service_status_detail_scroll));
+        let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight).style(
+            Style::default().fg(if ui.service_status_detail_focused {
+                p.accent
+            } else {
+                p.border
+            }),
+        );
+        f.render_stateful_widget(widget, area, &mut scrollbar);
+    }
 }
 
 fn push_snapshot_details(
@@ -361,6 +471,7 @@ fn push_snapshot_details(
     lang: Language,
     snapshot: &ServiceStatusSnapshot,
     operator_status: Option<crate::dashboard_core::OperatorReadStatus>,
+    selected: Option<SelectedStatusRow<'_>>,
 ) {
     let l = |text| i18n::label(lang, text);
     let now = now_ms();
@@ -450,10 +561,13 @@ fn push_snapshot_details(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        l("probes"),
+        match lang {
+            Language::Zh => "当前选择",
+            Language::En => "Selected row",
+        },
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
-    if snapshot.probes.is_empty() {
+    let Some(SelectedStatusRow { probe, service }) = selected else {
         lines.push(Line::from(Span::styled(
             if snapshot.enabled {
                 match lang {
@@ -469,70 +583,134 @@ fn push_snapshot_details(
             Style::default().fg(p.muted),
         )));
         return;
+    };
+
+    let credential = probe
+        .credential_readiness
+        .map(|readiness| super::routing::credential_readiness_short_label(readiness, lang))
+        .unwrap_or("-");
+    let probe_style = if probe.error.is_some() {
+        Style::default().fg(p.warn)
+    } else if probe.all_ok == Some(false) {
+        Style::default().fg(p.bad)
+    } else {
+        Style::default().fg(p.good)
+    };
+    lines.push(kv_line(
+        p,
+        l("probe"),
+        probe.id.clone(),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    ));
+    lines.push(kv_line(
+        p,
+        l("status"),
+        format!(
+            "services={} all_ok={} credential={} age={}",
+            probe.services.len(),
+            probe
+                .all_ok
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            credential,
+            format_age(
+                now,
+                (probe.fetched_at_ms != 0).then_some(probe.fetched_at_ms)
+            )
+        ),
+        probe_style,
+    ));
+    lines.push(kv_line(
+        p,
+        "url",
+        shorten_middle(&probe.url, 120),
+        Style::default().fg(p.muted),
+    ));
+    if let Some(error) = probe.error.as_deref() {
+        lines.push(kv_line(
+            p,
+            l("error"),
+            shorten_middle(error, 120),
+            Style::default().fg(p.warn),
+        ));
+    }
+    for detail in &probe.credential_details {
+        let kind = detail.kind.map(|kind| kind.as_str()).unwrap_or("upstream");
+        let source = detail.source_kind.as_deref().unwrap_or("unreported");
+        let reference = detail.reference.as_deref().unwrap_or("-");
+        let cause = detail
+            .stale_cause
+            .map(|cause| format!(" cause={}", cause.as_str()))
+            .unwrap_or_default();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {kind}: {} source={source} ref={reference}{cause}",
+                detail.code.as_str()
+            ),
+            Style::default().fg(if detail.code.is_routable() {
+                p.muted
+            } else {
+                p.warn
+            }),
+        )));
     }
 
-    for probe in &snapshot.probes {
-        let credential = probe
-            .credential_readiness
-            .map(|readiness| super::routing::credential_readiness_short_label(readiness, lang))
-            .unwrap_or("-");
-        let status_style = if probe.error.is_some() {
-            Style::default().fg(p.warn)
-        } else if probe.all_ok == Some(false) {
-            Style::default().fg(p.bad)
-        } else {
-            Style::default().fg(p.good)
-        };
-        let probe_label = shorten_middle(&probe.id, 30);
-        lines.push(Line::from(vec![
-            Span::styled(format!("{probe_label}: "), Style::default().fg(p.muted)),
-            Span::styled(
+    if let Some(service) = service {
+        let operator_ready =
+            operator_status == Some(crate::dashboard_core::OperatorReadStatus::Ready);
+        let (status_label, status_style) =
+            effective_status_label(p, lang, snapshot, probe, service, operator_ready);
+        lines.push(Line::from(""));
+        lines.push(kv_line(
+            p,
+            l("model"),
+            service.model.clone(),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ));
+        lines.push(kv_line(p, l("status"), status_label, status_style));
+        lines.push(kv_line(
+            p,
+            l("uptime"),
+            service
+                .uptime_pct
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            Style::default().fg(p.text),
+        ));
+        let latest = service
+            .latest
+            .as_ref()
+            .map(|sample| {
                 format!(
-                    "services={} all_ok={} credential={} age={}",
-                    probe.services.len(),
-                    probe
-                        .all_ok
+                    "ok={} latency={} age={} error={}",
+                    sample
+                        .ok
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "-".to_string()),
-                    credential,
-                    format_age(
-                        now,
-                        (probe.fetched_at_ms != 0).then_some(probe.fetched_at_ms)
-                    )
-                ),
-                status_style,
-            ),
-        ]));
-        if let Some(error) = probe.error.as_deref() {
-            lines.push(Line::from(vec![Span::styled(
-                format!("  {}: {}", l("error"), shorten_middle(error, 82)),
-                Style::default().fg(p.warn),
-            )]));
-        }
-        for detail in &probe.credential_details {
-            let kind = detail.kind.map(|kind| kind.as_str()).unwrap_or("upstream");
-            let source = detail.source_kind.as_deref().unwrap_or("unreported");
-            let reference = detail.reference.as_deref().unwrap_or("-");
-            let cause = detail
-                .stale_cause
-                .map(|cause| format!(" cause={}", cause.as_str()))
-                .unwrap_or_default();
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {kind}: {} source={source} ref={reference}{cause}",
-                    detail.code.as_str()
-                ),
-                Style::default().fg(if detail.code.is_routable() {
-                    p.muted
-                } else {
-                    p.warn
-                }),
-            )));
-        }
-        lines.push(Line::from(vec![Span::styled(
-            format!("  {}", shorten_middle(&probe.url, 92)),
-            Style::default().fg(p.muted),
-        )]));
+                    sample
+                        .latency_ms
+                        .map(|value| format!("{value}ms"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    format_age(now, sample.ts_ms),
+                    sample.error.as_deref().unwrap_or("-")
+                )
+            })
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(kv_line(
+            p,
+            match lang {
+                Language::Zh => "最近探测",
+                Language::En => "latest probe",
+            },
+            latest,
+            Style::default().fg(p.text),
+        ));
+        let mut history = history_spans(p, &service.history);
+        history.spans.insert(
+            0,
+            Span::styled(format!("{}: ", l("history")), Style::default().fg(p.muted)),
+        );
+        lines.push(history);
     }
 }
 
@@ -650,6 +828,22 @@ mod tests {
         output
     }
 
+    fn render_service_status(
+        width: u16,
+        height: u16,
+        ui: &mut UiState,
+        snapshot: &Snapshot,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let frame = terminal
+            .draw(|frame| {
+                render_service_status_page(frame, Palette::default(), ui, snapshot, frame.area());
+            })
+            .expect("render service status page");
+        buffer_text(frame.buffer)
+    }
+
     fn render_service_status_text(width: u16, height: u16) -> String {
         let (service_status, _, _) =
             status_fixture(crate::credentials::CredentialReadinessCode::Ready);
@@ -657,18 +851,11 @@ mod tests {
             service_status: Some(service_status),
             ..Snapshot::default()
         };
-        let ui = UiState {
+        let mut ui = UiState {
             language: Language::En,
             ..UiState::default()
         };
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let frame = terminal
-            .draw(|frame| {
-                render_service_status_page(frame, Palette::default(), &ui, &snapshot, frame.area());
-            })
-            .expect("render service status page");
-        buffer_text(frame.buffer)
+        render_service_status(width, height, &mut ui, &snapshot)
     }
 
     #[test]
@@ -696,6 +883,44 @@ mod tests {
             assert!(text.contains("details"), "width={width}\n{text}");
             assert!(text.contains("gpt-test"), "width={width}\n{text}");
         }
+    }
+
+    #[test]
+    fn long_service_status_list_scrolls_to_selected_probe_and_links_details() {
+        let (mut service_status, base_probe, base_service) =
+            status_fixture(crate::credentials::CredentialReadinessCode::Ready);
+        service_status.probes = (0..30)
+            .map(|index| ServiceStatusProbeSnapshot {
+                id: format!("provider-{index:02}"),
+                url: format!("https://provider-{index:02}.example"),
+                services: vec![ServiceStatusServiceSnapshot {
+                    model: format!("model-{index:02}"),
+                    ..base_service.clone()
+                }],
+                ..base_probe.clone()
+            })
+            .collect();
+        let snapshot = Snapshot {
+            service_status: Some(service_status),
+            ..Snapshot::default()
+        };
+        let mut ui = UiState {
+            language: Language::En,
+            selected_service_status_idx: 29,
+            selected_service_status_key: Some((
+                "provider-29".to_string(),
+                Some("model-29".to_string()),
+            )),
+            ..UiState::default()
+        };
+
+        let text = render_service_status(160, 32, &mut ui, &snapshot);
+
+        assert!(ui.service_status_table.offset() > 0);
+        assert_eq!(ui.service_status_table.selected(), Some(29));
+        assert!(text.contains("provider-29"), "{text}");
+        assert!(text.contains("https://provider-29.example"), "{text}");
+        assert!(!text.contains("https://provider-00.example"), "{text}");
     }
 
     #[test]

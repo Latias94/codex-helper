@@ -223,6 +223,12 @@ impl ProxyRuntime {
 fn quota_sampler_refresh_result(
     summary: &crate::usage_providers::UsageProviderRefreshSummary,
 ) -> QuotaSamplerRefreshOutcome {
+    if summary.failed > 0 && summary.refreshed == 0 {
+        return QuotaSamplerRefreshOutcome::Failed(format!(
+            "{} of {} quota provider refresh attempts failed",
+            summary.failed, summary.attempted
+        ));
+    }
     if summary.suppressed > 0
         && let Some(next_retry_at_ms) = summary.next_retry_at_ms
     {
@@ -231,14 +237,7 @@ fn quota_sampler_refresh_result(
             wake_at: tokio::time::Instant::now() + delay,
         };
     }
-    if summary.attempted > 0 && summary.failed >= summary.attempted {
-        QuotaSamplerRefreshOutcome::Failed(format!(
-            "all {} quota provider refresh attempts failed",
-            summary.attempted
-        ))
-    } else {
-        QuotaSamplerRefreshOutcome::Refreshed
-    }
+    QuotaSamplerRefreshOutcome::Refreshed
 }
 
 fn unix_now_ms() -> u64 {
@@ -752,6 +751,39 @@ mod tests {
             Ok(guard) => guard,
             Err(error) => error.into_inner(),
         }
+    }
+
+    #[test]
+    fn quota_sampler_failure_dominates_a_suppressed_target() {
+        let summary = crate::usage_providers::UsageProviderRefreshSummary {
+            attempted: 2,
+            failed: 1,
+            suppressed: 1,
+            next_retry_at_ms: Some(unix_now_ms().saturating_add(30_000)),
+            ..Default::default()
+        };
+
+        let outcome = quota_sampler_refresh_result(&summary);
+
+        assert!(
+            matches!(outcome, QuotaSamplerRefreshOutcome::Failed(_)),
+            "an actual failed attempt must retain sampler backoff even when another target is suppressed: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn quota_sampler_partial_success_does_not_back_off_healthy_targets() {
+        let summary = crate::usage_providers::UsageProviderRefreshSummary {
+            attempted: 2,
+            refreshed: 1,
+            failed: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            quota_sampler_refresh_result(&summary),
+            QuotaSamplerRefreshOutcome::Refreshed
+        );
     }
 
     fn write_file(path: &Path, contents: &str) {

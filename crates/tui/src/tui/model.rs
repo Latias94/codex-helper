@@ -7,9 +7,9 @@ use ratatui::prelude::{Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::dashboard_core::{
-    OperatorProviderBalanceSummary, OperatorProviderEndpointSummary, OperatorProviderSummary,
-    OperatorReadData, OperatorRequestSummary, OperatorRoutingSummary, OperatorSessionSummary,
-    WindowStats,
+    OperatorLocalSessionMetadata, OperatorProviderBalanceSummary, OperatorProviderEndpointSummary,
+    OperatorProviderSummary, OperatorReadData, OperatorRequestSummary, OperatorRoutingSummary,
+    OperatorSessionSummary, WindowStats,
 };
 use crate::pricing::{ModelPriceCatalogSnapshot, UsdAmount};
 use crate::quota_analytics::QuotaAnalyticsView;
@@ -56,6 +56,7 @@ pub(in crate::tui) struct SessionRow {
     pub(in crate::tui) avg_output_tokens_per_second: Option<f64>,
     pub(in crate::tui) binding_profile_name: Option<String>,
     pub(in crate::tui) binding_continuity_mode: Option<crate::state::SessionContinuityMode>,
+    pub(in crate::tui) binding: crate::state::SessionBindingProjection,
     pub(in crate::tui) last_route_decision: Option<RouteDecisionProvenance>,
     pub(in crate::tui) route_affinity: Option<SessionRouteAffinityView>,
     pub(in crate::tui) effective_model: Option<ResolvedRouteValue>,
@@ -64,6 +65,12 @@ pub(in crate::tui) struct SessionRow {
 }
 
 impl SessionRow {
+    pub(in crate::tui) fn display_session_id(&self) -> Option<&str> {
+        self.local_session_id
+            .as_deref()
+            .or(self.session_id.as_deref())
+    }
+
     pub(in crate::tui) fn local_command_session_id(&self) -> Option<&str> {
         self.local_session_id.as_deref()
     }
@@ -198,6 +205,16 @@ impl Default for Snapshot {
             refreshed_at: Instant::now(),
         }
     }
+}
+
+pub(in crate::tui) fn latest_provider_balance_fetched_at_ms(snapshot: &Snapshot) -> Option<u64> {
+    snapshot
+        .provider_balances
+        .values()
+        .flatten()
+        .map(|balance| balance.fetched_at_ms)
+        .filter(|fetched_at_ms| *fetched_at_ms > 0)
+        .max()
 }
 
 pub(in crate::tui) fn request_attempt_count(request: &OperatorRequestSummary) -> u32 {
@@ -369,9 +386,10 @@ fn suffix_by_width(s: &str, max_width: usize) -> &str {
 }
 
 pub(in crate::tui) fn short_sid(sid: &str, max: usize) -> String {
-    // Prefer head truncation (end ellipsis) over middle truncation so the string stays readable
-    // and copy/paste friendly in terminals.
-    shorten_head(sid, max)
+    let compact = sid
+        .strip_prefix("session:sha256:")
+        .map(|digest| format!("session:{digest}"));
+    shorten_head(compact.as_deref().unwrap_or(sid), max)
 }
 
 pub(in crate::tui) fn balance_status_style(p: Palette, status: BalanceSnapshotStatus) -> Style {
@@ -928,6 +946,26 @@ pub(in crate::tui) fn balance_snapshot_rank(snapshot: &ProviderBalanceSnapshot) 
     }
 }
 
+pub(in crate::tui) fn provider_endpoint_balance_snapshot<'a>(
+    provider_balances: &'a HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    provider_id: &str,
+    endpoint_id: &str,
+) -> Option<&'a ProviderBalanceSnapshot> {
+    provider_balances
+        .get(provider_id)?
+        .iter()
+        .filter(|snapshot| snapshot.provider_endpoint.endpoint_id == endpoint_id)
+        .min_by(|left, right| {
+            balance_snapshot_rank(left)
+                .cmp(&balance_snapshot_rank(right))
+                .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
+                .then_with(|| {
+                    left.observation_provider_id
+                        .cmp(&right.observation_provider_id)
+                })
+        })
+}
+
 fn primary_balance_snapshot(
     balances: &[ProviderBalanceSnapshot],
 ) -> Option<&ProviderBalanceSnapshot> {
@@ -1269,14 +1307,39 @@ pub(in crate::tui) fn format_tok_per_second(value: Option<f64>) -> String {
 }
 
 pub(in crate::tui) fn usage_line_lang(usage: &UsageMetrics, lang: Language) -> String {
-    format!(
-        "{}: {}/{}/{}/{}",
+    crate::usage_format::usage_line_with_labels(
+        usage,
         i18n::label(lang, "tok in/out/rsn/ttl"),
-        tokens_short(usage.input_tokens),
-        tokens_short(usage.output_tokens),
-        tokens_short(usage.reasoning_output_tokens),
-        tokens_short(usage.total_tokens),
+        i18n::label(lang, "cache read/create"),
     )
+}
+
+pub(in crate::tui) fn request_cache_hit_rate_label(request: &OperatorRequestSummary) -> String {
+    let Some(usage) = request.usage.as_ref() else {
+        return "-".to_string();
+    };
+    if let Some(rate) = usage.cache_hit_rate_with_convention(request.cache_accounting_convention) {
+        return format!("{:.1}%", rate * 100.0);
+    }
+
+    let inferred = match request.service.trim().to_ascii_lowercase().as_str() {
+        "codex" | "gemini" => Some(crate::usage::CacheAccountingConvention {
+            cache_read: crate::usage::CacheTokenInclusion::IncludedInInput,
+            cache_write: crate::usage::CacheTokenInclusion::Separate,
+        }),
+        "claude" | "anthropic" => Some(crate::usage::CacheAccountingConvention::SEPARATE),
+        _ => None,
+    };
+    if let Some(rate) =
+        inferred.and_then(|convention| usage.cache_hit_rate_with_convention(convention))
+    {
+        return format!("~{:.1}%", rate * 100.0);
+    }
+    if usage.has_cache_tokens() {
+        "?".to_string()
+    } else {
+        "-".to_string()
+    }
 }
 
 pub(in crate::tui) fn status_style(p: Palette, status: Option<u16>) -> Style {
@@ -1322,6 +1385,7 @@ fn build_session_rows_from_cards(cards: &[SessionIdentityCard]) -> Vec<SessionRo
                 avg_output_tokens_per_second: card.avg_output_tokens_per_second,
                 binding_profile_name: card.binding_profile_name.clone(),
                 binding_continuity_mode: card.binding_continuity_mode,
+                binding: card.binding.clone(),
                 last_route_decision: card
                     .last_route_decision
                     .as_ref()
@@ -1400,6 +1464,42 @@ pub(in crate::tui) fn session_control_posture_lang(
     row: &SessionRow,
     lang: Language,
 ) -> SessionControlPosture {
+    if row.binding.has_manual_values() {
+        let profile = row
+            .binding
+            .profile_name
+            .as_deref()
+            .map(|name| format!("profile {name}"))
+            .unwrap_or_else(|| match lang {
+                Language::Zh => "手动字段".to_string(),
+                Language::En => "manual fields".to_string(),
+            });
+        let fields = [
+            row.binding.model.as_ref().map(|_| "model"),
+            row.binding.reasoning_effort.as_ref().map(|_| "effort"),
+            row.binding.service_tier.as_ref().map(|_| "service_tier"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+        return SessionControlPosture {
+            headline: match lang {
+                Language::Zh => format!("手动控制：{profile}"),
+                Language::En => format!("manual control: {profile}"),
+            },
+            detail: match (lang, fields.is_empty()) {
+                (Language::Zh, true) => "下一请求使用存储的会话值。".to_string(),
+                (Language::Zh, false) => format!("下一请求使用存储的会话值（{fields}）。"),
+                (Language::En, true) => "The next request uses stored session values.".to_string(),
+                (Language::En, false) => {
+                    format!("The next request uses stored session values ({fields}).")
+                }
+            },
+            color: Color::Rgb(63, 185, 80),
+        };
+    }
+
     if let Some(profile_name) = row.binding_profile_name.as_deref() {
         let mode = row
             .binding_continuity_mode
@@ -1432,13 +1532,13 @@ pub(in crate::tui) fn session_control_posture_lang(
 
 pub(in crate::tui) fn snapshot_from_operator_data(
     data: &OperatorReadData,
-    local_session_ids: &HashMap<String, String>,
+    local_sessions: &HashMap<String, OperatorLocalSessionMetadata>,
 ) -> Snapshot {
     let sessions = &data.summary.sessions;
     Snapshot {
         rows: sessions
             .iter()
-            .map(|session| session_row_from_operator(session, local_session_ids))
+            .map(|session| session_row_from_operator(session, local_sessions))
             .collect(),
         recent: data.recent_requests.clone(),
         request_control_evidence: data
@@ -1470,16 +1570,24 @@ pub(in crate::tui) fn provider_options_from_operator_data(
 
 fn session_row_from_operator(
     session: &OperatorSessionSummary,
-    local_session_ids: &HashMap<String, String>,
+    local_sessions: &HashMap<String, OperatorLocalSessionMetadata>,
 ) -> SessionRow {
+    let local = local_sessions.get(&session.session_key);
     SessionRow {
         session_id: Some(session.session_key.clone()),
-        local_session_id: local_session_ids.get(&session.session_key).cloned(),
-        observation_scope: SessionObservationScope::ObservedOnly,
-        host_local_transcript_path: None,
-        last_client_name: None,
-        last_client_addr: None,
-        cwd: None,
+        local_session_id: local.map(|local| local.raw_session_id.clone()),
+        observation_scope: if local
+            .is_some_and(|local| local.cwd.is_some() || local.host_local_transcript_path.is_some())
+        {
+            SessionObservationScope::HostLocalEnriched
+        } else {
+            SessionObservationScope::ObservedOnly
+        },
+        host_local_transcript_path: local
+            .and_then(|local| local.host_local_transcript_path.clone()),
+        last_client_name: local.and_then(|local| local.last_client_name.clone()),
+        last_client_addr: local.and_then(|local| local.last_client_addr.clone()),
+        cwd: local.and_then(|local| local.cwd.clone()),
         active_count: usize::try_from(session.active_count).unwrap_or(usize::MAX),
         active_started_at_ms_min: session.active_started_at_ms_min,
         active_last_method: None,
@@ -1499,6 +1607,7 @@ fn session_row_from_operator(
         avg_output_tokens_per_second: session.avg_output_tokens_per_second,
         binding_profile_name: session.binding_profile_name.clone(),
         binding_continuity_mode: session.binding_continuity_mode,
+        binding: session.binding.clone(),
         last_route_decision: session
             .last_route_decision
             .as_ref()
@@ -1597,39 +1706,59 @@ fn operator_provider_balances(
                         message: kind.as_str().to_string(),
                     })
                     .collect(),
-                ..Default::default()
+                error: balance.error.clone(),
             });
     }
     grouped
+}
+
+pub(in crate::tui) fn dashboard_request_filtered_indices(
+    snapshot: &Snapshot,
+    selected_session_idx: usize,
+) -> Vec<usize> {
+    let selected_row = snapshot.rows.get(selected_session_idx);
+    snapshot
+        .recent
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| {
+            let Some(selected_row) = selected_row else {
+                return true;
+            };
+            match (
+                selected_row.session_id.as_deref(),
+                request.session_key.as_deref(),
+            ) {
+                (Some(sid), Some(request_sid)) => sid == request_sid,
+                (Some(_), None) | (None, Some(_)) => false,
+                (None, None) => true,
+            }
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 pub(in crate::tui) fn filtered_requests_len(
     snapshot: &Snapshot,
     selected_session_idx: usize,
 ) -> usize {
-    let Some(selected_row) = snapshot.rows.get(selected_session_idx) else {
-        return snapshot.recent.iter().take(60).count();
-    };
-    snapshot
-        .recent
-        .iter()
-        .filter(
-            |r| match (selected_row.session_id.as_deref(), r.session_key.as_deref()) {
-                (Some(sid), Some(rid)) => sid == rid,
-                (Some(_), None) => false,
-                (None, Some(_)) => false,
-                (None, None) => true,
-            },
-        )
-        .take(60)
-        .count()
+    dashboard_request_filtered_indices(snapshot, selected_session_idx).len()
 }
 
 pub(in crate::tui) fn find_session_idx(snapshot: &Snapshot, sid: &str) -> Option<usize> {
+    snapshot.rows.iter().position(|row| {
+        row.session_id.as_deref() == Some(sid) || row.local_session_id.as_deref() == Some(sid)
+    })
+}
+
+pub(in crate::tui) fn runtime_session_key(snapshot: &Snapshot, sid: &str) -> Option<String> {
     snapshot
         .rows
         .iter()
-        .position(|row| row.session_id.as_deref() == Some(sid))
+        .find(|row| {
+            row.session_id.as_deref() == Some(sid) || row.local_session_id.as_deref() == Some(sid)
+        })
+        .and_then(|row| row.session_id.clone())
 }
 
 pub(in crate::tui) fn request_page_focus_session_id(
@@ -1652,10 +1781,9 @@ pub(in crate::tui) fn request_page_focus_is_runtime_observed(
     let Some(sid) = focused_sid else {
         return true;
     };
-    snapshot
-        .rows
-        .iter()
-        .any(|row| row.session_id.as_deref() == Some(sid))
+    snapshot.rows.iter().any(|row| {
+        row.session_id.as_deref() == Some(sid) || row.local_session_id.as_deref() == Some(sid)
+    })
 }
 
 pub(in crate::tui) fn request_matches_page_filters(
@@ -1701,6 +1829,7 @@ pub(in crate::tui) fn request_matches_control_filter(
     }
 }
 
+#[cfg(test)]
 pub(in crate::tui) fn filtered_request_page_len(
     snapshot: &Snapshot,
     explicit_focus: Option<&str>,
@@ -1787,6 +1916,21 @@ mod tests {
     }
 
     #[test]
+    fn operator_provider_balances_preserve_safe_error_detail() {
+        let mut balance = operator_balance("quota-observer", "input", "responses", "opaque:key");
+        balance.status = BalanceSnapshotStatus::Error;
+        balance.error = Some("authentication failed".to_string());
+
+        let grouped = operator_provider_balances("codex", &[balance]);
+        let snapshot = grouped
+            .get("input")
+            .and_then(|balances| balances.first())
+            .expect("provider balance");
+
+        assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
+    }
+
+    #[test]
     fn operator_provider_balances_keeps_same_observer_across_endpoints() {
         let grouped = operator_provider_balances(
             "codex",
@@ -1844,6 +1988,7 @@ mod tests {
             avg_output_tokens_per_second: None,
             binding_profile_name: None,
             binding_continuity_mode: None,
+            binding: crate::state::SessionBindingProjection::default(),
             last_route_decision: None,
             route_affinity: None,
             effective_model: None,
@@ -1855,6 +2000,7 @@ mod tests {
     fn operator_request(id: u64, session_id: Option<&str>) -> OperatorRequestSummary {
         OperatorRequestSummary {
             id,
+            trace_key: None,
             session_key: session_id.map(ToOwned::to_owned),
             model: None,
             reasoning_effort: None,
@@ -1865,6 +2011,7 @@ mod tests {
             route_path: Vec::new(),
             upstream_origin: None,
             usage: None,
+            cache_accounting_convention: Default::default(),
             cost: crate::pricing::CostBreakdown::default(),
             retry: None,
             provider_signal_codes: Vec::new(),
@@ -1936,6 +2083,7 @@ mod tests {
             avg_output_tokens_per_second: Some(10.0),
             binding_profile_name: Some("fast".to_string()),
             binding_continuity_mode: None,
+            binding: crate::state::SessionBindingProjection::default(),
             last_route_decision: Some(route_decision.clone()),
             route_affinity: Some(OperatorSessionRouteAffinitySummary {
                 revision: "affinity:v1:test".to_string(),
@@ -1962,6 +2110,7 @@ mod tests {
         };
         let request = OperatorRequestSummary {
             id: 7,
+            trace_key: None,
             session_key: Some(session_key.to_string()),
             model: Some("gpt-5.6".to_string()),
             reasoning_effort: Some("high".to_string()),
@@ -1972,6 +2121,7 @@ mod tests {
             route_path: vec!["main".to_string(), "provider-a".to_string()],
             upstream_origin: Some("https://relay.example.test".to_string()),
             usage: None,
+            cache_accounting_convention: Default::default(),
             cost: crate::pricing::CostBreakdown::default(),
             retry: Some(OperatorRetrySummaryView {
                 attempts: 2,
@@ -2059,10 +2209,20 @@ mod tests {
             }),
             provider_balances: Vec::new(),
         };
-        let local_session_ids =
-            HashMap::from([(session_key.to_string(), "raw-session-id".to_string())]);
+        let local_sessions = HashMap::from([(
+            session_key.to_string(),
+            OperatorLocalSessionMetadata {
+                raw_session_id: "raw-session-id".to_string(),
+                cwd: Some("/workspace/project".to_string()),
+                last_client_name: Some("codex-cli".to_string()),
+                last_client_addr: Some("127.0.0.1:43123".to_string()),
+                host_local_transcript_path: Some(
+                    "/home/operator/.codex/sessions/session.jsonl".to_string(),
+                ),
+            },
+        )]);
 
-        let snapshot = snapshot_from_operator_data(&data, &local_session_ids);
+        let snapshot = snapshot_from_operator_data(&data, &local_sessions);
 
         assert_eq!(
             snapshot
@@ -2075,6 +2235,16 @@ mod tests {
         let row = snapshot.rows.first().expect("operator session row");
         assert_eq!(row.session_id.as_deref(), Some(session_key));
         assert_eq!(row.local_session_id.as_deref(), Some("raw-session-id"));
+        assert_eq!(row.cwd.as_deref(), Some("/workspace/project"));
+        assert_eq!(row.last_client_name.as_deref(), Some("codex-cli"));
+        assert_eq!(
+            row.host_local_transcript_path.as_deref(),
+            Some("/home/operator/.codex/sessions/session.jsonl")
+        );
+        assert_eq!(
+            row.observation_scope,
+            SessionObservationScope::HostLocalEnriched
+        );
         assert_eq!(
             row.observed_upstream_origin().as_deref(),
             Some("https://relay.example.test")
@@ -2581,6 +2751,7 @@ mod tests {
                 avg_output_tokens_per_second: None,
                 binding_profile_name: None,
                 binding_continuity_mode: None,
+                binding: crate::state::SessionBindingProjection::default(),
                 last_route_decision: None,
                 route_affinity: None,
                 effective_model: None,
@@ -2636,6 +2807,7 @@ mod tests {
                 avg_output_tokens_per_second: None,
                 binding_profile_name: None,
                 binding_continuity_mode: None,
+                binding: crate::state::SessionBindingProjection::default(),
                 last_route_decision: None,
                 route_affinity: None,
                 effective_model: None,
@@ -2805,5 +2977,66 @@ mod tests {
 
         assert!(posture.headline.contains("no stored profile binding"));
         assert!(posture.detail.contains("route graph defaults"));
+    }
+
+    #[test]
+    fn usage_line_keeps_cache_read_and_creation_metrics() {
+        let usage = UsageMetrics {
+            input_tokens: 1_000,
+            output_tokens: 200,
+            total_tokens: 1_200,
+            cache_read_input_tokens: 250,
+            cache_creation_input_tokens: 50,
+            ..UsageMetrics::default()
+        };
+
+        let line = usage_line_lang(&usage, Language::En);
+
+        assert!(line.contains("cache read/create: 250/50"), "{line}");
+    }
+
+    #[test]
+    fn local_session_id_is_preferred_for_display_only() {
+        let mut row = empty_session_row();
+        row.session_id = Some("session:sha256:opaque".to_string());
+        row.local_session_id = Some("019f-session-id".to_string());
+
+        assert_eq!(row.display_session_id(), Some("019f-session-id"));
+        assert_eq!(row.session_id.as_deref(), Some("session:sha256:opaque"));
+    }
+
+    #[test]
+    fn local_session_id_resolves_back_to_runtime_key_for_cross_page_navigation() {
+        let mut snapshot = Snapshot::default();
+        let mut row = empty_session_row();
+        row.session_id = Some("session:sha256:opaque".to_string());
+        row.local_session_id = Some("019f-session-id".to_string());
+        snapshot.rows.push(row);
+
+        assert_eq!(find_session_idx(&snapshot, "019f-session-id"), Some(0));
+        assert_eq!(
+            runtime_session_key(&snapshot, "019f-session-id").as_deref(),
+            Some("session:sha256:opaque")
+        );
+        assert!(request_page_focus_is_runtime_observed(
+            &snapshot,
+            Some("019f-session-id")
+        ));
+    }
+
+    #[test]
+    fn opaque_session_labels_keep_a_distinguishing_digest_prefix() {
+        let first = short_sid(
+            "session:sha256:406e61b4390f54e5f38b9966b9e01e04267fcf4a26a1d4713d",
+            18,
+        );
+        let second = short_sid(
+            "session:sha256:9a884e0c390f54e5f38b9966b9e01e04267fcf4a26a1d4713d",
+            18,
+        );
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("session:406"), "{first}");
+        assert!(second.starts_with("session:9a8"), "{second}");
     }
 }

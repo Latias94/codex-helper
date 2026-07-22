@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::i18n::{self, msg};
-use crate::tui::model::{Palette, Snapshot, request_attempt_count, shorten_middle};
+use crate::tui::model::{Palette, Snapshot, now_ms, request_attempt_count, shorten_middle};
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay, Page, page_index, page_titles};
 
@@ -177,52 +177,262 @@ fn footer_parts_fit(parts: &[&str], next: &str, max_width: usize) -> bool {
         <= max_width
 }
 
-fn footer_help_text(ui: &UiState) -> &'static str {
+fn settings_footer_help_text(ui: &UiState) -> String {
+    let mut parts = match (ui.language, ui.runtime_connection.is_attached()) {
+        (crate::tui::Language::Zh, false) => vec!["1-9/0 页面", "q 退出"],
+        (crate::tui::Language::En, false) => vec!["1-9/0 pages", "q quit"],
+        (crate::tui::Language::Zh, true) => vec!["q 只退出控制台"],
+        (crate::tui::Language::En, true) => vec!["q exit console only"],
+    };
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "↑/↓/Pg/Home/End 滚动",
+        crate::tui::Language::En => "↑/↓/Pg/Home/End scroll",
+    });
+    if ui.can_mutate_default_profile() {
+        parts.push("p/P profiles");
+    }
+    if ui.can_reload_runtime() {
+        parts.push(match ui.language {
+            crate::tui::Language::Zh => "R 重载",
+            crate::tui::Language::En => "R reload",
+        });
+    }
+    if ui.can_inspect_relay_capabilities() {
+        parts.push("C inspect");
+    }
+    if ui.can_run_relay_live_smoke() {
+        parts.push("X/Y smoke");
+    }
+    if ui.allows_local_codex_switch() {
+        parts.extend(["n/o switch", "B/I/F/V/D presets"]);
+    }
+    if !ui.can_mutate_default_profile()
+        && !ui.can_reload_runtime()
+        && !ui.can_inspect_relay_capabilities()
+        && !ui.can_run_relay_live_smoke()
+        && !ui.allows_local_codex_switch()
+    {
+        parts.push(match ui.runtime_connection.is_remote_observer() {
+            true => "remote read-only",
+            false => "currently read-only",
+        });
+    }
+    parts.push("L language");
+    parts.push("? help");
+    parts.join("  ")
+}
+
+fn sessions_footer_help_text(ui: &UiState) -> String {
+    let mut parts = match (ui.language, ui.runtime_connection.is_attached()) {
+        (crate::tui::Language::Zh, false) => vec!["1-9/0 页面", "q 退出"],
+        (crate::tui::Language::En, false) => vec!["1-9/0 pages", "q quit"],
+        (crate::tui::Language::Zh, true) => vec!["q 只退出控制台"],
+        (crate::tui::Language::En, true) => vec!["q exit console only"],
+    };
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "↑/↓ 会话",
+        crate::tui::Language::En => "↑/↓ session",
+    });
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "Pg 详情",
+        crate::tui::Language::En => "Pg details",
+    });
+    if ui.can_mutate_session_affinity() {
+        parts.push("A affinity");
+    }
+    parts.push("a/e/v filters");
+    if ui.can_mutate_session_binding() {
+        parts.extend([
+            "b/M/E/f binding",
+            "Enter effort",
+            "x clear effort",
+            "R reset",
+        ]);
+    }
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "o 请求",
+        crate::tui::Language::En => "o requests",
+    });
+    if ui.can_bridge_runtime_sessions_to_local_codex() {
+        parts.push(match ui.language {
+            crate::tui::Language::Zh => "t 记录",
+            crate::tui::Language::En => "t transcript",
+        });
+    }
+    if !ui.can_mutate_session_affinity() && !ui.can_mutate_session_binding() {
+        parts.push(match (ui.language, ui.runtime_connection) {
+            (
+                crate::tui::Language::Zh,
+                crate::tui::state::RuntimeConnectionKind::RemoteObserver,
+            ) => "远程只读",
+            (
+                crate::tui::Language::En,
+                crate::tui::state::RuntimeConnectionKind::RemoteObserver,
+            ) => "remote read-only",
+            (crate::tui::Language::Zh, crate::tui::state::RuntimeConnectionKind::LocalAttached) => {
+                "本机只读"
+            }
+            (crate::tui::Language::En, crate::tui::state::RuntimeConnectionKind::LocalAttached) => {
+                "local read-only"
+            }
+            (crate::tui::Language::Zh, _) => "当前只读",
+            (crate::tui::Language::En, _) => "currently read-only",
+        });
+    }
+    parts.push("? help");
+    parts.join("  ")
+}
+
+fn requests_footer_help_text(ui: &UiState) -> String {
+    let mut parts = match (ui.language, ui.runtime_connection.is_attached()) {
+        (crate::tui::Language::Zh, false) => vec!["1-9/0 页面", "q 退出"],
+        (crate::tui::Language::En, false) => vec!["1-9/0 pages", "q quit"],
+        (crate::tui::Language::Zh, true) => vec!["q 只退出控制台"],
+        (crate::tui::Language::En, true) => vec!["q exit console only"],
+    };
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "↑/↓ 请求",
+        crate::tui::Language::En => "↑/↓ request",
+    });
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "Pg 详情",
+        crate::tui::Language::En => "Pg details",
+    });
+    parts.push("e/c/s filters");
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "x 清焦点",
+        crate::tui::Language::En => "x clear focus",
+    });
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "o 会话",
+        crate::tui::Language::En => "o session",
+    });
+    if ui.can_bridge_runtime_sessions_to_local_codex() {
+        parts.push(match ui.language {
+            crate::tui::Language::Zh => "h 历史",
+            crate::tui::Language::En => "h history",
+        });
+    }
+    parts.push("? help");
+    parts.join("  ")
+}
+
+fn dashboard_footer_help_text(ui: &UiState) -> String {
+    let mut parts = match (ui.language, ui.runtime_connection.is_attached()) {
+        (crate::tui::Language::Zh, false) => vec!["1-9/0 页面", "q 退出"],
+        (crate::tui::Language::En, false) => vec!["1-9/0 pages", "q quit"],
+        (crate::tui::Language::Zh, true) => vec!["q 只退出控制台"],
+        (crate::tui::Language::En, true) => vec!["q exit console only"],
+    };
+    parts.push("Tab focus");
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "Pg/Home/End 详情",
+        crate::tui::Language::En => "Pg/Home/End details",
+    });
+    match ui.focus {
+        Focus::Sessions => {
+            parts.push(match ui.language {
+                crate::tui::Language::Zh => "↑/↓ 会话",
+                crate::tui::Language::En => "↑/↓ session",
+            });
+            parts.push(match ui.language {
+                crate::tui::Language::Zh => "O 请求",
+                crate::tui::Language::En => "O requests",
+            });
+            if ui.can_bridge_runtime_sessions_to_local_codex() {
+                parts.push(match ui.language {
+                    crate::tui::Language::Zh => "H 历史",
+                    crate::tui::Language::En => "H history",
+                });
+            }
+            if ui.can_mutate_session_binding() {
+                parts.extend(["b/M/E/f binding", "Enter effort", "x clear effort"]);
+            }
+        }
+        Focus::Requests => {
+            parts.push(match ui.language {
+                crate::tui::Language::Zh => "↑/↓ 请求",
+                crate::tui::Language::En => "↑/↓ request",
+            });
+            parts.push(match ui.language {
+                crate::tui::Language::Zh => "o 会话",
+                crate::tui::Language::En => "o session",
+            });
+            if ui.can_bridge_runtime_sessions_to_local_codex() {
+                parts.push(match ui.language {
+                    crate::tui::Language::Zh => "h 历史",
+                    crate::tui::Language::En => "h history",
+                });
+            }
+        }
+        Focus::Providers => {}
+    }
+    parts.push("? help");
+    parts.join("  ")
+}
+
+fn stats_footer_help_text(ui: &UiState) -> String {
+    let mut parts = match (ui.language, ui.runtime_connection.is_attached()) {
+        (crate::tui::Language::Zh, false) => vec!["1-9/0 页面", "q 退出"],
+        (crate::tui::Language::En, false) => vec!["1-9/0 pages", "q quit"],
+        (crate::tui::Language::Zh, true) => vec!["q 只退出控制台"],
+        (crate::tui::Language::En, true) => vec!["q exit console only"],
+    };
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "Tab 额度视图",
+        crate::tui::Language::En => "Tab quota view",
+    });
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "↑/↓ 移动",
+        crate::tui::Language::En => "↑/↓ move",
+    });
+    parts.push(match (ui.language, ui.can_refresh_provider_balances()) {
+        (crate::tui::Language::Zh, true) => "g 刷新余额",
+        (crate::tui::Language::En, true) => "g refresh balances",
+        (crate::tui::Language::Zh, false) => "g 刷新快照",
+        (crate::tui::Language::En, false) => "g refresh snapshot",
+    });
+    parts.push(match ui.language {
+        crate::tui::Language::Zh => "y 导出",
+        crate::tui::Language::En => "y export",
+    });
+    parts.push("? help");
+    parts.join("  ")
+}
+
+fn routing_footer_help_text(ui: &UiState, base: &str) -> String {
+    if !ui.routing_detail_available {
+        return base.to_string();
+    }
+    let pane_hint = match ui.language {
+        crate::tui::Language::Zh => "Tab 候选/详情",
+        crate::tui::Language::En => "Tab list/details",
+    };
+    format!("{base}  {pane_hint}")
+}
+
+fn footer_help_text(ui: &UiState) -> String {
+    if ui.overlay == Overlay::None && ui.page == Page::Settings {
+        return settings_footer_help_text(ui);
+    }
     if ui.overlay == Overlay::None && ui.page == Page::Sessions {
-        return match (
-            ui.language,
-            ui.can_mutate_session_affinity(),
-            ui.runtime_connection.is_attached(),
-            ui.runtime_connection.is_remote_observer(),
-        ) {
-            (crate::tui::Language::Zh, true, false, _) => {
-                "1-9/0 页面  q 退出  ↑/↓ 会话  Enter affinity  a/e 筛选  t 记录  ? 帮助"
-            }
-            (crate::tui::Language::En, true, false, _) => {
-                "1-9/0 pages  q quit  ↑/↓ session  Enter affinity  a/e filters  t transcript  ? help"
-            }
-            (crate::tui::Language::Zh, false, false, _) => {
-                "1-9/0 页面  q 退出  ↑/↓ 会话  a/e 筛选  t 记录  当前只读  ? 帮助"
-            }
-            (crate::tui::Language::En, false, false, _) => {
-                "1-9/0 pages  q quit  ↑/↓ session  a/e filters  t transcript  currently read-only  ? help"
-            }
-            (crate::tui::Language::Zh, true, true, _) => {
-                "q 只退出控制台  ↑/↓ 会话  Enter affinity  a/e 筛选  t 记录  ? 帮助"
-            }
-            (crate::tui::Language::En, true, true, _) => {
-                "q exit console only  ↑/↓ session  Enter affinity  a/e filters  t transcript  ? help"
-            }
-            (crate::tui::Language::Zh, false, true, true) => {
-                "q 只退出控制台  ↑/↓ 会话  a/e 筛选  t 记录  远程只读  ? 帮助"
-            }
-            (crate::tui::Language::En, false, true, true) => {
-                "q exit console only  ↑/↓ session  a/e filters  t transcript  remote read-only  ? help"
-            }
-            (crate::tui::Language::Zh, false, true, false) => {
-                "q 只退出控制台  ↑/↓ 会话  a/e 筛选  t 记录  本机只读  ? 帮助"
-            }
-            (crate::tui::Language::En, false, true, false) => {
-                "q exit console only  ↑/↓ session  a/e filters  t transcript  local read-only  ? help"
-            }
-        };
+        return sessions_footer_help_text(ui);
+    }
+    if ui.overlay == Overlay::None && ui.page == Page::Requests {
+        return requests_footer_help_text(ui);
+    }
+    if ui.overlay == Overlay::None && ui.page == Page::Dashboard {
+        return dashboard_footer_help_text(ui);
+    }
+    if ui.overlay == Overlay::None && ui.page == Page::Stats {
+        return stats_footer_help_text(ui);
     }
 
     if !ui.runtime_connection.is_attached()
         && ui.overlay == Overlay::None
         && ui.page == Page::Routing
     {
-        return match (
+        let base = match (
             ui.language,
             ui.can_mutate_routing(),
             ui.can_refresh_provider_balances(),
@@ -252,52 +462,139 @@ fn footer_help_text(ui: &UiState) -> &'static str {
                 "1-9/0 pages  q quit  ↑/↓ endpoint  i details  currently read-only  ? help"
             }
         };
+        return routing_footer_help_text(ui, base);
     }
 
     if ui.runtime_connection.is_attached() && ui.overlay == Overlay::None {
-        return match (
+        let base = match (
             ui.language,
             ui.page,
             ui.can_mutate_routing(),
             ui.can_refresh_provider_balances(),
             ui.runtime_connection.is_remote_observer(),
+            ui.can_bridge_runtime_sessions_to_local_codex(),
         ) {
-            (crate::tui::Language::Zh, Page::Routing, true, true, _) => {
+            (crate::tui::Language::Zh, Page::Routing, true, true, _, _) => {
                 "q 只退出控制台  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助"
             }
-            (crate::tui::Language::En, Page::Routing, true, true, _) => {
+            (crate::tui::Language::En, Page::Routing, true, true, _, _) => {
                 "q exit console only  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  g refresh  i details  ? help"
             }
-            (crate::tui::Language::Zh, Page::Routing, true, false, _) => {
+            (crate::tui::Language::Zh, Page::Routing, true, false, _, _) => {
                 "q 只退出控制台  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  i 详情  ? 帮助"
             }
-            (crate::tui::Language::En, Page::Routing, true, false, _) => {
+            (crate::tui::Language::En, Page::Routing, true, false, _, _) => {
                 "q exit console only  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  i details  ? help"
             }
-            (crate::tui::Language::Zh, Page::Routing, false, true, _) => {
+            (crate::tui::Language::Zh, Page::Routing, false, true, _, _) => {
                 "q 只退出控制台  ↑/↓/Pg 端点  g 刷新  i 详情  ? 帮助"
             }
-            (crate::tui::Language::En, Page::Routing, false, true, _) => {
+            (crate::tui::Language::En, Page::Routing, false, true, _, _) => {
                 "q exit console only  ↑/↓/Pg endpoint  g refresh  i details  ? help"
             }
-            (crate::tui::Language::Zh, Page::Routing, false, false, true) => {
+            (crate::tui::Language::Zh, Page::Routing, false, false, true, _) => {
                 "q 只退出控制台  ↑/↓ 端点  i 详情  远程只读  ? 帮助"
             }
-            (crate::tui::Language::En, Page::Routing, false, false, true) => {
+            (crate::tui::Language::En, Page::Routing, false, false, true, _) => {
                 "q exit console only  ↑/↓ endpoint  i details  remote read-only  ? help"
             }
-            (crate::tui::Language::Zh, Page::Routing, false, false, false) => {
+            (crate::tui::Language::Zh, Page::Routing, false, false, false, _) => {
                 "q 只退出控制台  ↑/↓ 端点  i 详情  本机只读  ? 帮助"
             }
-            (crate::tui::Language::En, Page::Routing, false, false, false) => {
+            (crate::tui::Language::En, Page::Routing, false, false, false, _) => {
                 "q exit console only  ↑/↓ endpoint  i details  local read-only  ? help"
             }
-            (crate::tui::Language::Zh, _, _, _, _) => {
-                "1-9/0 页面  q 只退出控制台  L 语言  Tab 焦点  ↑/↓ 移动  ? 帮助"
+            (crate::tui::Language::Zh, Page::Dashboard, _, _, _, true) => {
+                "1-9/0 页面  q 只退出控制台  Tab 焦点  ↑/↓ 移动  O/H o/h 关联页  ? 帮助"
             }
-            (crate::tui::Language::En, _, _, _, _) => {
-                "1-9/0 pages  q exit console only  L language  Tab focus  ↑/↓ move  ? help"
+            (crate::tui::Language::En, Page::Dashboard, _, _, _, true) => {
+                "1-9/0 pages  q exit console only  Tab focus  ↑/↓ move  O/H o/h related pages  ? help"
             }
+            (crate::tui::Language::Zh, Page::Dashboard, _, _, _, false) => {
+                "1-9/0 页面  q 只退出控制台  Tab 焦点  ↑/↓ 移动  O/o 请求/会话  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Dashboard, _, _, _, false) => {
+                "1-9/0 pages  q exit console only  Tab focus  ↑/↓ move  O/o requests/sessions  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Requests, _, _, _, true) => {
+                "q 只退出控制台  ↑/↓ 请求  e/c/s 筛选  x 清焦点  o 会话  h 历史  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Requests, _, _, _, true) => {
+                "q exit console only  ↑/↓ request  e/c/s filters  x clear focus  o session  h history  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Requests, _, _, _, false) => {
+                "q 只退出控制台  ↑/↓ 请求  e/c/s 筛选  x 清焦点  o 会话  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Requests, _, _, _, false) => {
+                "q exit console only  ↑/↓ request  e/c/s filters  x clear focus  o session  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Stats, _, _, _, _) => {
+                "q 只退出控制台  Tab 额度视图  ↑/↓ 移动  g 刷新  y 导出  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Stats, _, _, _, _) => {
+                "q exit console only  Tab quota view  ↑/↓ move  g refresh  y export  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Settings, _, _, _, _) => {
+                if ui.allows_local_codex_switch() {
+                    "q 只退出控制台  n/o Codex switch  L 语言  ? 帮助"
+                } else {
+                    "q 只退出控制台  L 语言  当前只读  ? 帮助"
+                }
+            }
+            (crate::tui::Language::En, Page::Settings, _, _, _, _) => {
+                if ui.allows_local_codex_switch() {
+                    "q exit console only  n/o Codex switch  L language  ? help"
+                } else {
+                    "q exit console only  L language  read-only  ? help"
+                }
+            }
+            (crate::tui::Language::Zh, Page::History, _, _, _, true) => {
+                "q 只退出控制台  ↑/↓ 选择  Pg 详情  r 刷新  t/Enter 记录  s/f 会话/请求  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::History, _, _, _, true) => {
+                "q exit console only  ↑/↓ select  Pg details  r refresh  t/Enter transcript  s/f session/requests  ? help"
+            }
+            (crate::tui::Language::Zh, Page::History, _, _, _, false) => {
+                "q 只退出控制台  ↑/↓ 选择  Pg 详情  r 刷新  t/Enter 本机记录  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::History, _, _, _, false) => {
+                "q exit console only  ↑/↓ select  Pg details  r refresh  t/Enter local transcript  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Recent, _, _, _, true) => {
+                "q 只退出控制台  ↑/↓ 选择  Pg 详情  [] 时间  Enter/y 复制  t 记录  s/f/h 跳转  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Recent, _, _, _, true) => {
+                "q exit console only  ↑/↓ select  Pg details  [] window  Enter/y copy  t transcript  s/f/h navigate  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Recent, _, _, _, false) => {
+                "q 只退出控制台  ↑/↓ 选择  Pg 详情  [] 时间  Enter/y 复制  t 记录  h 历史  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Recent, _, _, _, false) => {
+                "q exit console only  ↑/↓ select  Pg details  [] window  Enter/y copy  t transcript  h history  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Fleet, _, _, _, _) => {
+                "q 只退出控制台  Tab 焦点  ↑/↓ 移动  r 刷新  t Tree/Flat  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Fleet, _, _, _, _) => {
+                "q exit console only  Tab focus  ↑/↓ move  r refresh  t Tree/Flat  ? help"
+            }
+            (crate::tui::Language::Zh, Page::ServiceStatus, _, _, _, _) => {
+                "q 只退出控制台  ↑/↓/Pg 探针  Tab 详情  r 刷新  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::ServiceStatus, _, _, _, _) => {
+                "q exit console only  ↑/↓/Pg probes  Tab details  r refresh  ? help"
+            }
+            (crate::tui::Language::Zh, Page::Sessions, _, _, _, _) => {
+                "q 只退出控制台  ↑/↓ 会话  a/e 筛选  ? 帮助"
+            }
+            (crate::tui::Language::En, Page::Sessions, _, _, _, _) => {
+                "q exit console only  ↑/↓ session  a/e filters  ? help"
+            }
+        };
+        return if ui.page == Page::Routing {
+            routing_footer_help_text(ui, base)
+        } else {
+            base.to_string()
         };
     }
 
@@ -337,7 +634,21 @@ fn footer_help_text(ui: &UiState) -> &'static str {
             crate::tui::Language::Zh => "Enter / y 确认  Esc / n 取消",
             crate::tui::Language::En => "Enter / y confirm  Esc / n cancel",
         },
+        Overlay::SessionProfileMenu
+        | Overlay::SessionModelMenu
+        | Overlay::SessionEffortMenu
+        | Overlay::SessionServiceTierMenu
+        | Overlay::ConfiguredDefaultProfileMenu
+        | Overlay::RuntimeDefaultProfileMenu => match ui.language {
+            crate::tui::Language::Zh => "↑/↓ 选择  Enter 应用  Esc 取消",
+            crate::tui::Language::En => "↑/↓ select  Enter apply  Esc cancel",
+        },
+        Overlay::SessionBindingInput => match ui.language {
+            crate::tui::Language::Zh => "输入值  Enter 应用  Esc 返回",
+            crate::tui::Language::En => "type value  Enter apply  Esc back",
+        },
     }
+    .to_string()
 }
 
 fn fit_line_to_width(line: Line<'static>, max_width: u16) -> Line<'static> {
@@ -445,7 +756,7 @@ pub(super) fn render_header(
         .take(80)
         .filter(|r| r.status_code >= 400)
         .count();
-    let updated = snapshot.refreshed_at.elapsed().as_millis();
+    let updated = snapshot_age_ms(ui, snapshot, now_ms());
     let focus = match ui.page {
         Page::Fleet => i18n::label(ui.language, "fleet view"),
         Page::ServiceStatus => i18n::label(ui.language, "service status"),
@@ -734,6 +1045,20 @@ pub(super) fn render_header(
     f.render_widget(Paragraph::new(Text::from(tabs)), chunks[2]);
 }
 
+fn snapshot_age_ms(ui: &UiState, snapshot: &Snapshot, current_time_ms: u64) -> u128 {
+    ui.operator_read_model
+        .as_ref()
+        .filter(|model| {
+            matches!(
+                model.status,
+                crate::dashboard_core::OperatorReadStatus::Ready
+                    | crate::dashboard_core::OperatorReadStatus::Stale
+            ) && model.captured_at_ms > 0
+        })
+        .map(|model| u128::from(current_time_ms.saturating_sub(model.captured_at_ms)))
+        .unwrap_or_else(|| snapshot.refreshed_at.elapsed().as_millis())
+}
+
 pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, area: Rect) {
     let now = std::time::Instant::now();
     if let Some((_, ts)) = ui.toast.as_ref()
@@ -745,7 +1070,7 @@ pub(super) fn render_footer(f: &mut Frame<'_>, p: Palette, ui: &mut UiState, are
     let left = footer_help_text(ui);
     let right = ui.toast.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
 
-    let (first, second) = split_footer_help(left, area.width);
+    let (first, second) = split_footer_help(&left, area.width);
     let first_line = fit_spans_to_width(
         vec![Span::styled(first, Style::default().fg(p.muted))],
         area.width,
@@ -789,6 +1114,24 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    #[test]
+    fn stale_operator_snapshot_keeps_original_capture_age() {
+        let ui = UiState {
+            operator_read_model: Some(crate::dashboard_core::OperatorReadModel {
+                api_version: 1,
+                service_name: "codex".to_string(),
+                status: crate::dashboard_core::OperatorReadStatus::Stale,
+                captured_at_ms: 5_000,
+                revisions: None,
+                data: None,
+                issue: Some(crate::dashboard_core::OperatorReadIssue::RefreshFailed),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(snapshot_age_ms(&ui, &Snapshot::default(), 12_000), 7_000);
     }
 
     #[test]
@@ -856,6 +1199,47 @@ mod tests {
     }
 
     #[test]
+    fn wide_routing_footer_advertises_independent_detail_focus() {
+        let ui = UiState {
+            page: Page::Routing,
+            language: crate::tui::Language::En,
+            routing_detail_available: true,
+            ..Default::default()
+        };
+
+        let text = footer_help_text(&ui);
+
+        assert!(text.contains("Tab list/details"), "{text}");
+    }
+
+    #[test]
+    fn dashboard_footer_uses_unambiguous_navigation_keys_for_each_focus() {
+        let sessions = UiState {
+            page: Page::Dashboard,
+            focus: Focus::Sessions,
+            language: crate::tui::Language::En,
+            ..Default::default()
+        };
+        let requests = UiState {
+            page: Page::Dashboard,
+            focus: Focus::Requests,
+            language: crate::tui::Language::En,
+            ..Default::default()
+        };
+
+        let sessions = footer_help_text(&sessions);
+        assert!(sessions.contains("O requests"), "{sessions}");
+        assert!(sessions.contains("H history"), "{sessions}");
+        assert!(!sessions.contains("o session"), "{sessions}");
+        assert!(!sessions.contains("h history"), "{sessions}");
+
+        let requests = footer_help_text(&requests);
+        assert!(requests.contains("o session"), "{requests}");
+        assert!(requests.contains("h history"), "{requests}");
+        assert!(!requests.contains("O requests"), "{requests}");
+    }
+
+    #[test]
     fn integrated_routing_footer_does_not_advertise_blocked_actions() {
         let ui = UiState {
             page: Page::Routing,
@@ -906,6 +1290,11 @@ mod tests {
                 refresh_provider_balances: true,
                 mutate_routing: false,
                 mutate_session_affinity: false,
+                mutate_session_binding: false,
+                reload_runtime: false,
+                mutate_default_profile: false,
+                inspect_relay_capabilities: false,
+                run_relay_live_smoke: false,
             },
             ..Default::default()
         };
@@ -928,6 +1317,11 @@ mod tests {
                 refresh_provider_balances: true,
                 mutate_routing: true,
                 mutate_session_affinity: true,
+                mutate_session_binding: true,
+                reload_runtime: false,
+                mutate_default_profile: false,
+                inspect_relay_capabilities: false,
+                run_relay_live_smoke: false,
             },
             ..Default::default()
         };
@@ -950,6 +1344,11 @@ mod tests {
                 refresh_provider_balances: false,
                 mutate_routing: true,
                 mutate_session_affinity: false,
+                mutate_session_binding: false,
+                reload_runtime: false,
+                mutate_default_profile: false,
+                inspect_relay_capabilities: false,
+                run_relay_live_smoke: false,
             },
             ..Default::default()
         };
@@ -987,8 +1386,67 @@ mod tests {
 
         let text = footer_help_text(&ui);
 
-        assert!(text.contains("Enter affinity"), "{text}");
+        assert!(text.contains("A affinity"), "{text}");
+        assert!(text.contains("Enter effort"), "{text}");
+        assert!(text.contains("a/e/v filters"), "{text}");
+        assert!(text.contains("b/M/E/f binding"), "{text}");
+        assert!(text.contains("R reset"), "{text}");
         assert!(!text.contains("read-only"), "{text}");
+    }
+
+    #[test]
+    fn settings_footer_follows_runtime_capabilities() {
+        let integrated = UiState {
+            page: Page::Settings,
+            language: crate::tui::Language::En,
+            ..Default::default()
+        };
+        let remote = UiState {
+            page: Page::Settings,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::RemoteObserver,
+            ..Default::default()
+        };
+        let local_attached = UiState {
+            page: Page::Settings,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::LocalAttached,
+            operator_action_capabilities: crate::dashboard_core::OperatorActionCapabilities {
+                reload_runtime: true,
+                inspect_relay_capabilities: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let integrated = footer_help_text(&integrated);
+        assert!(integrated.contains("p/P profiles"), "{integrated}");
+        assert!(integrated.contains("R reload"), "{integrated}");
+        assert!(integrated.contains("C inspect"), "{integrated}");
+        assert!(integrated.contains("X/Y smoke"), "{integrated}");
+        assert!(integrated.contains("B/I/F/V/D presets"), "{integrated}");
+
+        let remote = footer_help_text(&remote);
+        assert!(remote.contains("remote read-only"), "{remote}");
+        for blocked in [
+            "p/P profiles",
+            "R reload",
+            "C inspect",
+            "X/Y smoke",
+            "presets",
+        ] {
+            assert!(
+                !remote.contains(blocked),
+                "unexpected {blocked:?} in {remote}"
+            );
+        }
+
+        let local_attached = footer_help_text(&local_attached);
+        assert!(local_attached.contains("R reload"), "{local_attached}");
+        assert!(local_attached.contains("C inspect"), "{local_attached}");
+        assert!(local_attached.contains("n/o switch"), "{local_attached}");
+        assert!(!local_attached.contains("p/P profiles"), "{local_attached}");
+        assert!(!local_attached.contains("X/Y smoke"), "{local_attached}");
     }
 
     #[test]
@@ -1010,9 +1468,61 @@ mod tests {
         let remote_text = footer_help_text(&remote);
 
         assert!(local_text.contains("local read-only"), "{local_text}");
-        assert!(!local_text.contains("Enter affinity"), "{local_text}");
+        assert!(!local_text.contains("A affinity"), "{local_text}");
+        assert!(local_text.contains("transcript"), "{local_text}");
         assert!(remote_text.contains("remote read-only"), "{remote_text}");
-        assert!(!remote_text.contains("Enter affinity"), "{remote_text}");
+        assert!(!remote_text.contains("A affinity"), "{remote_text}");
+        assert!(!remote_text.contains("transcript"), "{remote_text}");
+        assert!(remote_text.contains("o requests"), "{remote_text}");
+    }
+
+    #[test]
+    fn attached_page_footers_advertise_the_shared_controls_they_handle() {
+        let remote = |page| UiState {
+            page,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::RemoteObserver,
+            ..Default::default()
+        };
+
+        let requests = footer_help_text(&remote(Page::Requests));
+        assert!(requests.contains("e/c/s filters"), "{requests}");
+        assert!(requests.contains("x clear focus"), "{requests}");
+        assert!(requests.contains("o session"), "{requests}");
+        assert!(!requests.contains("h history"), "{requests}");
+
+        let history = footer_help_text(&remote(Page::History));
+        assert!(history.contains("Pg details"), "{history}");
+        assert!(history.contains("r refresh"), "{history}");
+        assert!(history.contains("local transcript"), "{history}");
+        assert!(!history.contains("s/f"), "{history}");
+
+        let recent = footer_help_text(&remote(Page::Recent));
+        assert!(recent.contains("Pg details"), "{recent}");
+        assert!(recent.contains("Enter/y copy"), "{recent}");
+        assert!(recent.contains("h history"), "{recent}");
+        assert!(!recent.contains("s/f/h"), "{recent}");
+
+        let stats = footer_help_text(&remote(Page::Stats));
+        assert!(stats.contains("g refresh"), "{stats}");
+        assert!(stats.contains("y export"), "{stats}");
+
+        let fleet = footer_help_text(&remote(Page::Fleet));
+        assert!(fleet.contains("Tab focus"), "{fleet}");
+        assert!(fleet.contains("r refresh"), "{fleet}");
+        assert!(fleet.contains("t Tree/Flat"), "{fleet}");
+
+        let local_history = footer_help_text(&UiState {
+            page: Page::History,
+            language: crate::tui::Language::En,
+            runtime_connection: crate::tui::state::RuntimeConnectionKind::LocalAttached,
+            local_operator_transport_available: true,
+            ..Default::default()
+        });
+        assert!(
+            local_history.contains("s/f session/requests"),
+            "{local_history}"
+        );
     }
 
     #[test]
@@ -1087,6 +1597,9 @@ mod tests {
         let text = footer_help_text(&ui);
 
         assert!(text.contains("1-9/0 pages"), "{text}");
+        assert!(text.contains("Tab focus"), "{text}");
+        assert!(text.contains("r refresh"), "{text}");
+        assert!(text.contains("t Tree/Flat"), "{text}");
         assert!(text.contains("? help"), "{text}");
     }
 }

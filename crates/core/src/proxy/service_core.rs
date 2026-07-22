@@ -242,7 +242,7 @@ impl ProxyService {
 
     pub(super) async fn ensure_default_session_binding(
         &self,
-        view: &crate::config::ServiceRouteConfig,
+        runtime_snapshot: &super::runtime_config::RuntimeSnapshot,
         session_id: &str,
         now_ms: u64,
     ) -> Option<SessionBinding> {
@@ -251,7 +251,11 @@ impl ProxyService {
             return Some(binding);
         }
 
-        let profile_name = effective_default_profile_name(view)?;
+        let config = runtime_snapshot.config();
+        let view =
+            super::control_plane_service::service_route_config(config.as_ref(), self.service_name);
+        let profile_name =
+            effective_default_profile_name(runtime_snapshot, self.service_name).ok()??;
         let profile = crate::config::resolve_service_profile_from_catalog(
             &view.profiles,
             profile_name.as_str(),
@@ -377,6 +381,13 @@ impl ProxyService {
         request: super::OperatorSessionAffinityMutationRequest,
     ) -> Result<super::OperatorSessionAffinityMutationResponse, ProxyControlError> {
         super::session_affinity_control::mutate_operator_session_affinity(self, request).await
+    }
+
+    pub async fn mutate_operator_session_binding(
+        &self,
+        request: super::OperatorSessionBindingMutationRequest,
+    ) -> Result<super::OperatorSessionBindingMutationResponse, ProxyControlError> {
+        super::session_binding_control::mutate_operator_session_binding(self, request).await
     }
 
     pub async fn codex_relay_capabilities(

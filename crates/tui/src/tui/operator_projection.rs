@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::dashboard_core::{OperatorReadModel, OperatorReadStatus};
+use crate::dashboard_core::{OperatorLocalSessionMetadata, OperatorReadModel, OperatorReadStatus};
 
 use super::model::{
     ProviderOption, Snapshot, provider_options_from_operator_data, snapshot_from_operator_data,
@@ -13,7 +13,7 @@ pub(super) fn apply_operator_read_model(
     snapshot: &mut Snapshot,
     providers: &mut Vec<ProviderOption>,
     model: OperatorReadModel,
-    local_session_ids: &HashMap<String, String>,
+    local_sessions: &HashMap<String, OperatorLocalSessionMetadata>,
 ) {
     ui.last_runtime_config_refresh_at = Some(Instant::now());
     ui.runtime_status_error = match model.status {
@@ -28,7 +28,12 @@ pub(super) fn apply_operator_read_model(
     };
 
     if let Some(data) = model.data.as_ref() {
-        *snapshot = snapshot_from_operator_data(data, local_session_ids);
+        ui.host_local_sessions = if ui.runtime_connection.is_remote_observer() {
+            HashMap::new()
+        } else {
+            local_sessions.clone()
+        };
+        *snapshot = snapshot_from_operator_data(data, &ui.host_local_sessions);
         *providers = provider_options_from_operator_data(data);
         let runtime = &data.summary.runtime;
         ui.operator_action_capabilities = runtime.operator_actions;
@@ -38,7 +43,11 @@ pub(super) fn apply_operator_read_model(
         ui.profile_options = data.summary.profiles.clone();
         ui.configured_default_profile = runtime.configured_default_profile.clone();
         ui.effective_default_profile = runtime.default_profile.clone();
+        ui.runtime_default_profile_override = runtime.runtime_default_profile_override.clone();
+        ui.default_profile_control_revision = runtime.default_profile_control_revision;
+        ui.profile_catalog_key = runtime.profile_catalog_key.clone();
     } else {
+        ui.host_local_sessions.clear();
         *snapshot = Snapshot::default();
         providers.clear();
         ui.last_runtime_config_loaded_at_ms = None;
@@ -48,6 +57,9 @@ pub(super) fn apply_operator_read_model(
         ui.profile_options.clear();
         ui.configured_default_profile = None;
         ui.effective_default_profile = None;
+        ui.runtime_default_profile_override = None;
+        ui.default_profile_control_revision = 0;
+        ui.profile_catalog_key.clear();
         ui.fleet_snapshot = None;
     }
 

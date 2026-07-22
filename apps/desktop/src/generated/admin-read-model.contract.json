@@ -321,6 +321,7 @@
         "configured_profile",
         "upstream_max_attempts",
         "provider_max_attempts",
+        "policy",
         "recent_retried_requests",
         "recent_cross_provider_failovers",
         "recent_same_provider_retries",
@@ -341,6 +342,11 @@
           "name": "provider_max_attempts",
           "optional": false,
           "type": "number"
+        },
+        {
+          "name": "policy",
+          "optional": true,
+          "type": "ApiOperatorRetryPolicySummary"
         },
         {
           "name": "recent_retried_requests",
@@ -370,7 +376,12 @@
       "fields": [
         "refresh_provider_balances",
         "mutate_routing",
-        "mutate_session_affinity"
+        "mutate_session_affinity",
+        "mutate_session_binding",
+        "reload_runtime",
+        "mutate_default_profile",
+        "inspect_relay_capabilities",
+        "run_relay_live_smoke"
       ],
       "shape": [
         {
@@ -385,6 +396,31 @@
         },
         {
           "name": "mutate_session_affinity",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mutate_session_binding",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "reload_runtime",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mutate_default_profile",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "inspect_relay_capabilities",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "run_relay_live_smoke",
           "optional": false,
           "type": "boolean"
         }
@@ -862,6 +898,7 @@
         "avg_output_tokens_per_second",
         "binding_profile_name",
         "binding_continuity_mode",
+        "binding",
         "last_route_decision",
         "route_affinity",
         "effective_model",
@@ -958,6 +995,11 @@
           "name": "binding_continuity_mode",
           "optional": true,
           "type": "ApiSessionContinuityMode"
+        },
+        {
+          "name": "binding",
+          "optional": false,
+          "type": "ApiSessionBindingProjection"
         },
         {
           "name": "last_route_decision",
@@ -1231,6 +1273,7 @@
       "struct": "OperatorRequestSummary",
       "fields": [
         "id",
+        "trace_key",
         "session_key",
         "model",
         "reasoning_effort",
@@ -1241,6 +1284,7 @@
         "route_path",
         "upstream_origin",
         "usage",
+        "cache_accounting_convention",
         "cost",
         "retry",
         "provider_signal_codes",
@@ -1260,6 +1304,11 @@
           "name": "id",
           "optional": false,
           "type": "number"
+        },
+        {
+          "name": "trace_key",
+          "optional": true,
+          "type": "string"
         },
         {
           "name": "session_key",
@@ -1310,6 +1359,11 @@
           "name": "usage",
           "optional": true,
           "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "cache_accounting_convention",
+          "optional": false,
+          "type": "ApiCacheAccountingConvention"
         },
         {
           "name": "cost",
@@ -1636,7 +1690,8 @@
         "usage_windows",
         "usage_rate",
         "usage_model_stats",
-        "alert_codes"
+        "alert_codes",
+        "error"
       ],
       "shape": [
         {
@@ -1803,6 +1858,11 @@
           "name": "alert_codes",
           "optional": true,
           "type": "ApiProviderUsageAlertKind[]"
+        },
+        {
+          "name": "error",
+          "optional": true,
+          "type": "string"
         }
       ]
     },
@@ -1934,6 +1994,10 @@
         "runtime_source_mtime_ms",
         "configured_default_profile",
         "default_profile",
+        "runtime_default_profile_override",
+        "default_profile_source",
+        "default_profile_control_revision",
+        "profile_catalog_key",
         "default_profile_summary",
         "operator_actions"
       ],
@@ -1957,6 +2021,26 @@
           "name": "default_profile",
           "optional": false,
           "type": "null|string"
+        },
+        {
+          "name": "runtime_default_profile_override",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "default_profile_source",
+          "optional": false,
+          "type": "ApiEffectiveDefaultProfileSource"
+        },
+        {
+          "name": "default_profile_control_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "profile_catalog_key",
+          "optional": false,
+          "type": "string"
         },
         {
           "name": "default_profile_summary",
@@ -3415,6 +3499,7 @@
         "configured_profile",
         "upstream_max_attempts",
         "provider_max_attempts",
+        "policy",
         "recent_retried_requests",
         "recent_cross_provider_failovers",
         "recent_same_provider_retries",
@@ -3435,6 +3520,11 @@
           "name": "provider_max_attempts",
           "optional": false,
           "type": "number"
+        },
+        {
+          "name": "policy",
+          "optional": true,
+          "type": "ApiOperatorRetryPolicySummary"
         },
         {
           "name": "recent_retried_requests",
@@ -3464,7 +3554,12 @@
       "fields": [
         "refresh_provider_balances",
         "mutate_routing",
-        "mutate_session_affinity"
+        "mutate_session_affinity",
+        "mutate_session_binding",
+        "reload_runtime",
+        "mutate_default_profile",
+        "inspect_relay_capabilities",
+        "run_relay_live_smoke"
       ],
       "shape": [
         {
@@ -3479,6 +3574,31 @@
         },
         {
           "name": "mutate_session_affinity",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mutate_session_binding",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "reload_runtime",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "mutate_default_profile",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "inspect_relay_capabilities",
+          "optional": false,
+          "type": "boolean"
+        },
+        {
+          "name": "run_relay_live_smoke",
           "optional": false,
           "type": "boolean"
         }
@@ -3956,6 +4076,7 @@
         "avg_output_tokens_per_second",
         "binding_profile_name",
         "binding_continuity_mode",
+        "binding",
         "last_route_decision",
         "route_affinity",
         "effective_model",
@@ -4052,6 +4173,11 @@
           "name": "binding_continuity_mode",
           "optional": true,
           "type": "ApiSessionContinuityMode"
+        },
+        {
+          "name": "binding",
+          "optional": false,
+          "type": "ApiSessionBindingProjection"
         },
         {
           "name": "last_route_decision",
@@ -4325,6 +4451,7 @@
       "type": "ApiOperatorRequestSummary",
       "fields": [
         "id",
+        "trace_key",
         "session_key",
         "model",
         "reasoning_effort",
@@ -4335,6 +4462,7 @@
         "route_path",
         "upstream_origin",
         "usage",
+        "cache_accounting_convention",
         "cost",
         "retry",
         "provider_signal_codes",
@@ -4354,6 +4482,11 @@
           "name": "id",
           "optional": false,
           "type": "number"
+        },
+        {
+          "name": "trace_key",
+          "optional": true,
+          "type": "string"
         },
         {
           "name": "session_key",
@@ -4404,6 +4537,11 @@
           "name": "usage",
           "optional": true,
           "type": "ApiUsageMetrics"
+        },
+        {
+          "name": "cache_accounting_convention",
+          "optional": false,
+          "type": "ApiCacheAccountingConvention"
         },
         {
           "name": "cost",
@@ -4730,7 +4868,8 @@
         "usage_windows",
         "usage_rate",
         "usage_model_stats",
-        "alert_codes"
+        "alert_codes",
+        "error"
       ],
       "shape": [
         {
@@ -4897,6 +5036,11 @@
           "name": "alert_codes",
           "optional": true,
           "type": "ApiProviderUsageAlertKind[]"
+        },
+        {
+          "name": "error",
+          "optional": true,
+          "type": "string"
         }
       ]
     },
@@ -5028,6 +5172,10 @@
         "runtime_source_mtime_ms",
         "configured_default_profile",
         "default_profile",
+        "runtime_default_profile_override",
+        "default_profile_source",
+        "default_profile_control_revision",
+        "profile_catalog_key",
         "default_profile_summary",
         "operator_actions"
       ],
@@ -5051,6 +5199,26 @@
           "name": "default_profile",
           "optional": false,
           "type": "null|string"
+        },
+        {
+          "name": "runtime_default_profile_override",
+          "optional": false,
+          "type": "null|string"
+        },
+        {
+          "name": "default_profile_source",
+          "optional": false,
+          "type": "ApiEffectiveDefaultProfileSource"
+        },
+        {
+          "name": "default_profile_control_revision",
+          "optional": false,
+          "type": "number"
+        },
+        {
+          "name": "profile_catalog_key",
+          "optional": false,
+          "type": "string"
         },
         {
           "name": "default_profile_summary",

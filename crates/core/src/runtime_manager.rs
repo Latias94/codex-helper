@@ -1,5 +1,5 @@
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::proxy_home_dir;
 use crate::logging::now_ms;
 use crate::proxy::admin_port_for_proxy_port;
+
+const RUNTIME_OWNER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +124,8 @@ impl std::str::FromStr for RuntimeOwnerKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOwnerMarker {
     pub schema_version: u32,
+    #[serde(default)]
+    pub instance_id: String,
     pub owner: RuntimeOwnerKind,
     pub lifecycle_mode: ProxyLifecycleMode,
     pub service_name: String,
@@ -154,7 +158,8 @@ impl RuntimeOwnerMarker {
         started_at_ms: u64,
     ) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: RUNTIME_OWNER_SCHEMA_VERSION,
+            instance_id: uuid::Uuid::new_v4().to_string(),
             owner,
             lifecycle_mode: owner.lifecycle_mode(),
             service_name: service_name.into(),
@@ -169,6 +174,11 @@ impl RuntimeOwnerMarker {
 
     pub fn with_supervisor_pid(mut self, supervisor_pid: u32) -> Self {
         self.supervisor_pid = Some(supervisor_pid);
+        self
+    }
+
+    pub fn with_lifecycle_mode(mut self, lifecycle_mode: ProxyLifecycleMode) -> Self {
+        self.lifecycle_mode = lifecycle_mode;
         self
     }
 
@@ -199,6 +209,10 @@ pub fn owner_marker_path_in(
         normalize_service_name(service_name),
         proxy_port
     ))
+}
+
+fn owner_lock_path_in(run_dir: impl AsRef<Path>, service_name: &str, proxy_port: u16) -> PathBuf {
+    owner_marker_path_in(run_dir, service_name, proxy_port).with_extension("lock")
 }
 
 pub fn write_owner_marker(marker: &RuntimeOwnerMarker) -> Result<PathBuf> {
@@ -280,6 +294,110 @@ pub fn clear_owner_marker_from(
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("clear owner marker {}", path.display())),
+    }
+}
+
+#[derive(Debug)]
+pub struct RuntimeOwnerLease {
+    run_dir: PathBuf,
+    marker: RuntimeOwnerMarker,
+    _lock: File,
+}
+
+impl RuntimeOwnerLease {
+    pub fn acquire(marker: &RuntimeOwnerMarker) -> Result<Self> {
+        Self::acquire_in(runtime_run_dir(), marker)
+    }
+
+    pub fn acquire_in(run_dir: impl Into<PathBuf>, marker: &RuntimeOwnerMarker) -> Result<Self> {
+        anyhow::ensure!(
+            marker.schema_version == RUNTIME_OWNER_SCHEMA_VERSION,
+            "runtime owner lease requires schema version {RUNTIME_OWNER_SCHEMA_VERSION}"
+        );
+        uuid::Uuid::parse_str(&marker.instance_id)
+            .context("runtime owner lease requires a valid instance ID")?;
+        anyhow::ensure!(
+            marker.lifecycle_mode.owns_runtime(),
+            "runtime owner lease requires an owning lifecycle mode"
+        );
+        anyhow::ensure!(
+            marker.admin_port == admin_port_for_proxy_port(marker.proxy_port),
+            "runtime owner marker admin port does not match its proxy port"
+        );
+        let run_dir = run_dir.into();
+        fs::create_dir_all(&run_dir)
+            .with_context(|| format!("create runtime run dir {}", run_dir.display()))?;
+        let lock_path = owner_lock_path_in(&run_dir, &marker.service_name, marker.proxy_port);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options
+            .open(&lock_path)
+            .with_context(|| format!("open runtime owner lock {}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => anyhow::bail!(
+                "runtime {}:{} is already owned; lock is held at {}",
+                marker.service_name,
+                marker.proxy_port,
+                lock_path.display()
+            ),
+            Err(TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("lock runtime owner file {}", lock_path.display()));
+            }
+        }
+        write_owner_marker_to(&run_dir, marker)?;
+        Ok(Self {
+            run_dir,
+            marker: marker.clone(),
+            _lock: lock,
+        })
+    }
+
+    pub fn instance_id(&self) -> &str {
+        self.marker.instance_id.as_str()
+    }
+
+    pub fn service_name(&self) -> &str {
+        self.marker.service_name.as_str()
+    }
+
+    pub fn proxy_port(&self) -> u16 {
+        self.marker.proxy_port
+    }
+
+    pub fn lifecycle_mode(&self) -> ProxyLifecycleMode {
+        self.marker.lifecycle_mode
+    }
+}
+
+impl Drop for RuntimeOwnerLease {
+    fn drop(&mut self) {
+        let current = read_owner_marker_from(
+            &self.run_dir,
+            &self.marker.service_name,
+            self.marker.proxy_port,
+        );
+        match current {
+            Ok(Some(current)) if current.instance_id == self.marker.instance_id => {
+                if let Err(error) = clear_owner_marker_from(
+                    &self.run_dir,
+                    &self.marker.service_name,
+                    self.marker.proxy_port,
+                ) {
+                    tracing::warn!("failed to clear owned runtime marker: {error}");
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                tracing::warn!("failed to verify runtime owner marker before release: {error}");
+            }
+        }
     }
 }
 
@@ -446,6 +564,7 @@ mod tests {
         assert_eq!(loaded.lifecycle_mode, ProxyLifecycleMode::DesktopOwned);
         assert_eq!(loaded.admin_port, admin_port_for_proxy_port(3211));
         assert_eq!(loaded.pid, 42);
+        assert!(!loaded.instance_id.is_empty());
         assert_eq!(loaded.supervisor_pid, Some(7));
         assert_eq!(loaded.note.as_deref(), Some("started by desktop shell"));
 
@@ -480,20 +599,85 @@ mod tests {
     }
 
     #[test]
-    fn owner_marker_guard_clears_marker_on_drop() {
-        let run_dir = unique_run_dir("guard");
+    fn owner_lease_rejects_a_second_live_owner_without_replacing_marker() {
+        let run_dir = unique_run_dir("lease-exclusive");
         let marker =
             RuntimeOwnerMarker::new_with_pid(RuntimeOwnerKind::ManualCli, "codex", 3211, 42, 1);
-        write_owner_marker_to(&run_dir, &marker).expect("write owner marker");
+        let lease = RuntimeOwnerLease::acquire_in(&run_dir, &marker).expect("acquire owner lease");
+        let competing =
+            RuntimeOwnerMarker::new_with_pid(RuntimeOwnerKind::Supervisor, "codex", 3211, 43, 2);
 
-        {
-            let _guard = RuntimeOwnerMarkerGuard::new_in(&run_dir, "codex", 3211, true);
-        }
+        let error = RuntimeOwnerLease::acquire_in(&run_dir, &competing)
+            .expect_err("second live owner must be rejected");
+        assert!(error.to_string().contains("already owned"), "{error}");
+        assert_eq!(
+            read_owner_marker_from(&run_dir, "codex", 3211)
+                .expect("read marker")
+                .expect("marker exists")
+                .instance_id,
+            marker.instance_id
+        );
 
+        drop(lease);
         assert!(
             read_owner_marker_from(&run_dir, "codex", 3211)
-                .expect("read after guard drop")
+                .expect("read after lease drop")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn owner_lease_rejects_legacy_or_non_owning_marker_identity() {
+        let run_dir = unique_run_dir("lease-identity-validation");
+        let mut marker =
+            RuntimeOwnerMarker::new_with_pid(RuntimeOwnerKind::ManualCli, "codex", 3211, 42, 1);
+
+        marker.schema_version = 1;
+        assert!(
+            RuntimeOwnerLease::acquire_in(&run_dir, &marker)
+                .expect_err("legacy schema cannot own a runtime")
+                .to_string()
+                .contains("schema version")
+        );
+
+        marker.schema_version = RUNTIME_OWNER_SCHEMA_VERSION;
+        marker.instance_id.clear();
+        assert!(
+            RuntimeOwnerLease::acquire_in(&run_dir, &marker)
+                .expect_err("empty instance ID cannot own a runtime")
+                .to_string()
+                .contains("instance ID")
+        );
+
+        marker.instance_id = uuid::Uuid::new_v4().to_string();
+        marker.lifecycle_mode = ProxyLifecycleMode::AttachedObserver;
+        assert!(
+            RuntimeOwnerLease::acquire_in(&run_dir, &marker)
+                .expect_err("observer lifecycle cannot own a runtime")
+                .to_string()
+                .contains("owning lifecycle")
+        );
+    }
+
+    #[test]
+    fn dropping_old_owner_lease_preserves_a_replacement_marker() {
+        let run_dir = unique_run_dir("lease-cas-drop");
+        let original =
+            RuntimeOwnerMarker::new_with_pid(RuntimeOwnerKind::ManualCli, "codex", 3211, 42, 1);
+        let lease =
+            RuntimeOwnerLease::acquire_in(&run_dir, &original).expect("acquire owner lease");
+        let replacement =
+            RuntimeOwnerMarker::new_with_pid(RuntimeOwnerKind::Desktop, "codex", 3211, 43, 2);
+        write_owner_marker_to(&run_dir, &replacement).expect("replace marker out of band");
+
+        drop(lease);
+
+        assert_eq!(
+            read_owner_marker_from(&run_dir, "codex", 3211)
+                .expect("read replacement")
+                .expect("replacement remains")
+                .instance_id,
+            replacement.instance_id
         );
     }
 }

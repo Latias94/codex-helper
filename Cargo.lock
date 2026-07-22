@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-core"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -896,6 +896,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.25.12+spec-1.1.0",
@@ -914,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-desktop"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "codex-helper-core",
  "reqwest",
@@ -933,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-desktop-contract-schema"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "heck 0.5.0",
  "serde",
@@ -943,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-server"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -959,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "codex-helper-tui"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4473,6 +4474,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",

@@ -1,24 +1,21 @@
 mod history_bridge;
 mod normal;
+mod session_binding;
 mod transcript;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::proxy::{
-    OperatorEndpointMode, OperatorRoutingCommand, OperatorSessionAffinityCommand,
-    OperatorSessionAffinityMutationRequest,
+    OperatorDefaultProfileMutationRequest, OperatorDefaultProfileScope, OperatorEndpointMode,
+    OperatorRoutingCommand, OperatorSessionAffinityCommand, OperatorSessionAffinityMutationRequest,
 };
 
 use super::model::{ProviderOption, Snapshot};
 use super::operator_actions::{queue_routing_mutation, queue_session_affinity_mutation};
 use super::state::UiState;
 use super::types::{Overlay, RoutingActionChoice};
+pub(in crate::tui) use normal::routing_mutation_request;
 use normal::{apply_page_shortcuts, handle_key_normal, toggle_language};
-pub(in crate::tui) use normal::{
-    export_selected_stats_report, handle_routing_operator_key,
-    handle_session_affinity_operator_key, move_routing_page_selection, routing_mutation_request,
-    select_routing_page_edge,
-};
 use transcript::handle_key_session_transcript;
 
 pub(in crate::tui) fn should_accept_key_event(event: &KeyEvent) -> bool {
@@ -312,10 +309,111 @@ pub(in crate::tui) fn handle_session_affinity_actions_key(
     }
 }
 
+pub(in crate::tui) fn handle_default_profile_menu_key(ui: &mut UiState, key: KeyEvent) -> bool {
+    let scope = match ui.overlay {
+        Overlay::ConfiguredDefaultProfileMenu => OperatorDefaultProfileScope::Configured,
+        Overlay::RuntimeDefaultProfileMenu => OperatorDefaultProfileScope::Runtime,
+        _ => return false,
+    };
+    match key.code {
+        KeyCode::Esc => {
+            ui.overlay = Overlay::None;
+            ui.clear_profile_menu_snapshot();
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.settings_profile_menu_idx = ui.settings_profile_menu_idx.saturating_sub(1);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            ui.settings_profile_menu_idx =
+                (ui.settings_profile_menu_idx + 1).min(ui.profile_menu_options().len());
+            true
+        }
+        KeyCode::Home => {
+            ui.settings_profile_menu_idx = 0;
+            true
+        }
+        KeyCode::End => {
+            ui.settings_profile_menu_idx = ui.profile_menu_options().len();
+            true
+        }
+        KeyCode::Enter => {
+            let request = if let Some(snapshot) = ui.profile_menu_snapshot.as_ref() {
+                OperatorDefaultProfileMutationRequest {
+                    scope,
+                    profile_name: ui
+                        .settings_profile_menu_idx
+                        .checked_sub(1)
+                        .and_then(|index| snapshot.options.get(index))
+                        .map(|profile| profile.name.clone()),
+                    expected_profile_catalog_key: snapshot.catalog_key.clone(),
+                    expected_control_revision: snapshot.control_revision,
+                    expected_configured_profile: snapshot.configured_default_profile.clone(),
+                    expected_runtime_profile: snapshot.runtime_default_profile_override.clone(),
+                }
+            } else {
+                OperatorDefaultProfileMutationRequest {
+                    scope,
+                    profile_name: ui
+                        .settings_profile_menu_idx
+                        .checked_sub(1)
+                        .and_then(|index| ui.profile_options.get(index))
+                        .map(|profile| profile.name.clone()),
+                    expected_profile_catalog_key: ui.profile_catalog_key.clone(),
+                    expected_control_revision: ui.default_profile_control_revision,
+                    expected_configured_profile: ui.configured_default_profile.clone(),
+                    expected_runtime_profile: ui.runtime_default_profile_override.clone(),
+                }
+            };
+            ui.overlay = Overlay::None;
+            ui.clear_profile_menu_snapshot();
+            super::operator_actions::queue_default_profile_mutation(ui, request);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub(in crate::tui) struct KeyEventContext<'a> {
     pub(in crate::tui) providers: &'a mut Vec<ProviderOption>,
     pub(in crate::tui) ui: &'a mut UiState,
     pub(in crate::tui) snapshot: &'a Snapshot,
+}
+
+async fn persist_host_local_language_change_with<F, Fut>(
+    ui: &mut UiState,
+    previous: super::Language,
+    persist: F,
+) where
+    F: FnOnce(super::Language) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    if ui.language == previous || ui.runtime_connection.is_remote_observer() {
+        return;
+    }
+
+    let selected = ui.language;
+    let result = persist(selected).await;
+    ui.toast = Some((
+        match result {
+            Ok(_) => super::i18n::format_language_saved(ui.language, selected),
+            Err(error) => super::i18n::format_language_save_failed(ui.language, selected, &error),
+        },
+        std::time::Instant::now(),
+    ));
+}
+
+async fn persist_host_local_language_change(ui: &mut UiState, previous: super::Language) {
+    persist_host_local_language_change_with(ui, previous, |selected| async move {
+        crate::config::mutate_helper_config(|config| {
+            config.ui.language = Some(super::i18n::storage_code(selected).to_string());
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    })
+    .await;
 }
 
 pub(in crate::tui) async fn handle_key_event(ctx: KeyEventContext<'_>, key: KeyEvent) -> bool {
@@ -323,11 +421,47 @@ pub(in crate::tui) async fn handle_key_event(ctx: KeyEventContext<'_>, key: KeyE
         return true;
     }
 
-    match ctx.ui.overlay {
-        Overlay::None => handle_key_normal(ctx, key).await,
+    let previous_language = ctx.ui.language;
+    let handled = match ctx.ui.overlay {
+        Overlay::None => {
+            handle_key_normal(
+                KeyEventContext {
+                    providers: &mut *ctx.providers,
+                    ui: &mut *ctx.ui,
+                    snapshot: ctx.snapshot,
+                },
+                key,
+            )
+            .await
+        }
         Overlay::Help => match key.code {
             KeyCode::Esc | KeyCode::Char('?') => {
                 ctx.ui.overlay = Overlay::None;
+                ctx.ui.help_scroll = 0;
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                ctx.ui.help_scroll = ctx.ui.help_scroll.saturating_sub(1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                ctx.ui.help_scroll = ctx.ui.help_scroll.saturating_add(1);
+                true
+            }
+            KeyCode::PageUp => {
+                ctx.ui.help_scroll = ctx.ui.help_scroll.saturating_sub(8);
+                true
+            }
+            KeyCode::PageDown => {
+                ctx.ui.help_scroll = ctx.ui.help_scroll.saturating_add(8);
+                true
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                ctx.ui.help_scroll = 0;
+                true
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                ctx.ui.help_scroll = u16::MAX;
                 true
             }
             KeyCode::Char('L') => {
@@ -357,6 +491,14 @@ pub(in crate::tui) async fn handle_key_event(ctx: KeyEventContext<'_>, key: KeyE
         Overlay::SessionAffinityConfirmation => {
             handle_session_affinity_confirmation_key(ctx.ui, key)
         }
+        Overlay::SessionProfileMenu => session_binding::handle_profile_menu(ctx.ui, key),
+        Overlay::SessionModelMenu => session_binding::handle_model_menu(ctx.ui, key),
+        Overlay::SessionEffortMenu => session_binding::handle_effort_menu(ctx.ui, key),
+        Overlay::SessionServiceTierMenu => session_binding::handle_service_tier_menu(ctx.ui, key),
+        Overlay::SessionBindingInput => session_binding::handle_binding_input(ctx.ui, key),
+        Overlay::ConfiguredDefaultProfileMenu | Overlay::RuntimeDefaultProfileMenu => {
+            handle_default_profile_menu_key(ctx.ui, key)
+        }
         Overlay::ProviderInfo => {
             if handle_provider_info_key(ctx.ui, key) {
                 true
@@ -367,7 +509,11 @@ pub(in crate::tui) async fn handle_key_event(ctx: KeyEventContext<'_>, key: KeyE
                 false
             }
         }
+    };
+    if handled {
+        persist_host_local_language_change(ctx.ui, previous_language).await;
     }
+    handled
 }
 
 #[cfg(test)]

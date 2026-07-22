@@ -48,6 +48,14 @@ pub(in crate::tui) fn render_app(
         Overlay::SessionAffinityConfirmation => {
             modals::render_session_affinity_confirmation_modal(f, p, ui, snapshot)
         }
+        Overlay::SessionProfileMenu => modals::render_session_profile_menu(f, p, ui),
+        Overlay::SessionModelMenu => modals::render_session_model_menu(f, p, ui),
+        Overlay::SessionEffortMenu => modals::render_session_effort_menu(f, p, ui),
+        Overlay::SessionServiceTierMenu => modals::render_session_service_tier_menu(f, p, ui),
+        Overlay::SessionBindingInput => modals::render_session_binding_input(f, p, ui),
+        Overlay::ConfiguredDefaultProfileMenu | Overlay::RuntimeDefaultProfileMenu => {
+            modals::render_default_profile_menu(f, p, ui)
+        }
         Overlay::SessionTranscript => modals::render_session_transcript_modal(f, p, ui),
     }
 }
@@ -62,19 +70,24 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use crate::codex_integration::{
         CodexStartupReadiness, CodexStartupReadinessIssue, CodexStartupReadinessIssueKind,
         CodexStartupReadinessSeverity,
     };
     use crate::dashboard_core::{
-        OperatorPolicyActionSummary, OperatorProviderCapacity, OperatorRouteCandidateSummary,
+        ControlProfileOption, OperatorPolicyActionSummary, OperatorProviderCapacity,
+        OperatorRequestObservability, OperatorRequestSummary, OperatorRouteCandidateSummary,
         OperatorRoutingSummary,
     };
+    use crate::sessions::{SessionSummary, SessionSummarySource};
     use crate::state::{
         BalanceSnapshotStatus, ProviderBalanceSnapshot, SessionObservationScope, UsageBucket,
     };
     use crate::tui::Language;
     use crate::tui::model::{SessionRouteAffinityView, SessionRow, Snapshot, UpstreamSummary};
+    use crate::tui::state::{RecentCodexRow, RuntimeConnectionKind};
     use crate::tui::types::{Focus, Overlay, Page, StatsFocus};
     use codex_helper_core::fleet::{
         FleetConfidence, FleetEvidence, FleetEvidenceSource, FleetNodeHealth, FleetNodeKind,
@@ -266,6 +279,49 @@ mod tests {
         .collect()
     }
 
+    fn dashboard_request(id: u64, session_id: &str) -> OperatorRequestSummary {
+        OperatorRequestSummary {
+            id,
+            trace_key: None,
+            session_key: Some(session_id.to_string()),
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            provider_id: None,
+            endpoint_id: None,
+            provider_endpoint_key: None,
+            route_path: Vec::new(),
+            upstream_origin: None,
+            usage: None,
+            cache_accounting_convention: Default::default(),
+            cost: crate::pricing::CostBreakdown::default(),
+            retry: None,
+            provider_signal_codes: Vec::new(),
+            policy_action_codes: Vec::new(),
+            observability: OperatorRequestObservability {
+                duration_ms: Some(10),
+                ttfb_ms: None,
+                generation_ms: None,
+                output_tokens_per_second: None,
+                attempt_count: 1,
+                route_attempt_count: 0,
+                retried: false,
+                cross_provider_failover: false,
+                same_provider_retry: false,
+                fast_mode: false,
+                streaming: false,
+            },
+            service: "codex".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            duration_ms: 10,
+            ttfb_ms: None,
+            streaming: false,
+            ended_at_ms: id,
+        }
+    }
+
     fn sample_startup_readiness() -> CodexStartupReadiness {
         CodexStartupReadiness {
             issues: vec![CodexStartupReadinessIssue {
@@ -404,6 +460,7 @@ mod tests {
             avg_output_tokens_per_second: None,
             binding_profile_name: None,
             binding_continuity_mode: None,
+            binding: crate::state::SessionBindingProjection::default(),
             last_route_decision: None,
             route_affinity: None,
             effective_model: None,
@@ -439,6 +496,86 @@ mod tests {
             })
             .expect("draw");
         buffer_text(frame.buffer)
+    }
+
+    fn menu_profile(index: usize) -> ControlProfileOption {
+        ControlProfileOption {
+            name: format!("profile-{index:02}"),
+            extends: None,
+            model: Some(format!("gpt-{index:02}")),
+            reasoning_effort: Some("high".to_string()),
+            service_tier: Some("priority".to_string()),
+            fast_mode: true,
+            is_default: index == 20,
+        }
+    }
+
+    async fn press_menu_end(ui: &mut UiState, snapshot: &Snapshot) {
+        let mut providers = Vec::new();
+        assert!(
+            crate::tui::input::handle_key_event(
+                crate::tui::input::KeyEventContext {
+                    providers: &mut providers,
+                    ui,
+                    snapshot,
+                },
+                KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn long_profile_default_and_model_menus_keep_end_selection_visible_at_80x24() {
+        let snapshot = sample_snapshot();
+        let profiles = (1..=20).map(menu_profile).collect::<Vec<_>>();
+
+        let mut session_profile = UiState {
+            overlay: Overlay::SessionProfileMenu,
+            profile_options: profiles.clone(),
+            configured_default_profile: Some("profile-20".to_string()),
+            effective_default_profile: Some("profile-20".to_string()),
+            runtime_default_profile_override: Some("profile-20".to_string()),
+            ..UiState::default()
+        };
+        session_profile.capture_profile_menu_snapshot();
+        press_menu_end(&mut session_profile, &snapshot).await;
+        let profile_text = render_app_text(80, 24, &mut session_profile, &snapshot);
+        for expected in [
+            "profile-20",
+            "default configured runtime effective",
+            "model=gpt-20",
+            "reasoning=high",
+            "tier=priority",
+        ] {
+            assert!(
+                profile_text.contains(expected),
+                "missing {expected:?}\n{profile_text}"
+            );
+        }
+
+        let mut default_profile = UiState {
+            overlay: Overlay::ConfiguredDefaultProfileMenu,
+            profile_options: profiles,
+            configured_default_profile: Some("profile-20".to_string()),
+            effective_default_profile: Some("profile-20".to_string()),
+            runtime_default_profile_override: Some("profile-20".to_string()),
+            ..UiState::default()
+        };
+        default_profile.capture_profile_menu_snapshot();
+        press_menu_end(&mut default_profile, &snapshot).await;
+        let default_text = render_app_text(80, 24, &mut default_profile, &snapshot);
+        assert!(default_text.contains("profile-20"), "{default_text}");
+
+        let mut model = UiState {
+            overlay: Overlay::SessionModelMenu,
+            session_model_options: (1..=20).map(|index| format!("model-{index:02}")).collect(),
+            ..UiState::default()
+        };
+        press_menu_end(&mut model, &snapshot).await;
+        let model_text = render_app_text(80, 24, &mut model, &snapshot);
+        assert!(model_text.contains("model-20"), "{model_text}");
+        assert!(model_text.contains("Custom model"), "{model_text}");
     }
 
     #[test]
@@ -583,6 +720,32 @@ mod tests {
     }
 
     #[test]
+    fn routing_detail_scroll_reaches_bottom_fields_at_common_terminal_height() {
+        let mut snapshot = sample_snapshot();
+        snapshot.routing.as_mut().expect("routing").candidates[3].route_path = vec![
+            "main".to_string(),
+            "regional-relay".to_string(),
+            "credential-pool".to_string(),
+            "bottom-route-marker".to_string(),
+        ];
+        let providers = sample_providers();
+        let mut ui = UiState {
+            page: Page::Routing,
+            focus: Focus::Providers,
+            selected_routing_candidate_idx: 3,
+            routing_detail_focused: true,
+            routing_detail_scroll: u16::MAX,
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_app_text_with_providers(120, 24, &mut ui, &snapshot, &providers);
+
+        assert!(text.contains("Routing policy"), "{text}");
+        assert!(text.contains("bottom-route-marker"), "{text}");
+    }
+
+    #[test]
     fn routing_master_list_scrolls_the_selected_candidate_into_view() {
         let mut snapshot = sample_snapshot();
         let routing = snapshot.routing.as_mut().expect("routing");
@@ -668,6 +831,102 @@ mod tests {
 
         assert!(text.contains("legacy read-only data"), "{text}");
         assert!(text.contains("input-light"), "{text}");
+    }
+
+    #[test]
+    fn provider_info_end_scroll_clamps_to_content_and_reaches_the_last_endpoint() {
+        let snapshot = sample_snapshot();
+        let mut providers = sample_providers();
+        let endpoint_template = providers[0].endpoints[0].clone();
+        providers[0].endpoints = (0..14)
+            .map(|index| UpstreamSummary {
+                name: format!("endpoint-{index}"),
+                provider_endpoint_key: format!("endpoint:sha256:scroll-{index}"),
+                origin: Some(if index == 13 {
+                    "https://bottom-endpoint-marker.example.test".to_string()
+                } else {
+                    format!("https://provider-{index}.example.test")
+                }),
+                ..endpoint_template.clone()
+            })
+            .collect();
+        providers[0].routable_endpoints = providers[0].endpoints.len();
+        let mut ui = UiState {
+            page: Page::Routing,
+            overlay: Overlay::ProviderInfo,
+            selected_provider_idx: 0,
+            provider_info_scroll: u16::MAX,
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        let text = render_app_text_with_providers(100, 24, &mut ui, &snapshot, &providers);
+
+        assert!(ui.provider_info_scroll > 0);
+        assert!(ui.provider_info_scroll < u16::MAX);
+        assert!(text.contains("bottom-endpoint-marker"), "{text}");
+    }
+
+    #[test]
+    fn provider_info_and_routing_choose_the_same_latest_equal_rank_balance() {
+        let mut snapshot = sample_snapshot();
+        snapshot.provider_balances.insert(
+            "input".to_string(),
+            vec![
+                ProviderBalanceSnapshot {
+                    observation_provider_id: "input-observer".to_string(),
+                    provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
+                        "codex", "input", "default",
+                    ),
+                    fetched_at_ms: 1_000,
+                    status: BalanceSnapshotStatus::Ok,
+                    plan_name: Some("old-balance-sample".to_string()),
+                    total_balance_usd: Some("1".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                },
+                ProviderBalanceSnapshot {
+                    observation_provider_id: "input-observer".to_string(),
+                    provider_endpoint: crate::runtime_identity::ProviderEndpointKey::new(
+                        "codex", "input", "default",
+                    ),
+                    fetched_at_ms: 2_000,
+                    status: BalanceSnapshotStatus::Ok,
+                    plan_name: Some("latest-balance-sample".to_string()),
+                    total_balance_usd: Some("2".to_string()),
+                    ..ProviderBalanceSnapshot::default()
+                },
+            ],
+        );
+        let providers = sample_providers();
+        let mut routing_ui = UiState {
+            page: Page::Routing,
+            selected_routing_candidate_idx: 0,
+            language: Language::En,
+            ..UiState::default()
+        };
+        let routing_text =
+            render_app_text_with_providers(132, 30, &mut routing_ui, &snapshot, &providers);
+        let mut provider_ui = UiState {
+            page: Page::Routing,
+            overlay: Overlay::ProviderInfo,
+            selected_provider_idx: 0,
+            provider_info_endpoint_id: Some("default".to_string()),
+            language: Language::En,
+            ..UiState::default()
+        };
+        let provider_text =
+            render_app_text_with_providers(120, 36, &mut provider_ui, &snapshot, &providers);
+
+        for (surface, text) in [("routing", routing_text), ("provider info", provider_text)] {
+            assert!(
+                text.contains("latest-balance-sample"),
+                "{surface} did not render the newest equal-rank balance\n{text}"
+            );
+            assert!(
+                !text.contains("old-balance-sample"),
+                "{surface} rendered the older equal-rank balance\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -783,6 +1042,78 @@ mod tests {
     }
 
     #[test]
+    fn session_binding_menus_explain_fast_and_render_manual_values() {
+        let mut snapshot = sample_snapshot();
+        let mut row = unknown_session_row();
+        row.session_id = Some("session:sha256:binding".to_string());
+        row.active_count = 0;
+        row.binding_profile_name = Some("daily".to_string());
+        row.binding_continuity_mode = Some(crate::state::SessionContinuityMode::ManualProfile);
+        row.binding = crate::state::SessionBindingProjection {
+            revision: "binding:v1:test".to_string(),
+            profile_name: Some("daily".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            service_tier: Some("priority".to_string()),
+            continuity_mode: Some(crate::state::SessionContinuityMode::ManualProfile),
+        };
+        snapshot.rows.push(row);
+        let selected_index = snapshot.rows.len() - 1;
+        let mut ui = UiState {
+            page: Page::Sessions,
+            overlay: Overlay::SessionServiceTierMenu,
+            language: Language::En,
+            session_service_tier_menu_idx: 2,
+            selected_session_idx: selected_index,
+            selected_sessions_page_idx: selected_index,
+            ..UiState::default()
+        };
+
+        let modal = render_app_text(104, 32, &mut ui, &snapshot);
+        assert!(modal.contains("fast (upstream priority)"), "{modal}");
+        assert!(
+            modal.contains("fast is sent upstream as priority"),
+            "{modal}"
+        );
+
+        ui.overlay = Overlay::None;
+        let page = render_app_text(132, 36, &mut ui, &snapshot);
+        assert!(
+            page.contains("model=gpt-5.4 effort=high tier=priority"),
+            "{page}"
+        );
+        assert!(page.contains("b profile  M model  E effort"), "{page}");
+    }
+
+    #[test]
+    fn sessions_detail_hints_keep_effort_affinity_and_filter_keys_distinct() {
+        let mut snapshot = sample_snapshot();
+        let mut row = unknown_session_row();
+        row.session_id = Some("session:sha256:key-hints".to_string());
+        snapshot.rows.push(row);
+        let selected_index = snapshot.rows.len() - 1;
+        let mut ui = UiState {
+            page: Page::Sessions,
+            language: Language::En,
+            selected_session_idx: selected_index,
+            selected_sessions_page_idx: selected_index,
+            sessions_details_scroll: u16::MAX,
+            ..UiState::default()
+        };
+
+        let text = render_app_text(132, 36, &mut ui, &snapshot);
+        let compact_text = text_without_whitespace(&text);
+
+        assert!(compact_text.contains("atoggleactive-only"), "{text}");
+        assert!(compact_text.contains("Entereffortmenu"), "{text}");
+        assert!(compact_text.contains("Aadvancedsessionaffinity"), "{text}");
+        assert!(
+            !compact_text.contains("Enteradvancedaffinityactions"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn dashboard_renders_unknown_session_activity() {
         let mut snapshot = sample_snapshot();
         snapshot.rows.push(unknown_session_row());
@@ -797,6 +1128,353 @@ mod tests {
 
         assert!(compact_text.contains("未知"), "{text}");
         assert!(text.contains("RUN"), "{text}");
+    }
+
+    #[test]
+    fn dashboard_keeps_directory_usage_and_request_cache_visible_at_normal_size() {
+        let mut snapshot = sample_snapshot();
+        let mut row = unknown_session_row();
+        row.session_id = Some("session:sha256:runtime".to_string());
+        row.local_session_id = Some("local-session-id".to_string());
+        row.cwd = Some("/work/full/project".to_string());
+        row.last_usage = Some(crate::usage::UsageMetrics {
+            input_tokens: 1_000,
+            output_tokens: 200,
+            cache_read_input_tokens: 700,
+            cache_creation_input_tokens: 50,
+            total_tokens: 1_200,
+            ..Default::default()
+        });
+        row.total_usage = row.last_usage.clone();
+        snapshot.rows.push(row);
+        snapshot.recent.push(
+            serde_json::from_value(serde_json::json!({
+                "id": 7,
+                "session_key": "session:sha256:runtime",
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 200,
+                    "total_tokens": 1200,
+                    "cache_read_input_tokens": 700,
+                    "cache_creation_input_tokens": 50
+                },
+                "observability": {
+                    "attempt_count": 1,
+                    "route_attempt_count": 0,
+                    "retried": false,
+                    "cross_provider_failover": false,
+                    "same_provider_retry": false,
+                    "fast_mode": false,
+                    "streaming": true
+                },
+                "service": "codex",
+                "method": "POST",
+                "path": "/v1/responses",
+                "status_code": 200,
+                "duration_ms": 12,
+                "streaming": true,
+                "ended_at_ms": 1
+            }))
+            .expect("request fixture"),
+        );
+        for width in [120, 132, 140] {
+            let mut ui = UiState {
+                page: Page::Dashboard,
+                language: Language::En,
+                ..UiState::default()
+            };
+
+            let text = render_app_text(width, 40, &mut ui, &snapshot);
+
+            assert!(
+                text.lines()
+                    .any(|line| line.contains("Sessions") && line.contains("Details")),
+                "Dashboard master/detail panels must remain side by side at {width} columns:\n{text}"
+            );
+            assert!(text.contains("/work/full/project"), "{width}:\n{text}");
+            assert!(text.contains("activity:"), "{width}:\n{text}");
+            assert!(text.contains("usage:"), "{width}:\n{text}");
+            assert!(
+                text.lines()
+                    .any(|line| ["TTFB", "In", "Out", "Hit%", "CRead", "CNew"]
+                        .into_iter()
+                        .all(|column| line.contains(column))),
+                "Dashboard request metrics must share one visible table header at {width} columns:\n{text}"
+            );
+            assert!(text.contains("~66.7%"), "{width}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn sessions_keep_usage_columns_visible_at_common_terminal_widths() {
+        let mut snapshot = sample_snapshot();
+        snapshot.rows.push(unknown_session_row());
+
+        for width in [120, 132, 140] {
+            let mut ui = UiState {
+                page: Page::Sessions,
+                language: Language::En,
+                ..UiState::default()
+            };
+
+            let text = render_app_text(width, 40, &mut ui, &snapshot);
+
+            assert!(
+                text.lines().any(|line| ["turns", "Tok", "tok/s"]
+                    .into_iter()
+                    .all(|column| line.contains(column))),
+                "Sessions usage columns must share one visible table header at {width} columns:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn operational_master_detail_pages_stay_side_by_side_at_common_widths() {
+        let snapshot = sample_snapshot();
+        for width in [120, 132, 140] {
+            for (page, master_title, detail_title) in [
+                (Page::Sessions, "Sessions", "Session details"),
+                (Page::Requests, "Requests", "Details"),
+                (Page::ServiceStatus, "service status", "details"),
+            ] {
+                let mut ui = UiState {
+                    page,
+                    language: Language::En,
+                    ..UiState::default()
+                };
+                let text = render_app_text(width, 40, &mut ui, &snapshot);
+
+                assert!(
+                    text.lines().any(|line| {
+                        let line = line.to_ascii_lowercase();
+                        line.contains(&master_title.to_ascii_lowercase())
+                            && line.contains(&detail_title.to_ascii_lowercase())
+                    }),
+                    "{page:?} master/detail panels must remain side by side at {width} columns:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn operational_master_detail_pages_stack_below_common_widths() {
+        let snapshot = sample_snapshot();
+        for (page, master_title, detail_title) in [
+            (Page::Dashboard, "sessions", "details"),
+            (Page::Sessions, "sessions", "session details"),
+            (Page::Requests, "requests", "details"),
+            (Page::ServiceStatus, "service status", "details"),
+        ] {
+            let mut ui = UiState {
+                page,
+                language: Language::En,
+                ..UiState::default()
+            };
+            let text = render_app_text(119, 40, &mut ui, &snapshot);
+            let lines = text
+                .lines()
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>();
+            let master_row = lines
+                .iter()
+                .position(|line| line.contains(&format!("┌{master_title}")))
+                .expect("master panel title");
+            let detail_row = lines
+                .iter()
+                .position(|line| line.contains(&format!("┌{detail_title}")))
+                .expect("detail panel title");
+
+            assert!(
+                detail_row > master_row,
+                "{page:?} must stack below 120 columns:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_details_scroll_reaches_usage_at_common_terminal_height() {
+        let mut snapshot = sample_snapshot();
+        let mut row = unknown_session_row();
+        row.session_id = Some("session:sha256:scrollable".to_string());
+        row.cwd = Some("/work/scrollable/project".to_string());
+        row.last_usage = Some(crate::usage::UsageMetrics {
+            input_tokens: 900,
+            output_tokens: 100,
+            cache_read_input_tokens: 600,
+            cache_creation_input_tokens: 25,
+            total_tokens: 1_000,
+            ..Default::default()
+        });
+        row.total_usage = row.last_usage.clone();
+        snapshot.rows.push(row);
+        let mut ui = UiState {
+            page: Page::Dashboard,
+            language: Language::En,
+            dashboard_details_scroll: u16::MAX,
+            ..UiState::default()
+        };
+
+        let text = render_app_text(120, 24, &mut ui, &snapshot);
+
+        assert!(ui.dashboard_details_scroll > 0);
+        assert!(ui.dashboard_details_scroll < u16::MAX);
+        assert!(text.contains("usage:"), "{text}");
+        assert!(text.contains("cache read/create: 600/25"), "{text}");
+    }
+
+    #[test]
+    fn dashboard_requests_scroll_to_rows_after_the_old_preview_limit() {
+        let mut snapshot = sample_snapshot();
+        let mut session = unknown_session_row();
+        session.session_id = Some("session:sha256:many-requests".to_string());
+        snapshot.rows = vec![session];
+        snapshot.recent = (1..=75)
+            .map(|id| dashboard_request(id, "session:sha256:many-requests"))
+            .collect();
+        let mut ui = UiState {
+            page: Page::Dashboard,
+            focus: Focus::Requests,
+            selected_session_id: Some("session:sha256:many-requests".to_string()),
+            selected_request_idx: 74,
+            selected_request_id: Some(75),
+            ..UiState::default()
+        };
+        ui.requests_table.select(Some(74));
+
+        let text = render_app_text(120, 32, &mut ui, &snapshot);
+
+        assert!(
+            text.contains("Requests [session:sha256:many-requests]"),
+            "{text}"
+        );
+        assert_eq!(ui.requests_table.selected(), Some(74));
+        assert!(ui.requests_table.offset() > 0);
+    }
+
+    #[test]
+    fn remote_history_stacks_and_scrolls_details_on_narrow_terminals() {
+        let snapshot = sample_snapshot();
+
+        for (width, height) in [(76, 24), (60, 20)] {
+            let mut ui = UiState {
+                page: Page::History,
+                language: Language::En,
+                runtime_connection: RuntimeConnectionKind::RemoteObserver,
+                codex_history_sessions: vec![SessionSummary {
+                    id: "history-session-alpha".to_string(),
+                    path: "history-session-alpha.jsonl".into(),
+                    cwd: Some("/work/project-alpha".to_string()),
+                    created_at: Some("2026-07-21T08:00:00Z".to_string()),
+                    updated_at: Some("2026-07-21T09:00:00Z".to_string()),
+                    last_response_at: Some("2026-07-21T09:00:01Z".to_string()),
+                    user_turns: 8,
+                    assistant_turns: 8,
+                    rounds: 8,
+                    first_user_message: Some(
+                        "first line\nsecond line\nthird line\nfourth line\nfifth line".to_string(),
+                    ),
+                    source: SessionSummarySource::LocalFile,
+                    sort_hint_ms: Some(1),
+                }],
+                ..UiState::default()
+            };
+
+            let text = render_app_text(width, height, &mut ui, &snapshot);
+            assert!(
+                text.contains("History sessions (observer-local Codex)"),
+                "{text}"
+            );
+            assert!(text.contains("project-alpha"), "{text}");
+            let list_row = text
+                .lines()
+                .position(|line| line.contains("History sessions"))
+                .expect("history title");
+            let details_row = text
+                .lines()
+                .position(|line| line.contains("Details  PgUp/PgDn"))
+                .expect("history details title");
+            assert!(details_row > list_row, "{width}x{height}\n{text}");
+
+            ui.codex_history_details_scroll = u16::MAX;
+            let _ = render_app_text(width, height, &mut ui, &snapshot);
+            assert!(ui.codex_history_details_scroll > 0);
+            assert!(ui.codex_history_details_scroll < u16::MAX);
+        }
+    }
+
+    #[test]
+    fn history_table_scrolls_to_the_loader_tail_after_external_focus_insertion() {
+        let summary = |index: usize| SessionSummary {
+            id: format!("session-{index}"),
+            path: format!("{index}.jsonl").into(),
+            cwd: None,
+            created_at: None,
+            updated_at: None,
+            last_response_at: None,
+            user_turns: 0,
+            assistant_turns: 0,
+            rounds: 0,
+            first_user_message: None,
+            source: SessionSummarySource::LocalFile,
+            sort_hint_ms: None,
+        };
+        let mut ui = UiState {
+            page: Page::History,
+            language: Language::En,
+            codex_history_sessions: (0..301).map(summary).collect(),
+            selected_codex_history_idx: 300,
+            selected_codex_history_id: Some("session-300".to_string()),
+            ..UiState::default()
+        };
+        ui.codex_history_table.select(Some(300));
+
+        let text = render_app_text(120, 32, &mut ui, &sample_snapshot());
+
+        assert!(text.contains("session-300"), "{text}");
+        assert_eq!(ui.codex_history_table.selected(), Some(300));
+        assert!(ui.codex_history_table.offset() > 0);
+    }
+
+    #[test]
+    fn remote_recent_stacks_and_scrolls_details_on_narrow_terminals() {
+        let snapshot = sample_snapshot();
+
+        for (width, height) in [(76, 24), (60, 20)] {
+            let mut ui = UiState {
+                page: Page::Recent,
+                language: Language::En,
+                runtime_connection: RuntimeConnectionKind::RemoteObserver,
+                codex_recent_rows: vec![RecentCodexRow {
+                    root: "/work/recent-project".to_string(),
+                    branch: Some("main".to_string()),
+                    session_id: "recent-session-alpha".to_string(),
+                    cwd: Some("/work/recent-project/subdirectory".to_string()),
+                    mtime_ms: u64::MAX,
+                }],
+                ..UiState::default()
+            };
+
+            let text = render_app_text(width, height, &mut ui, &snapshot);
+            assert!(
+                text.contains("Recent sessions (observer-local Codex)"),
+                "{text}"
+            );
+            assert!(text.contains("recent-project"), "{text}");
+            let list_row = text
+                .lines()
+                .position(|line| line.contains("Recent sessions"))
+                .expect("recent title");
+            let details_row = text
+                .lines()
+                .position(|line| line.contains("Details  PgUp/PgDn"))
+                .expect("recent details title");
+            assert!(details_row > list_row, "{width}x{height}\n{text}");
+
+            ui.codex_recent_details_scroll = u16::MAX;
+            let _ = render_app_text(width, height, &mut ui, &snapshot);
+            assert!(ui.codex_recent_details_scroll > 0);
+            assert!(ui.codex_recent_details_scroll < u16::MAX);
+        }
     }
 
     #[test]

@@ -584,6 +584,8 @@ pub struct RelayTargetConfig {
     pub admin_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_token_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_patch: Option<CodexClientPatchOverrides>,
 }
 
 pub const CURRENT_CONFIG_VERSION: u32 = 6;
@@ -645,10 +647,38 @@ impl HelperConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodexCompactionConfig {
+    #[serde(
+        default = "default_codex_remote_v2_downgrade",
+        skip_serializing_if = "is_default_codex_remote_v2_downgrade"
+    )]
+    pub remote_v2_downgrade: bool,
+}
+
+impl Default for CodexCompactionConfig {
+    fn default() -> Self {
+        Self {
+            remote_v2_downgrade: default_codex_remote_v2_downgrade(),
+        }
+    }
+}
+
+fn default_codex_remote_v2_downgrade() -> bool {
+    true
+}
+
+fn is_default_codex_remote_v2_downgrade(value: &bool) -> bool {
+    *value == default_codex_remote_v2_downgrade()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServiceRouteConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_patch: Option<CodexClientPatchConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CodexCompactionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -660,6 +690,13 @@ pub struct ServiceRouteConfig {
 }
 
 impl ServiceRouteConfig {
+    pub fn remote_v2_downgrade_enabled(&self) -> bool {
+        self.compaction
+            .as_ref()
+            .map(|compaction| compaction.remote_v2_downgrade)
+            .unwrap_or_else(default_codex_remote_v2_downgrade)
+    }
+
     pub fn ensure_routing_mut(&mut self) -> &mut RouteGraphConfig {
         self.routing.get_or_insert_with(RouteGraphConfig::default)
     }

@@ -193,5 +193,6 @@ mod api_admin;
 mod crash_recovery;
 mod failover;
 mod harness;
+mod http_debug;
 mod openai_images_generation;
 mod routing_profiles;

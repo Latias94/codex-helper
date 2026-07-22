@@ -116,7 +116,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: ConfigCommand,
     },
-    /// Manage provider routing policy and runtime routing views
+    /// Manage provider routing policy and configuration routing previews
     Routing {
         #[command(subcommand)]
         cmd: RoutingCommand,
@@ -164,6 +164,9 @@ pub(crate) enum Command {
         /// Proxy port; defaults to 3211 for Codex and 3210 for Claude
         #[arg(long)]
         port: Option<u16>,
+        /// Select the usage authority; auto prefers the matching canonical store
+        #[arg(long, value_enum, default_value_t = UsageSource::Auto)]
+        source: UsageSource,
         #[command(subcommand)]
         cmd: UsageCommand,
     },
@@ -329,6 +332,36 @@ pub(crate) enum RelayCommand {
         /// Target Claude service
         #[arg(long)]
         claude: bool,
+        /// Override the global Codex client preset for this relay target
+        #[arg(long, value_enum)]
+        preset: Option<CodexClientPresetArg>,
+        /// Removed legacy spelling; use --preset instead
+        #[arg(long = "mode", hide = true, conflicts_with = "preset")]
+        legacy_mode: Option<String>,
+        /// Override Responses WebSocket transport for this relay target
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true
+        )]
+        responses_websocket: Option<bool>,
+        /// Override the global Codex compaction strategy for this relay target
+        #[arg(long, value_enum)]
+        compaction: Option<CodexCompactionStrategyArg>,
+        /// Override OpenAI `/models` translation for this relay target
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true
+        )]
+        translate_models: Option<bool>,
+        /// Override hosted image generation handling for this relay target
+        #[arg(long, value_enum)]
+        hosted_image_generation: Option<CodexHostedImageGenerationArg>,
     },
     /// List configured relay targets
     List,
@@ -340,9 +373,9 @@ pub(crate) enum RelayCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Explain how to disable an explicit Codex switch without changing client config
+    /// Restore the Codex client configuration saved by the active relay switch
     Off,
-    /// Use a relay target; starts local or attaches remote without changing client config
+    /// Use a relay target; starts local or switches Codex to a remote target
     Use {
         /// Target name, for example "local" or "nas"
         target: String,
@@ -458,10 +491,10 @@ pub(crate) enum SwitchCommand {
         #[arg(long, conflicts_with = "port")]
         base_url: Option<String>,
         /// Codex client preset; if omitted, use [codex.client_patch] from helper config
-        #[arg(long, value_enum, conflicts_with = "client_facade")]
+        #[arg(long, value_enum)]
         preset: Option<CodexClientPresetArg>,
         /// Removed legacy spelling; use --preset instead
-        #[arg(long = "mode", hide = true, conflicts_with = "client_facade")]
+        #[arg(long = "mode", hide = true)]
         legacy_mode: Option<String>,
         /// Override Responses WebSocket transport (`--responses-websocket` means true)
         #[arg(
@@ -469,12 +502,11 @@ pub(crate) enum SwitchCommand {
             action = clap::ArgAction::Set,
             num_args = 0..=1,
             default_missing_value = "true",
-            require_equals = true,
-            conflicts_with = "client_facade"
+            require_equals = true
         )]
         responses_websocket: Option<bool>,
         /// Override the Codex client compaction strategy
-        #[arg(long, value_enum, conflicts_with = "client_facade")]
+        #[arg(long, value_enum)]
         compaction: Option<CodexCompactionStrategyArg>,
         /// Override OpenAI `/models` translation (`--translate-models` means true)
         #[arg(
@@ -482,27 +514,12 @@ pub(crate) enum SwitchCommand {
             action = clap::ArgAction::Set,
             num_args = 0..=1,
             default_missing_value = "true",
-            require_equals = true,
-            conflicts_with = "client_facade"
+            require_equals = true
         )]
         translate_models: Option<bool>,
         /// Override hosted image generation handling
-        #[arg(long, value_enum, conflicts_with = "client_facade")]
+        #[arg(long, value_enum)]
         hosted_image_generation: Option<CodexHostedImageGenerationArg>,
-        /// Compatibility shortcut for the reduced client facade surface
-        #[arg(
-            long,
-            value_enum,
-            conflicts_with_all = [
-                "preset",
-                "legacy_mode",
-                "responses_websocket",
-                "compaction",
-                "translate_models",
-                "hosted_image_generation"
-            ]
-        )]
-        client_facade: Option<CodexClientFacadeArg>,
     },
     /// Restore the selector and helper stanza recorded by the explicit switch operation
     Off,
@@ -586,27 +603,6 @@ pub(crate) fn reject_legacy_switch_mode(value: Option<String>) -> CliResult<()> 
     Err(CliError::Other(format!(
         "`--mode {trimmed}` has been removed; use `--preset {replacement}` instead"
     )))
-}
-
-#[derive(ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[value(rename_all = "kebab-case")]
-pub(crate) enum CodexClientFacadeArg {
-    #[default]
-    Compatible,
-    #[value(name = "openai")]
-    OpenAi,
-    #[value(name = "openai-tools")]
-    OpenAiTools,
-}
-
-impl From<CodexClientFacadeArg> for codex_helper_core::codex_switch::CodexClientFacade {
-    fn from(value: CodexClientFacadeArg) -> Self {
-        match value {
-            CodexClientFacadeArg::Compatible => Self::Compatible,
-            CodexClientFacadeArg::OpenAi => Self::OpenAi,
-            CodexClientFacadeArg::OpenAiTools => Self::OpenAiTools,
-        }
-    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1165,7 +1161,7 @@ pub enum UsageCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Show recent requests from the runtime operator read model
+    /// Show recent requests from the selected usage authority
     Tail {
         /// Maximum number of recent entries to print
         #[arg(long, default_value_t = 20)]
@@ -1174,16 +1170,16 @@ pub enum UsageCommand {
         #[arg(long)]
         raw: bool,
     },
-    /// Summarize token usage from the runtime operator read model
+    /// Summarize token usage from the selected usage authority
     Summary {
         /// Maximum number of summary rows to show (sorted by total_tokens desc)
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Group summary rows by provider endpoint, provider, model, or session
-        #[arg(long, value_enum, default_value_t = UsageSummaryBy::ProviderEndpoint)]
+        #[arg(long, value_enum, default_value_t = UsageSummaryBy::Provider)]
         by: UsageSummaryBy,
     },
-    /// Find matching requests in the runtime operator read model
+    /// Find matching requests in the selected usage authority
     Find {
         /// Maximum number of matching entries to print, newest first
         #[arg(long, default_value_t = 20)]
@@ -1198,7 +1194,7 @@ pub enum UsageCommand {
         #[arg(long)]
         provider_endpoint: Option<ProviderEndpointArg>,
         /// Match provider id substring
-        #[arg(long)]
+        #[arg(long, alias = "station")]
         provider: Option<String>,
         /// Match request path substring, for example responses/compact
         #[arg(long)]
@@ -1246,9 +1242,19 @@ pub enum UsageCommand {
 #[value(rename_all = "kebab-case")]
 pub enum UsageSummaryBy {
     ProviderEndpoint,
+    #[value(alias = "station")]
     Provider,
     Model,
     Session,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+pub enum UsageSource {
+    #[default]
+    Auto,
+    Runtime,
+    Store,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1455,33 +1461,12 @@ mod tests {
                     compaction: None,
                     translate_models: None,
                     hosted_image_generation: None,
-                    client_facade: None,
                 },
         }) = cli.command
         else {
             panic!("expected explicit switch-on base URL");
         };
         assert_eq!(base_url, "https://relay.example/v1");
-    }
-
-    #[test]
-    fn switch_on_accepts_explicit_client_facades() {
-        for (label, expected) in [
-            ("compatible", CodexClientFacadeArg::Compatible),
-            ("openai", CodexClientFacadeArg::OpenAi),
-            ("openai-tools", CodexClientFacadeArg::OpenAiTools),
-        ] {
-            let cli =
-                Cli::try_parse_from(["codex-helper", "switch", "on", "--client-facade", label])
-                    .expect("parse client facade");
-            let Some(Command::Switch {
-                cmd: SwitchCommand::On { client_facade, .. },
-            }) = cli.command
-            else {
-                panic!("expected switch-on client facade");
-            };
-            assert_eq!(client_facade, Some(expected));
-        }
     }
 
     #[test]
@@ -1508,7 +1493,6 @@ mod tests {
                     compaction,
                     translate_models,
                     hosted_image_generation,
-                    client_facade,
                     ..
                 },
         }) = cli.command
@@ -1524,7 +1508,6 @@ mod tests {
             hosted_image_generation,
             Some(CodexHostedImageGenerationArg::Disabled)
         );
-        assert_eq!(client_facade, None);
     }
 
     #[test]
@@ -1575,40 +1558,6 @@ mod tests {
     }
 
     #[test]
-    fn switch_on_rejects_client_facade_with_client_patch_overrides() {
-        for args in [
-            vec![
-                "codex-helper",
-                "switch",
-                "on",
-                "--client-facade",
-                "openai",
-                "--preset",
-                "official-relay",
-            ],
-            vec![
-                "codex-helper",
-                "switch",
-                "on",
-                "--client-facade",
-                "openai",
-                "--responses-websocket",
-            ],
-            vec![
-                "codex-helper",
-                "switch",
-                "on",
-                "--client-facade",
-                "openai",
-                "--compaction",
-                "local",
-            ],
-        ] {
-            assert!(Cli::try_parse_from(args).is_err());
-        }
-    }
-
-    #[test]
     fn switch_rejects_removed_mutation_surfaces() {
         for args in [
             vec![
@@ -1631,6 +1580,7 @@ mod tests {
             vec!["codex-helper", "switch", "off", "--codex"],
             vec!["codex-helper", "switch", "status", "--codex"],
             vec!["codex-helper", "switch", "status", "--claude"],
+            vec!["codex-helper", "switch", "on", "--client-facade", "openai"],
             vec!["codex-helper", "switch", "remote-control", "enable"],
             vec!["codex-helper", "switch", "remote-control", "status"],
             vec!["codex-helper", "switch", "remote-control", "check-logs"],
@@ -1795,19 +1745,59 @@ mod tests {
     }
 
     #[test]
-    fn usage_cli_rejects_removed_station_identity() {
-        for args in [
-            vec!["codex-helper", "usage", "summary", "--by", "station"],
-            vec![
-                "codex-helper",
-                "usage",
-                "find",
-                "--station",
-                "legacy-station",
-            ],
-        ] {
-            assert!(Cli::try_parse_from(args).is_err());
-        }
+    fn usage_cli_preserves_station_alias_and_defaults_to_store_aware_provider_summary() {
+        let summary = Cli::try_parse_from([
+            "codex-helper",
+            "usage",
+            "--source",
+            "auto",
+            "summary",
+            "--by",
+            "station",
+        ])
+        .expect("parse station summary alias");
+        let Some(Command::Usage { source, cmd, .. }) = summary.command else {
+            panic!("expected usage summary command");
+        };
+        assert_eq!(source, UsageSource::Auto);
+        assert!(matches!(
+            cmd,
+            UsageCommand::Summary {
+                by: UsageSummaryBy::Provider,
+                ..
+            }
+        ));
+
+        let find = Cli::try_parse_from([
+            "codex-helper",
+            "usage",
+            "find",
+            "--station",
+            "legacy-station",
+        ])
+        .expect("parse station provider alias");
+        let Some(Command::Usage {
+            cmd: UsageCommand::Find { provider, .. },
+            ..
+        }) = find.command
+        else {
+            panic!("expected usage find command");
+        };
+        assert_eq!(provider.as_deref(), Some("legacy-station"));
+
+        let default_summary = Cli::try_parse_from(["codex-helper", "usage", "summary"])
+            .expect("parse default usage summary");
+        assert!(matches!(
+            default_summary.command,
+            Some(Command::Usage {
+                source: UsageSource::Auto,
+                cmd: UsageCommand::Summary {
+                    by: UsageSummaryBy::Provider,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2265,25 +2255,71 @@ mod tests {
     }
 
     #[test]
-    fn relay_cli_rejects_removed_client_preset() {
-        for removed in [
-            vec!["--preset", "chatgpt-bridge"],
-            vec!["--mode", "official-relay"],
-            vec!["--responses-websocket"],
-        ] {
-            let mut args = vec![
-                "ch",
-                "relay",
-                "add",
-                "nas",
-                "--proxy-url",
-                "http://nas.local:3211",
-                "--admin-token-env",
-                "NAS_ADMIN_TOKEN",
-            ];
-            args.extend(removed);
-            assert!(Cli::try_parse_from(args).is_err());
-        }
+    fn relay_cli_parses_target_client_patch_overrides() {
+        let cli = Cli::try_parse_from([
+            "ch",
+            "relay",
+            "add",
+            "nas",
+            "--proxy-url",
+            "http://nas.local:3211",
+            "--preset",
+            "official-imagegen",
+            "--responses-websocket=false",
+            "--compaction",
+            "remote-v1",
+            "--translate-models",
+            "--hosted-image-generation",
+            "disabled",
+        ])
+        .expect("parse relay target client patch");
+
+        let Some(Command::Relay {
+            cmd:
+                RelayCommand::Add {
+                    preset,
+                    responses_websocket,
+                    compaction,
+                    translate_models,
+                    hosted_image_generation,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected relay add command");
+        };
+        assert_eq!(preset, Some(CodexClientPresetArg::OfficialImagegen));
+        assert_eq!(responses_websocket, Some(false));
+        assert_eq!(compaction, Some(CodexCompactionStrategyArg::RemoteV1));
+        assert_eq!(translate_models, Some(true));
+        assert_eq!(
+            hosted_image_generation,
+            Some(CodexHostedImageGenerationArg::Disabled)
+        );
+    }
+
+    #[test]
+    fn relay_add_legacy_mode_returns_a_canonical_preset_hint() {
+        let cli = Cli::try_parse_from([
+            "ch",
+            "relay",
+            "add",
+            "nas",
+            "--proxy-url",
+            "http://nas.local:3211",
+            "--mode",
+            "official-imagegen-bridge",
+        ])
+        .expect("legacy relay mode is parsed so the CLI can return a migration hint");
+        let Some(Command::Relay {
+            cmd: RelayCommand::Add { legacy_mode, .. },
+        }) = cli.command
+        else {
+            panic!("expected relay add command");
+        };
+
+        let error = reject_legacy_switch_mode(legacy_mode).expect_err("legacy mode must fail");
+        assert!(error.to_string().contains("--preset official-imagegen"));
     }
 
     #[test]

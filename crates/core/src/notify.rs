@@ -816,6 +816,7 @@ mod tests {
     ) -> OperatorRequestSummary {
         OperatorRequestSummary {
             id: 1,
+            trace_key: None,
             session_key: Some(
                 crate::dashboard_core::operator_summary::operator_session_key(thread_id),
             ),
@@ -828,6 +829,7 @@ mod tests {
             route_path: Vec::new(),
             upstream_origin: None,
             usage: None,
+            cache_accounting_convention: Default::default(),
             cost: Default::default(),
             retry: None,
             provider_signal_codes: Vec::new(),

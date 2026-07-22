@@ -407,7 +407,12 @@ async fn responses_websocket_never_replays_auth_handshake_failures_and_refreshes
                     } else {
                         axum::response::IntoResponse::into_response((
                             status,
-                            Json(serde_json::json!({ "error": "auth failed" })),
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "API_KEY_REQUIRED",
+                                    "message": "API key is required in Authorization header"
+                                }
+                            })),
                         ))
                     }
                 }
@@ -557,6 +562,124 @@ async fn responses_websocket_never_replays_auth_handshake_failures_and_refreshes
         proxy_handle.abort();
         primary_handle.abort();
         backup_handle.abort();
+    }
+
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_generic_handshake_rejections_do_not_refresh_or_cool_http_inference() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    for (status, body) in [
+        (
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":{"code":"websocket_auth_scheme_unsupported","message":"use query authorization for websocket upgrade"}}"#,
+        ),
+        (
+            StatusCode::UPGRADE_REQUIRED,
+            r#"{"error":{"message":"websocket beta required"}}"#,
+        ),
+    ] {
+        let inference_hits = Arc::new(AtomicUsize::new(0));
+        let inference_hits_for_route = Arc::clone(&inference_hits);
+        let upstream = axum::Router::new().route(
+            "/v1/responses",
+            get(move || async move {
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response
+            })
+            .post(move || {
+                let inference_hits = Arc::clone(&inference_hits_for_route);
+                async move {
+                    inference_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "id": "resp-http-healthy",
+                        "object": "response",
+                        "output": []
+                    }))
+                }
+            }),
+        );
+        let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+        let mut source =
+            single_provider_websocket_config(upstream_addr, SchedulingPreset::Balanced, 1);
+        source
+            .codex
+            .providers
+            .get_mut("single")
+            .expect("single provider")
+            .auth = UpstreamAuth {
+            auth_token_ref: Some(crate::config::CredentialRef::Native {
+                name: "relay.single".to_string(),
+            }),
+            ..UpstreamAuth::default()
+        };
+        let (credential_sources, credential_control) =
+            crate::credentials::CredentialSourceCapabilities::test_native(
+                crate::credentials::SecretValue::new(b"generation-a".to_vec())
+                    .expect("valid initial credential"),
+            );
+        let runtime_store = Arc::new(
+            crate::runtime_store::RuntimeStore::open_in_memory().expect("open runtime store"),
+        );
+        let proxy = ProxyService::new_with_runtime_store_and_credential_sources(
+            Client::new(),
+            Arc::new(source),
+            "codex",
+            runtime_store,
+            credential_sources,
+        )
+        .expect("build credential-backed proxy");
+        assert_eq!(credential_control.read_count(), 1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let refresh_driver = proxy.spawn_credential_refresh_driver(shutdown_rx);
+        let app = crate::proxy::router(proxy);
+        let (proxy_addr, proxy_handle) = spawn_axum_server(app);
+
+        let error = tokio_tungstenite::connect_async(test_websocket_request(
+            proxy_addr,
+            "ws-generic-handshake-rejection",
+        ))
+        .await
+        .expect_err("upstream handshake rejection must be returned to the client");
+        let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("expected HTTP handshake rejection, got {error:?}");
+        };
+        assert_eq!(response.status(), status);
+
+        let inference = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/responses"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-5","input":"HTTP remains healthy"}"#)
+            .send()
+            .await
+            .expect("send HTTP inference after WebSocket handshake rejection");
+        assert_eq!(inference.status(), StatusCode::OK, "status={status}");
+        let _ = inference.bytes().await.expect("read inference response");
+        assert_eq!(inference_hits.load(Ordering::SeqCst), 1, "status={status}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            credential_control.read_count(),
+            1,
+            "status={status} must not schedule a native credential refresh"
+        );
+
+        shutdown_tx.send(true).expect("signal refresh shutdown");
+        refresh_driver.await.expect("join refresh driver");
+        proxy_handle.abort();
+        upstream_handle.abort();
     }
 
     let _ = std::fs::remove_dir_all(codex_home);
@@ -1248,6 +1371,152 @@ async fn responses_websocket_logical_failures_are_durable_but_health_neutral() {
     let _ = std::fs::remove_dir_all(codex_home);
 }
 
+#[tokio::test]
+async fn responses_websocket_incomplete_half_open_probe_is_neutral_and_once_per_epoch() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut socket| async move {
+                if socket.recv().await.is_some() {
+                    send_logical_failure_websocket_response(
+                        &mut socket,
+                        "resp-half-open-incomplete",
+                        "response.incomplete",
+                    )
+                    .await;
+                }
+            })
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let (proxy, proxy_addr, proxy_handle) =
+        spawn_single_provider_websocket_proxy(upstream_addr, SchedulingPreset::Balanced, 1);
+    let state = Arc::clone(&proxy.state);
+    let endpoint = ProviderEndpointKey::new("codex", "single", "default");
+    let identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&endpoint)
+        .await;
+    state
+        .penalize_runtime_upstream_attempt_for_domain(
+            "codex",
+            &identity,
+            crate::endpoint_health::RuntimeHealthDomain::Capability(
+                crate::endpoint_health::RouteCapability::ResponsesWebSocket,
+            ),
+            30,
+            crate::endpoint_health::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+
+    let mut socket = connect_test_websocket(proxy_addr, "ws-half-open-incomplete").await;
+    send_test_response_create(&mut socket, "incomplete half-open").await;
+    assert_eq!(
+        next_test_websocket_json(&mut socket).await["type"].as_str(),
+        Some("response.created")
+    );
+    assert_eq!(
+        next_test_websocket_json(&mut socket).await["type"].as_str(),
+        Some("response.incomplete")
+    );
+    socket
+        .close(None)
+        .await
+        .expect("close incomplete probe socket");
+
+    let next = test_websocket_request(proxy_addr, "ws-half-open-incomplete-next");
+    let error = tokio_tungstenite::connect_async(next)
+        .await
+        .expect_err("a neutral half-open terminal must not repeat in the same breaker epoch");
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("expected HTTP half-open rejection, got: {error}");
+    };
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(state.list_recent_finished(10).await.len(), 1);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_failure_does_not_cool_http_inference() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let http_hits = Arc::new(AtomicUsize::new(0));
+    let http_hits_for_route = http_hits.clone();
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut socket| async move {
+                if socket.recv().await.is_some() {
+                    send_failed_websocket_response(&mut socket, "resp-ws-failed").await;
+                }
+            })
+        })
+        .post(move || {
+            let hits = http_hits_for_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "id": "resp-http-healthy",
+                    "object": "response",
+                    "output": []
+                }))
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let (_proxy, proxy_addr, proxy_handle) =
+        spawn_single_provider_websocket_proxy(upstream_addr, SchedulingPreset::Balanced, 1);
+
+    let mut socket = connect_test_websocket(proxy_addr, "ws-health-isolation").await;
+    send_test_response_create(&mut socket, "fail websocket capability").await;
+    assert_eq!(
+        next_test_websocket_json(&mut socket).await["type"].as_str(),
+        Some("response.created")
+    );
+    assert_eq!(
+        next_test_websocket_json(&mut socket).await["type"].as_str(),
+        Some("response.failed")
+    );
+    socket.close(None).await.expect("close WebSocket");
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"still healthy"}"#)
+        .send()
+        .await
+        .expect("send HTTP inference after WebSocket failure");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response
+        .bytes()
+        .await
+        .expect("read HTTP inference response");
+    assert_eq!(http_hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
 async fn run_websocket_failed_terminal_commit_failure(fail_attempt_commit: bool) {
     let _env_guard = env_lock().await;
     let codex_home = make_temp_test_dir();
@@ -1481,7 +1750,7 @@ supports_websockets = true
 }
 
 #[tokio::test]
-async fn responses_websocket_route_unavailable_rejects_before_101_without_request_attempts() {
+async fn responses_websocket_half_open_probe_is_singleflight_and_completed_create_recovers_route() {
     let _env_guard = env_lock().await;
     let codex_home = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -1501,13 +1770,16 @@ supports_websockets = true
 "#,
     );
 
-    let upstream =
-        axum::Router::new().route(
-            "/v1/responses",
-            get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
-                ws.on_upgrade(|_| async move {})
-            }),
-        );
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut socket| async move {
+                if socket.recv().await.is_some() {
+                    send_successful_websocket_response(&mut socket, "resp-half-open").await;
+                }
+            })
+        }),
+    );
     let (u_addr, u_handle) = spawn_axum_server(upstream);
 
     let retry = RetryConfig {
@@ -1542,9 +1814,12 @@ supports_websockets = true
         .runtime_identity_for_provider_endpoint_for_test(&provider_endpoint)
         .await;
     state
-        .penalize_runtime_upstream_attempt(
+        .penalize_runtime_upstream_attempt_for_domain(
             "codex",
             &provider_identity,
+            crate::endpoint_health::RuntimeHealthDomain::Capability(
+                crate::endpoint_health::RouteCapability::ResponsesWebSocket,
+            ),
             30,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,
@@ -1558,18 +1833,284 @@ supports_websockets = true
     let request = format!("ws://{proxy_addr}/v1/responses")
         .into_client_request()
         .expect("ws request");
-    let error = tokio_tungstenite::connect_async(request)
+    let (mut first, first_response) = tokio_tungstenite::connect_async(request)
         .await
-        .expect_err("route unavailability must prevent downstream 101");
+        .expect("the unique cooled route should admit one half-open WebSocket probe");
+    assert_eq!(first_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let second_request = format!("ws://{proxy_addr}/v1/responses")
+        .into_client_request()
+        .expect("second ws request");
+    let error = tokio_tungstenite::connect_async(second_request)
+        .await
+        .expect_err("a dispatched half-open probe must prevent a concurrent second probe");
     let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
-        panic!("expected HTTP route rejection, got: {error}");
+        panic!("expected HTTP half-open rejection, got: {error}");
     };
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(state.list_active_requests().await.is_empty());
-    assert!(state.list_recent_finished(10).await.is_empty());
+
+    send_test_response_create(&mut first, "recover cooled WebSocket route").await;
+    assert_eq!(
+        next_test_websocket_json(&mut first).await["type"].as_str(),
+        Some("response.created")
+    );
+    assert_eq!(
+        next_test_websocket_json(&mut first).await["type"].as_str(),
+        Some("response.completed")
+    );
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let endpoint = runtime.provider_endpoint(&provider_endpoint);
+    assert_eq!(endpoint.failure_count, 0);
+    assert!(!endpoint.cooldown_active);
+
+    first.close(None).await.expect("close recovered WebSocket");
+    let replacement_request = format!("ws://{proxy_addr}/v1/responses")
+        .into_client_request()
+        .expect("replacement ws request");
+    let (_, replacement_response) = tokio_tungstenite::connect_async(replacement_request)
+        .await
+        .expect("a completed half-open probe should restore normal route selection");
+    assert_eq!(
+        replacement_response.status(),
+        StatusCode::SWITCHING_PROTOCOLS
+    );
 
     proxy_handle.abort();
     u_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_client_close_during_active_half_open_create_is_neutral_and_durable() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let create_started = Arc::new(tokio::sync::Notify::new());
+    let create_started_for_route = Arc::clone(&create_started);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let create_started = Arc::clone(&create_started_for_route);
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    if socket.recv().await.is_some() {
+                        create_started.notify_one();
+                        while socket.recv().await.is_some() {}
+                    }
+                })
+            }
+        })
+        .post(|| async {
+            Json(serde_json::json!({
+                "id": "http-stays-healthy-after-client-close",
+                "object": "response",
+                "output": []
+            }))
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let (proxy, proxy_addr, proxy_handle) =
+        spawn_single_provider_websocket_proxy(upstream_addr, SchedulingPreset::Balanced, 1);
+    let state = Arc::clone(&proxy.state);
+    let endpoint = ProviderEndpointKey::new("codex", "single", "default");
+    let identity = proxy
+        .runtime_identity_for_provider_endpoint_for_test(&endpoint)
+        .await;
+    state
+        .penalize_runtime_upstream_attempt_for_domain(
+            "codex",
+            &identity,
+            crate::endpoint_health::RuntimeHealthDomain::Capability(
+                crate::endpoint_health::RouteCapability::ResponsesWebSocket,
+            ),
+            30,
+            crate::endpoint_health::CooldownBackoff {
+                factor: 1,
+                max_secs: 0,
+            },
+        )
+        .await;
+
+    let mut socket = connect_test_websocket(proxy_addr, "ws-client-close-half-open").await;
+    send_test_response_create(&mut socket, "close while active").await;
+    tokio::time::timeout(Duration::from_secs(2), create_started.notified())
+        .await
+        .expect("the half-open response.create should reach upstream");
+    socket
+        .close(None)
+        .await
+        .expect("client closes active websocket");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !state.list_recent_finished(10).await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client-close request should receive a durable terminal");
+    let finished = state.list_recent_finished(10).await;
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].status_code, StatusCode::BAD_GATEWAY.as_u16());
+
+    let http_response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"client closure is not endpoint transport"}"#)
+        .send()
+        .await
+        .expect("send inference after client-side WebSocket close");
+    assert_eq!(
+        http_response.status(),
+        StatusCode::OK,
+        "client closure must not create shared endpoint transport cooldown"
+    );
+
+    let second_request = test_websocket_request(proxy_addr, "ws-client-close-half-open-second");
+    let error = tokio_tungstenite::connect_async(second_request)
+        .await
+        .expect_err("neutral completion must not repeat the same half-open epoch");
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("expected HTTP half-open rejection, got: {error}");
+    };
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+    let _ = std::fs::remove_dir_all(codex_home);
+}
+
+#[tokio::test]
+async fn responses_websocket_three_upstream_disconnects_cool_only_websocket_capability() {
+    let _env_guard = env_lock().await;
+    let codex_home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HOME", &codex_home);
+    }
+    enable_responses_websocket_for_test(&codex_home);
+
+    let disconnects = Arc::new(AtomicUsize::new(0));
+    let disconnects_for_route = Arc::clone(&disconnects);
+    let release_disconnects = Arc::new(tokio::sync::Barrier::new(4));
+    let release_disconnects_for_route = Arc::clone(&release_disconnects);
+    let http_hits = Arc::new(AtomicUsize::new(0));
+    let http_hits_for_route = Arc::clone(&http_hits);
+    let upstream = axum::Router::new().route(
+        "/v1/responses",
+        get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+            let disconnects = Arc::clone(&disconnects_for_route);
+            let release_disconnects = Arc::clone(&release_disconnects_for_route);
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    while let Some(Ok(message)) = socket.recv().await {
+                        if matches!(
+                            message,
+                            axum::extract::ws::Message::Text(_)
+                                | axum::extract::ws::Message::Binary(_)
+                        ) {
+                            disconnects.fetch_add(1, Ordering::SeqCst);
+                            release_disconnects.wait().await;
+                            let _ = socket.close().await;
+                            break;
+                        }
+                    }
+                })
+            }
+        })
+        .post(move || {
+            let http_hits = Arc::clone(&http_hits_for_route);
+            async move {
+                http_hits.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "id": "resp-http-after-ws-disconnects",
+                    "object": "response",
+                    "output": []
+                }))
+            }
+        }),
+    );
+    let (upstream_addr, upstream_handle) = spawn_axum_server(upstream);
+    let (proxy, proxy_addr, proxy_handle) =
+        spawn_single_provider_websocket_proxy(upstream_addr, SchedulingPreset::Balanced, 3);
+    let state = Arc::clone(&proxy.state);
+
+    let mut sockets = Vec::new();
+    for index in 0..3 {
+        sockets.push(
+            connect_test_websocket(
+                proxy_addr,
+                format!("ws-upstream-disconnect-{index}").as_str(),
+            )
+            .await,
+        );
+    }
+    for socket in &mut sockets {
+        send_test_response_create(socket, "disconnect upstream").await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while disconnects.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all three response.create frames should reach upstream before disconnects");
+    release_disconnects.wait().await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.list_recent_finished(10).await.len() < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all upstream disconnects should receive durable terminals");
+    for socket in &mut sockets {
+        let _ = socket.close(None).await;
+    }
+    let finished = state.list_recent_finished(10).await;
+    assert_eq!(finished.len(), 3);
+    assert!(
+        finished
+            .iter()
+            .all(|request| request.status_code == StatusCode::BAD_GATEWAY.as_u16())
+    );
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let inference_health =
+        runtime.provider_endpoint(&ProviderEndpointKey::new("codex", "single", "default"));
+    assert_eq!(inference_health.failure_count, 0);
+    assert!(!inference_health.cooldown_active);
+
+    let http_response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"WebSocket transport is capability-local"}"#)
+        .send()
+        .await
+        .expect("send inference after upstream WebSocket disconnect");
+    assert_eq!(
+        http_response.status(),
+        StatusCode::OK,
+        "post-upgrade WebSocket failures must not cool HTTP inference"
+    );
+    assert_eq!(
+        http_hits.load(Ordering::SeqCst),
+        1,
+        "HTTP inference should still reach the healthy upstream"
+    );
+
+    proxy_handle.abort();
+    upstream_handle.abort();
     let _ = std::fs::remove_dir_all(codex_home);
 }
 
@@ -1905,9 +2446,12 @@ supports_websockets = true
         .await
         .expect("persist route affinity");
     state
-        .penalize_runtime_upstream_attempt(
+        .penalize_runtime_upstream_attempt_for_domain(
             "codex",
             &b_identity,
+            crate::endpoint_health::RuntimeHealthDomain::Capability(
+                crate::endpoint_health::RouteCapability::ResponsesWebSocket,
+            ),
             30,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,
@@ -1929,7 +2473,12 @@ supports_websockets = true
         .await
         .expect("connect proxy websocket");
     state
-        .record_runtime_upstream_attempt_success("codex", &b_identity, crate::logging::now_ms())
+        .record_runtime_upstream_attempt_success_for_capability(
+            "codex",
+            &b_identity,
+            crate::endpoint_health::RouteCapability::ResponsesWebSocket,
+            crate::logging::now_ms(),
+        )
         .await;
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -2974,7 +3523,7 @@ async fn responses_websocket_reuses_one_socket_without_warmup_economics() {
     assert!(warmup.cost.is_unknown(), "warmup must not publish cost");
     assert_eq!(
         state
-            .list_session_stats()
+            .list_session_stats("codex")
             .await
             .get("ws-reuse-session")
             .map(|stats| stats.turns_total)
@@ -3127,7 +3676,7 @@ async fn responses_websocket_reuses_one_socket_without_warmup_economics() {
     assert_eq!(previous_response_id_hits.load(Ordering::SeqCst), 1);
     assert_eq!(
         state
-            .list_session_stats()
+            .list_session_stats("codex")
             .await
             .get("ws-reuse-session")
             .map(|stats| stats.turns_total),

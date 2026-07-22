@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::logging::RetryInfo;
 use crate::policy_actions::PolicyAction;
@@ -252,6 +253,8 @@ pub struct RequestAccountingFacts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_membership: Option<AccountingPoolMembership>,
     pub price_coverage: AccountingPriceCoverage,
+    #[serde(default)]
+    pub cache_accounting_convention: CacheAccountingConvention,
 }
 
 impl RequestAccountingFacts {
@@ -263,6 +266,7 @@ impl RequestAccountingFacts {
             && self.provider_endpoint.is_none()
             && self.pool_membership.is_none()
             && self.price_coverage == AccountingPriceCoverage::Unknown
+            && self.cache_accounting_convention == CacheAccountingConvention::UNKNOWN
     }
 }
 
@@ -596,6 +600,72 @@ pub struct SessionBinding {
     pub last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SessionBindingProjection {
+    #[serde(default)]
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_mode: Option<SessionContinuityMode>,
+}
+
+impl SessionBindingProjection {
+    pub fn from_binding(binding: Option<&SessionBinding>) -> Self {
+        Self {
+            revision: session_binding_revision(binding),
+            profile_name: binding.and_then(|binding| binding.profile_name.clone()),
+            model: binding.and_then(|binding| binding.model.clone()),
+            reasoning_effort: binding.and_then(|binding| binding.reasoning_effort.clone()),
+            service_tier: binding.and_then(|binding| binding.service_tier.clone()),
+            continuity_mode: binding.map(|binding| binding.continuity_mode),
+        }
+    }
+
+    pub fn has_manual_values(&self) -> bool {
+        self.continuity_mode == Some(SessionContinuityMode::ManualProfile)
+            && (self.profile_name.is_some()
+                || self.model.is_some()
+                || self.reasoning_effort.is_some()
+                || self.service_tier.is_some())
+    }
+}
+
+pub fn session_binding_revision(binding: Option<&SessionBinding>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"codex-helper:session-binding-control:v1\0");
+    let Some(binding) = binding else {
+        digest.update([0]);
+        return format!("binding:v1:{:x}", digest.finalize());
+    };
+    digest.update([1]);
+    hash_optional_binding_text(&mut digest, binding.profile_name.as_deref());
+    hash_optional_binding_text(&mut digest, binding.model.as_deref());
+    hash_optional_binding_text(&mut digest, binding.reasoning_effort.as_deref());
+    hash_optional_binding_text(&mut digest, binding.service_tier.as_deref());
+    digest.update([match binding.continuity_mode {
+        SessionContinuityMode::DefaultProfile => 0,
+        SessionContinuityMode::ManualProfile => 1,
+    }]);
+    format!("binding:v1:{:x}", digest.finalize())
+}
+
+fn hash_optional_binding_text(digest: &mut Sha256, value: Option<&str>) {
+    let Some(value) = value else {
+        digest.update([0]);
+        return;
+    };
+    digest.update([1]);
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteValueSource {
@@ -733,6 +803,8 @@ pub struct SessionIdentityCard {
     pub binding_profile_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_continuity_mode: Option<SessionContinuityMode>,
+    #[serde(default)]
+    pub binding: SessionBindingProjection,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_route_decision: Option<RouteDecisionProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -776,6 +848,7 @@ fn empty_session_identity_card(session_id: Option<String>) -> SessionIdentityCar
         avg_output_tokens_per_second: None,
         binding_profile_name: None,
         binding_continuity_mode: None,
+        binding: SessionBindingProjection::default(),
         last_route_decision: None,
         route_affinity: None,
         effective_model: None,
@@ -840,6 +913,7 @@ fn apply_basic_effective_route(card: &mut SessionIdentityCard, binding: Option<&
     );
     card.binding_profile_name = binding.and_then(|binding| binding.profile_name.clone());
     card.binding_continuity_mode = binding.map(|binding| binding.continuity_mode);
+    card.binding = SessionBindingProjection::from_binding(binding);
 }
 
 fn session_identity_sort_key(card: &SessionIdentityCard) -> u64 {

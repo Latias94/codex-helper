@@ -67,7 +67,7 @@ Last updated: 2026-05-31
   Review: review-workstream before accepting completion.
   Evidence: EVIDENCE_AND_GATES.md
   Context: CONTEXT.jsonl plus GitHub Releases API version audit.
-  Handoff: DONE. Uses checkout v6, upload-artifact v7, download-artifact v8, setup-qemu v4, setup-buildx v4, login v4, metadata v6, build-push v7.
+  Handoff: DONE. Uses checkout v6, upload-artifact v7, download-artifact v8, setup-buildx v4, login v4, metadata v6, and build-push v7 on native architecture runners without cross-architecture emulation.
 
 ## M4 - Verification And Closeout
 

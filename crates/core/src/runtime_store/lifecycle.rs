@@ -550,6 +550,15 @@ pub struct LogicalRequestTerminalPayload {
 }
 
 impl LogicalRequestTerminalPayload {
+    fn normalize_legacy_fields(&mut self) {
+        if self.finished_request.accounting.cache_accounting_convention
+            == crate::usage::CacheAccountingConvention::UNKNOWN
+        {
+            self.finished_request.accounting.cache_accounting_convention =
+                self.cache_accounting_convention;
+        }
+    }
+
     fn validate_for_write(&self) -> Result<(), String> {
         if self.runtime_digest.trim().is_empty() {
             return Err("runtime digest is empty".to_string());
@@ -594,6 +603,14 @@ impl LogicalRequestTerminalPayload {
             && (self.billable_usage.is_some() || !self.finished_request.cost.is_unknown())
         {
             return Err("non-economic terminal contains billable usage or known cost".to_string());
+        }
+        if self.finished_request.accounting.cache_accounting_convention
+            != self.cache_accounting_convention
+        {
+            return Err(
+                "finished request cache accounting convention conflicts with terminal economics"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -1169,8 +1186,11 @@ impl<'transaction, 'connection> LifecycleTransaction<'transaction, 'connection> 
     pub(super) fn commit_logical_request_terminal(
         &self,
         logical_request_id: LogicalRequestId,
-        terminal: LogicalRequestTerminal,
+        mut terminal: LogicalRequestTerminal,
     ) -> Result<TerminalDisposition, RuntimeStoreError> {
+        if let Some(payload) = terminal.payload.as_mut() {
+            payload.normalize_legacy_fields();
+        }
         let payload = terminal.payload.as_ref().ok_or_else(|| {
             invariant(
                 "logical request",
@@ -1275,9 +1295,10 @@ impl<'transaction, 'connection> LifecycleTransaction<'transaction, 'connection> 
                     && actual.terminal.outcome == terminal.outcome
                     && actual.terminal.terminal_at_unix_ms == terminal.terminal_at_unix_ms
                     && actual.terminal.economics_state == terminal.economics_state;
-                if envelope_identical
-                    && existing_payload_json.as_deref() == Some(payload_json.as_str())
-                {
+                let payload_identical = existing_payload_json.as_deref()
+                    == Some(payload_json.as_str())
+                    || actual.terminal.payload == terminal.payload;
+                if envelope_identical && payload_identical {
                     Ok(TerminalDisposition::AlreadyIdentical)
                 } else {
                     let detail = if envelope_identical {
@@ -2485,13 +2506,14 @@ fn decode_logical_terminal_payload(
 ) -> Result<Option<LogicalRequestTerminalPayload>, RuntimeStoreError> {
     match (origin, payload_json) {
         (TerminalOrigin::Runtime, Some(payload_json)) => {
-            let payload = serde_json::from_str::<LogicalRequestTerminalPayload>(payload_json)
+            let mut payload = serde_json::from_str::<LogicalRequestTerminalPayload>(payload_json)
                 .map_err(|error| {
-                    invalid_metadata(
-                        path,
-                        format!("logical terminal payload is invalid: {error}"),
-                    )
-                })?;
+                invalid_metadata(
+                    path,
+                    format!("logical terminal payload is invalid: {error}"),
+                )
+            })?;
+            payload.normalize_legacy_fields();
             payload.validate_for_write().map_err(|error| {
                 invalid_metadata(
                     path,

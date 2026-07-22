@@ -2,12 +2,14 @@ mod attached;
 mod fleet_refresh;
 mod i18n;
 mod input;
+mod local_session_enrichment;
 mod model;
 mod operator_actions;
 mod operator_projection;
 mod report;
 mod runtime_refresh;
 mod session_refresh;
+mod settings_relay;
 mod snapshot_refresh;
 mod state;
 mod terminal;
@@ -41,8 +43,10 @@ use crate::proxy::ProxyService;
 use crate::state::ProxyState;
 
 use self::fleet_refresh::{
-    FleetRefreshResult, FleetRefreshSource, apply_fleet_refresh_result, start_fleet_refresh,
+    FleetRefreshResult, FleetRefreshSource, apply_fleet_refresh_result,
+    local_session_metadata_for_fleet, start_fleet_refresh,
 };
+use self::local_session_enrichment::LocalSessionEnrichmentCache;
 use self::model::{Palette, Snapshot};
 use self::operator_actions::{
     OperatorActionOutcome, apply_operator_action_outcome, start_integrated_operator_action,
@@ -50,6 +54,7 @@ use self::operator_actions::{
 use self::operator_projection::apply_operator_read_model;
 use self::runtime_refresh::{
     DashboardTiming, apply_pending_refresh_requests, handle_ticker_refreshes,
+    maybe_queue_stale_balance_refresh,
 };
 use self::session_refresh::{
     CodexHistoryRefreshResult, CodexRecentRefreshResult, apply_codex_history_refresh_result,
@@ -85,10 +90,12 @@ fn start_integrated_fleet_refresh(
         .operator_read_model
         .clone()
         .unwrap_or_else(|| crate::dashboard_core::OperatorReadModel::disconnected(ui.service_name));
+    let local_sessions = local_session_metadata_for_fleet(ui);
     start_fleet_refresh(
         ui,
         FleetRefreshSource::Integrated {
             model: Box::new(model),
+            local_sessions,
             cfg: cfg.clone(),
         },
         tx,
@@ -120,6 +127,7 @@ struct RenderSurfaceKey {
     selected_stats_provider_endpoint_idx: usize,
     selected_stats_provider_idx: usize,
     stats_provider_detail_scroll: u16,
+    selected_service_status_idx: usize,
     provider_info_scroll: u16,
     session_transcript_scroll: u16,
 }
@@ -151,6 +159,7 @@ impl RenderSurfaceKey {
             selected_stats_provider_endpoint_idx: ui.selected_stats_provider_endpoint_idx,
             selected_stats_provider_idx: ui.selected_stats_provider_idx,
             stats_provider_detail_scroll: ui.stats_provider_detail_scroll,
+            selected_service_status_idx: ui.selected_service_status_idx,
             provider_info_scroll: ui.provider_info_scroll,
             session_transcript_scroll: ui.session_transcript_scroll,
         }
@@ -253,20 +262,25 @@ pub async fn run_dashboard(
 
     let mut snapshot = Snapshot::default();
     let mut providers = Vec::new();
-    let mut local_session_ids = std::collections::HashMap::new();
-    let initial_model = match proxy.operator_read_capture().await {
+    let mut local_session_enrichment = LocalSessionEnrichmentCache::default();
+    let (initial_model, initial_local_sessions) = match proxy.operator_read_capture().await {
         Ok(capture) => {
-            local_session_ids = capture.local_session_ids;
-            capture.model
+            let local_sessions = local_session_enrichment
+                .resolve(capture.local_sessions)
+                .await;
+            (capture.model, local_sessions)
         }
-        Err(_) => crate::dashboard_core::OperatorReadModel::disconnected(service_name),
+        Err(_) => (
+            crate::dashboard_core::OperatorReadModel::disconnected(service_name),
+            local_session_enrichment.current(),
+        ),
     };
     apply_operator_read_model(
         &mut ui,
         &mut snapshot,
         &mut providers,
         initial_model,
-        &local_session_ids,
+        &initial_local_sessions,
     );
     let (snapshot_refresh_tx, mut snapshot_refresh_rx) =
         mpsc::unbounded_channel::<SnapshotRefreshResult>();
@@ -306,6 +320,13 @@ pub async fn run_dashboard(
                     &snapshot,
                     &mut snapshot_refresh,
                 );
+                if maybe_queue_stale_balance_refresh(&mut ui, &snapshot) {
+                    start_integrated_operator_action(
+                        &mut ui,
+                        &proxy,
+                        operator_action_tx.clone(),
+                    );
+                }
                 if ui.page == types::Page::Fleet
                     && !ui.fleet_loading
                     && ui
@@ -332,20 +353,23 @@ pub async fn run_dashboard(
                 if let Some(result) = maybe_snapshot_refresh {
                     snapshot_refresh.finish(result.generation);
                     if snapshot_refresh.result_is_current(&result) {
-                        let model = match result.capture {
+                        let (model, local_sessions) = match result.capture {
                             Ok(capture) => {
-                                local_session_ids = capture.local_session_ids;
-                                capture.model
+                                let local_sessions = local_session_enrichment
+                                    .resolve(capture.local_sessions)
+                                    .await;
+                                (capture.model, local_sessions)
                             }
                             Err(_error) => {
-                                ui.operator_read_model
+                                let model = ui.operator_read_model
                                     .as_ref()
                                     .map(crate::dashboard_core::OperatorReadModel::stale_from)
                                     .unwrap_or_else(|| {
                                         crate::dashboard_core::OperatorReadModel::disconnected(
                                             service_name,
                                         )
-                                    })
+                                    });
+                                (model, local_session_enrichment.current())
                             }
                         };
                         apply_operator_read_model(
@@ -353,7 +377,7 @@ pub async fn run_dashboard(
                             &mut snapshot,
                             &mut providers,
                             model,
-                            &local_session_ids,
+                            &local_sessions,
                         );
                         request_redraw(&mut render_invalidation);
                     }
@@ -456,4 +480,18 @@ pub async fn run_dashboard(
     }
 
     leave_dashboard_terminal(term_guard, &mut terminal)
+}
+
+#[cfg(test)]
+mod render_surface_key_tests {
+    use super::{RenderSurfaceKey, UiState};
+
+    #[test]
+    fn service_status_selection_invalidates_the_surface() {
+        let mut ui = UiState::default();
+        let baseline = RenderSurfaceKey::capture(&ui);
+
+        ui.selected_service_status_idx = 1;
+        assert_ne!(RenderSurfaceKey::capture(&ui), baseline);
+    }
 }

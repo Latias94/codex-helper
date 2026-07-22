@@ -1,7 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, Wrap,
+};
 
 use crate::state::{ResolvedRouteValue, RouteValueSource};
 use crate::tui::i18n;
@@ -13,7 +16,7 @@ use crate::tui::model::{
     shorten, shorten_middle, status_style, tokens_short, usage_line_lang,
 };
 use crate::tui::state::UiState;
-use crate::tui::view::widgets::kv_line;
+use crate::tui::view::widgets::{kv_line, master_detail_fits, max_wrapped_vertical_scroll};
 
 pub(super) fn render_sessions_page(
     f: &mut Frame<'_>,
@@ -24,15 +27,35 @@ pub(super) fn render_sessions_page(
 ) {
     let lang = ui.language;
     let l = |text| i18n::label(lang, text);
+    let (direction, constraints) = if master_detail_fits(area, 60, 70, 48) {
+        (
+            Direction::Horizontal,
+            [Constraint::Percentage(60), Constraint::Percentage(40)],
+        )
+    } else {
+        (
+            Direction::Vertical,
+            [Constraint::Percentage(42), Constraint::Percentage(58)],
+        )
+    };
     let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .direction(direction)
+        .constraints(constraints)
         .split(area);
 
     let filtered = ui.filtered_sessions_page_indices(snapshot);
 
+    let manual_count = snapshot
+        .rows
+        .iter()
+        .filter(|row| row.binding.has_manual_values())
+        .count();
+    let manual_label = match lang {
+        crate::tui::Language::Zh => "手动",
+        crate::tui::Language::En => "manual",
+    };
     let title = format!(
-        "{}  ({}: {}, {}: {})",
+        "{}  ({}: {}, {}: {}, {}: {}, {}: {})",
         l("Sessions"),
         l("active_only"),
         if ui.sessions_page_active_only {
@@ -45,7 +68,15 @@ pub(super) fn render_sessions_page(
             l("on")
         } else {
             l("off")
-        }
+        },
+        l("overrides_only"),
+        if ui.sessions_page_overrides_only {
+            l("on")
+        } else {
+            l("off")
+        },
+        manual_label,
+        manual_count,
     );
     let left_block = Block::default()
         .title(Span::styled(
@@ -56,7 +87,9 @@ pub(super) fn render_sessions_page(
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
-    let header = Row::new([
+    let table_width = columns[0].width;
+    let compact_table = table_width < 96;
+    let header = Row::new(vec![
         l("Session"),
         l("CWD"),
         "A",
@@ -65,7 +98,7 @@ pub(super) fn render_sessions_page(
         l("turns"),
         "Tok",
         "tok/s",
-        l("profile"),
+        if compact_table { "Ctl" } else { "Control" },
     ])
     .style(Style::default().fg(p.muted))
     .height(1);
@@ -76,14 +109,13 @@ pub(super) fn render_sessions_page(
         .filter_map(|idx| snapshot.rows.get(*idx))
         .map(|row| {
             let sid = row
-                .session_id
-                .as_deref()
-                .map(|s| short_sid(s, 18))
+                .display_session_id()
+                .map(|s| short_sid(s, if compact_table { 12 } else { 18 }))
                 .unwrap_or_else(|| "-".to_string());
             let cwd = row
                 .cwd
                 .as_deref()
-                .map(|s| shorten(basename(s), 16))
+                .map(|s| shorten(basename(s), if compact_table { 7 } else { 16 }))
                 .unwrap_or_else(|| "-".to_string());
             let active = row.active_count.to_string();
             let status = row
@@ -98,11 +130,7 @@ pub(super) fn render_sessions_page(
                 .map(|u| tokens_short(u.total_tokens))
                 .unwrap_or_else(|| "-".to_string());
             let tok_per_second = format_tok_per_second(row.last_output_tokens_per_second);
-            let profile = row
-                .binding_profile_name
-                .as_deref()
-                .map(|s| shorten(s, 12))
-                .unwrap_or_else(|| "-".to_string());
+            let control = session_control_table_label(row, if compact_table { 3 } else { 18 });
 
             let mut style = Style::default().fg(p.text);
             if row.last_status.is_some_and(|s| s >= 500) {
@@ -110,7 +138,7 @@ pub(super) fn render_sessions_page(
             } else if row.last_status.is_some_and(|s| s >= 400) {
                 style = style.fg(p.warn);
             }
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(sid),
                 Cell::from(Span::styled(cwd, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(
@@ -123,25 +151,38 @@ pub(super) fn render_sessions_page(
                 )),
                 Cell::from(Span::styled(status, status_style(p, row.last_status))),
                 Cell::from(Span::styled(last, Style::default().fg(p.muted))),
+            ];
+            cells.extend([
                 Cell::from(Span::styled(turns, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(tok, Style::default().fg(p.muted))),
                 Cell::from(Span::styled(tok_per_second, Style::default().fg(p.accent))),
-                Cell::from(Span::styled(
-                    profile,
-                    Style::default().fg(if row.binding_profile_name.is_some() {
-                        p.accent
-                    } else {
-                        p.muted
-                    }),
-                )),
-            ])
-            .style(style)
+            ]);
+            cells.push(Cell::from(Span::styled(
+                control,
+                Style::default().fg(if row.binding.has_manual_values() {
+                    p.accent
+                } else {
+                    p.muted
+                }),
+            )));
+            Row::new(cells).style(style)
         })
         .collect::<Vec<_>>();
 
-    let table = Table::new(
-        rows,
-        [
+    let widths = if compact_table {
+        vec![
+            Constraint::Length(12),
+            Constraint::Min(7),
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Length(3),
+        ]
+    } else {
+        vec![
             Constraint::Length(18),
             Constraint::Length(18),
             Constraint::Length(3),
@@ -150,14 +191,15 @@ pub(super) fn render_sessions_page(
             Constraint::Length(6),
             Constraint::Length(5),
             Constraint::Length(7),
-            Constraint::Min(8),
-        ],
-    )
-    .header(header)
-    .block(left_block)
-    .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
-    .highlight_symbol("  ")
-    .highlight_spacing(HighlightSpacing::Always);
+            Constraint::Min(12),
+        ]
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(left_block)
+        .row_highlight_style(Style::default().bg(Color::Rgb(32, 39, 48)))
+        .highlight_symbol("  ")
+        .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, columns[0], &mut ui.sessions_page_table);
 
     let selected = filtered
@@ -165,7 +207,7 @@ pub(super) fn render_sessions_page(
         .and_then(|idx| snapshot.rows.get(*idx));
     let mut lines = Vec::new();
     if let Some(row) = selected {
-        let sid_full = row.session_id.as_deref().unwrap_or("-");
+        let sid_full = row.display_session_id().unwrap_or("-");
         let cwd_full = row
             .cwd
             .as_deref()
@@ -275,6 +317,21 @@ pub(super) fn render_sessions_page(
         ));
         lines.push(kv_line(
             p,
+            "manual",
+            format!(
+                "model={} effort={} tier={}",
+                row.binding.model.as_deref().unwrap_or("-"),
+                row.binding.reasoning_effort.as_deref().unwrap_or("-"),
+                row.binding.service_tier.as_deref().unwrap_or("-")
+            ),
+            Style::default().fg(if row.binding.has_manual_values() {
+                p.accent
+            } else {
+                p.muted
+            }),
+        ));
+        lines.push(kv_line(
+            p,
             l("control"),
             posture.headline,
             Style::default().fg(posture.color),
@@ -285,6 +342,15 @@ pub(super) fn render_sessions_page(
             posture.detail,
             Style::default().fg(p.muted),
         ));
+        if ui.can_mutate_session_binding() {
+            lines.push(Line::from("  b profile  M model  E effort  f fast/tier"));
+            lines.push(Line::from(match lang {
+                crate::tui::Language::Zh => "  l/m/h/X 快速 effort  x 清除 effort  R 重置手动控制",
+                crate::tui::Language::En => {
+                    "  l/m/h/X quick effort  x clear effort  R reset manual controls"
+                }
+            }));
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             l("Observed route"),
@@ -424,13 +490,19 @@ pub(super) fn render_sessions_page(
             crate::tui::Language::En => "  e toggle errors-only",
         }));
         lines.push(Line::from(match lang {
+            crate::tui::Language::Zh => "  v 切换仅手动控制",
+            crate::tui::Language::En => "  v toggle manual-controls-only",
+        }));
+        lines.push(Line::from(match lang {
             crate::tui::Language::Zh => "  r 重置筛选",
             crate::tui::Language::En => "  r reset filters",
         }));
         lines.push(Line::from(match (lang, ui.can_mutate_session_affinity()) {
-            (crate::tui::Language::Zh, true) => "  Enter 会话 affinity 高级操作（仅空闲会话）",
+            (crate::tui::Language::Zh, true) => {
+                "  Enter effort 菜单  A 会话 affinity 高级操作（仅空闲会话）"
+            }
             (crate::tui::Language::En, true) => {
-                "  Enter advanced affinity actions (idle sessions only)"
+                "  Enter effort menu  A advanced session affinity actions (idle sessions only)"
             }
             (crate::tui::Language::Zh, false) if ui.runtime_connection.is_remote_observer() => {
                 "  affinity 操作：远程只读"
@@ -441,18 +513,34 @@ pub(super) fn render_sessions_page(
             (crate::tui::Language::Zh, false) => "  affinity 操作：当前只读",
             (crate::tui::Language::En, false) => "  affinity actions: currently read-only",
         }));
-        lines.push(Line::from(match lang {
-            crate::tui::Language::Zh => "  t 打开对话记录（全屏）",
-            crate::tui::Language::En => "  t transcript (full-screen)",
-        }));
+        if !ui.can_mutate_session_binding() {
+            lines.push(Line::from(match lang {
+                crate::tui::Language::Zh if ui.runtime_connection.is_remote_observer() => {
+                    "  会话字段控制：远程只读"
+                }
+                crate::tui::Language::En if ui.runtime_connection.is_remote_observer() => {
+                    "  session field controls: remote read-only"
+                }
+                crate::tui::Language::Zh => "  会话字段控制：当前只读",
+                crate::tui::Language::En => "  session field controls: currently read-only",
+            }));
+        }
         lines.push(Line::from(match lang {
             crate::tui::Language::Zh => "  o 在 Requests 中打开会话",
             crate::tui::Language::En => "  o open session in Requests",
         }));
-        lines.push(Line::from(match lang {
-            crate::tui::Language::Zh => "  H 在 History 中打开会话",
-            crate::tui::Language::En => "  H open session in History",
-        }));
+        if ui.can_bridge_runtime_sessions_to_local_codex()
+            && row.local_command_session_id().is_some()
+        {
+            lines.push(Line::from(match lang {
+                crate::tui::Language::Zh => "  t 打开对话记录（全屏）",
+                crate::tui::Language::En => "  t transcript (full-screen)",
+            }));
+            lines.push(Line::from(match lang {
+                crate::tui::Language::Zh => "  H 在 History 中打开会话",
+                crate::tui::Language::En => "  H open session in History",
+            }));
+        }
     } else {
         lines.push(Line::from(Span::styled(
             l("No sessions match the current filters."),
@@ -462,18 +550,64 @@ pub(super) fn render_sessions_page(
 
     let right_block = Block::default()
         .title(Span::styled(
-            l("Session details"),
+            format!("{}  PgUp/PgDn", l("Session details")),
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.border))
         .style(Style::default().bg(p.panel));
 
+    let inner = right_block.inner(columns[1]);
+    let max_scroll = max_wrapped_vertical_scroll(&lines, inner.width, inner.height);
+    ui.sessions_details_scroll = ui.sessions_details_scroll.min(max_scroll);
     let content = Paragraph::new(Text::from(lines))
         .block(right_block)
         .style(Style::default().fg(p.text))
+        .scroll((ui.sessions_details_scroll, 0))
         .wrap(Wrap { trim: false });
     f.render_widget(content, columns[1]);
+    if max_scroll > 0 {
+        let mut scrollbar = ScrollbarState::new(usize::from(max_scroll) + 1)
+            .position(usize::from(ui.sessions_details_scroll));
+        let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(p.border));
+        f.render_stateful_widget(widget, columns[1], &mut scrollbar);
+    }
+}
+
+fn session_control_table_label(row: &crate::tui::model::SessionRow, max: usize) -> String {
+    if !row.binding.has_manual_values() {
+        return "-".to_string();
+    }
+    if max <= 3 {
+        return "[M]".to_string();
+    }
+
+    let value = row
+        .binding
+        .profile_name
+        .as_deref()
+        .map(|value| format!("p={value}"))
+        .or_else(|| {
+            row.binding
+                .model
+                .as_deref()
+                .map(|value| format!("m={value}"))
+        })
+        .or_else(|| {
+            row.binding
+                .reasoning_effort
+                .as_deref()
+                .map(|value| format!("e={value}"))
+        })
+        .or_else(|| {
+            row.binding
+                .service_tier
+                .as_deref()
+                .map(|value| format!("t={value}"))
+        })
+        .unwrap_or_default();
+    shorten(format!("[M] {value}").trim(), max)
 }
 
 fn route_value_source_label(source: RouteValueSource, lang: crate::tui::Language) -> &'static str {

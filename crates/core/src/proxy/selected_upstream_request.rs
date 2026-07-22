@@ -38,6 +38,7 @@ pub(super) struct SelectedUpstreamRequestSetupParams<'a> {
     pub(super) effective_service_tier: Option<&'a str>,
     pub(super) client_content_type: Option<&'a str>,
     pub(super) request_body_previews: bool,
+    pub(super) apply_request_filter: bool,
     pub(super) debug_max: usize,
     pub(super) warn_max: usize,
 }
@@ -58,6 +59,7 @@ pub(super) fn prepare_selected_upstream_request(
         effective_service_tier,
         client_content_type,
         request_body_previews,
+        apply_request_filter,
         debug_max,
         warn_max,
     } = params;
@@ -89,7 +91,11 @@ pub(super) fn prepare_selected_upstream_request(
         provider_id: provider_id.as_deref(),
     });
 
-    let filtered_body = proxy.filter.apply_bytes(body_for_selected);
+    let filtered_body = if apply_request_filter {
+        proxy.filter.apply_bytes(body_for_selected)
+    } else {
+        body_for_selected
+    };
     let upstream_request_body_len = filtered_body.len();
     let upstream_body_previews = build_body_previews(
         &filtered_body,
@@ -291,6 +297,7 @@ mod tests {
             effective_service_tier: Some("priority"),
             client_content_type: Some("application/json"),
             request_body_previews: true,
+            apply_request_filter: true,
             debug_max: 128,
             warn_max: 64,
         })
@@ -333,6 +340,7 @@ mod tests {
             effective_service_tier: None,
             client_content_type: Some("application/json"),
             request_body_previews: false,
+            apply_request_filter: true,
             debug_max: 0,
             warn_max: 0,
         });
@@ -368,6 +376,7 @@ mod tests {
             effective_service_tier: None,
             client_content_type: Some("application/json"),
             request_body_previews: false,
+            apply_request_filter: true,
             debug_max: 0,
             warn_max: 0,
         })
@@ -412,6 +421,7 @@ mod tests {
             effective_service_tier: None,
             client_content_type: Some("application/json"),
             request_body_previews: false,
+            apply_request_filter: true,
             debug_max: 0,
             warn_max: 0,
         });

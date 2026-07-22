@@ -1,7 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
-use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Borders, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, Wrap,
+};
 
 use crate::credentials::CredentialReadinessCode;
 use crate::dashboard_core::{
@@ -10,11 +13,13 @@ use crate::dashboard_core::{
 };
 use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot, RuntimeConfigState};
 use crate::tui::model::{
-    Palette, Snapshot, balance_snapshot_rank, provider_balance_brief_lang,
-    provider_balance_compact_lang, shorten_middle,
+    Palette, Snapshot, format_age, latest_provider_balance_fetched_at_ms, now_ms,
+    provider_balance_brief_lang, provider_balance_compact_lang, provider_endpoint_balance_snapshot,
+    shorten_middle,
 };
-use crate::tui::operator_actions::PendingOperatorAction;
+use crate::tui::operator_actions::{PendingOperatorAction, balance_refresh_summary_has_warning};
 use crate::tui::state::UiState;
+use crate::tui::view::widgets::max_wrapped_vertical_scroll;
 use crate::tui::{Language, ProviderOption};
 
 const MASTER_DETAIL_MIN_WIDTH: u16 = 118;
@@ -105,45 +110,79 @@ fn routing_summary_line(routing: &OperatorRoutingSummary, lang: Language) -> Str
     }
 }
 
-fn balance_refresh_status(ui: &UiState) -> String {
-    if ui.runtime_connection.is_remote_observer() {
-        return match ui.language {
+fn balance_sample_age_label_at(
+    snapshot: &Snapshot,
+    lang: Language,
+    current_time_ms: u64,
+) -> String {
+    let Some(fetched_at_ms) = latest_provider_balance_fetched_at_ms(snapshot) else {
+        return match lang {
+            Language::Zh => "余额样本=无".to_string(),
+            Language::En => "balance sample=none".to_string(),
+        };
+    };
+    let age = format_age(current_time_ms, Some(fetched_at_ms));
+    match lang {
+        Language::Zh => format!("余额样本 age={age}"),
+        Language::En => format!("balance sample age={age}"),
+    }
+}
+
+fn balance_refresh_status_at(snapshot: &Snapshot, ui: &UiState, current_time_ms: u64) -> String {
+    let refresh_status = if ui.runtime_connection.is_remote_observer() {
+        match ui.language {
             Language::Zh => "远程只读；余额由 daemon 周期刷新".to_string(),
             Language::En => "remote read-only; balances refresh on the daemon".to_string(),
-        };
-    }
-    if !ui.can_refresh_provider_balances() {
-        return match ui.language {
+        }
+    } else if !ui.can_refresh_provider_balances() {
+        match ui.language {
             Language::Zh => "daemon 不支持本机刷新；当前只读".to_string(),
             Language::En => "daemon does not support local refresh; read-only".to_string(),
-        };
-    }
-    if ui.balance_refresh_in_flight
+        }
+    } else if ui.balance_refresh_in_flight
         || matches!(
             ui.pending_operator_action,
             Some(PendingOperatorAction::RefreshBalances { .. })
         )
     {
-        return match ui.language {
+        match ui.language {
             Language::Zh => "余额/额度刷新中".to_string(),
             Language::En => "balance/quota refresh in progress".to_string(),
-        };
-    }
-    if let Some(error) = ui.last_balance_refresh_error.as_deref() {
-        return match ui.language {
+        }
+    } else if let Some(error) = ui.last_balance_refresh_error.as_deref() {
+        match ui.language {
             Language::Zh => format!("余额/额度刷新失败：{error}"),
             Language::En => format!("balance/quota refresh failed: {error}"),
-        };
-    }
-    ui.last_balance_refresh_message
-        .clone()
-        .unwrap_or_else(|| match ui.language {
-            Language::Zh => "进入本页自动刷新；g 强制全量刷新".to_string(),
-            Language::En => "auto-refreshes on entry; g forces a full refresh".to_string(),
-        })
+        }
+    } else {
+        ui.last_balance_refresh_message
+            .clone()
+            .unwrap_or_else(|| match ui.language {
+                Language::Zh => "进入本页自动刷新；g 强制全量刷新".to_string(),
+                Language::En => "auto-refreshes on entry; g forces a full refresh".to_string(),
+            })
+    };
+    format!(
+        "{refresh_status} | {}",
+        balance_sample_age_label_at(snapshot, ui.language, current_time_ms)
+    )
+}
+
+fn balance_refresh_status(snapshot: &Snapshot, ui: &UiState) -> String {
+    balance_refresh_status_at(snapshot, ui, now_ms())
+}
+
+fn balance_refresh_status_has_warning(ui: &UiState) -> bool {
+    ui.last_balance_refresh_error.is_some()
+        || ui
+            .last_balance_refresh_summary
+            .as_ref()
+            .is_some_and(balance_refresh_summary_has_warning)
 }
 
 fn routing_summary_lines(
+    p: Palette,
+    snapshot: &Snapshot,
     routing: &OperatorRoutingSummary,
     ui: &UiState,
     width: u16,
@@ -154,7 +193,14 @@ fn routing_summary_lines(
             &routing_summary_line(routing, ui.language),
             max_width,
         )),
-        Line::from(shorten_middle(&balance_refresh_status(ui), max_width)),
+        Line::from(Span::styled(
+            shorten_middle(&balance_refresh_status(snapshot, ui), max_width),
+            Style::default().fg(if balance_refresh_status_has_warning(ui) {
+                p.warn
+            } else {
+                p.muted
+            }),
+        )),
     ]
 }
 
@@ -174,16 +220,11 @@ fn balance_for_candidate<'a>(
     snapshot: &'a Snapshot,
     candidate: &OperatorRouteCandidateSummary,
 ) -> Option<&'a ProviderBalanceSnapshot> {
-    snapshot
-        .provider_balances
-        .get(candidate.provider_id.as_str())?
-        .iter()
-        .filter(|balance| balance.provider_endpoint.endpoint_id == candidate.endpoint_id)
-        .min_by(|left, right| {
-            balance_snapshot_rank(left)
-                .cmp(&balance_snapshot_rank(right))
-                .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
-        })
+    provider_endpoint_balance_snapshot(
+        &snapshot.provider_balances,
+        candidate.provider_id.as_str(),
+        candidate.endpoint_id.as_str(),
+    )
 }
 
 fn capacity_label(capacity: Option<&OperatorProviderCapacity>) -> String {
@@ -534,11 +575,11 @@ fn candidate_table_title(ui: &UiState, routing: &OperatorRoutingSummary) -> Stri
     let selected = selected_candidate_number(ui, routing);
     match ui.language {
         Language::Zh => format!(
-            " 候选端点 {selected}/{}  (P 新会话首选) ",
+            " 候选端点 {selected}/{}  (p 新会话首选) ",
             routing.candidates.len()
         ),
         Language::En => format!(
-            " Endpoint candidates {selected}/{}  (P new-session preference) ",
+            " Endpoint candidates {selected}/{}  (p new-session preference) ",
             routing.candidates.len()
         ),
     }
@@ -561,7 +602,13 @@ fn render_candidate_table(
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border));
+        .border_style(Style::default().fg(
+            if ui.routing_detail_available && !ui.routing_detail_focused {
+                p.accent
+            } else {
+                p.border
+            },
+        ));
     let row_height = if layout == RoutingTableLayout::Tiny {
         2
     } else {
@@ -642,6 +689,7 @@ fn push_routing_policy_lines(
     lines: &mut Vec<Line<'static>>,
     p: Palette,
     ui: &UiState,
+    snapshot: &Snapshot,
     routing: &OperatorRoutingSummary,
     max_width: usize,
 ) {
@@ -695,14 +743,27 @@ fn push_routing_policy_lines(
         Language::Zh => format!("调度={}", routing.scheduling_preset.as_str()),
         Language::En => format!("scheduling={}", routing.scheduling_preset.as_str()),
     }));
+    let refresh_status = balance_refresh_status(snapshot, ui);
+    let (refresh_status, sample_age) = refresh_status
+        .split_once(" | ")
+        .map_or((refresh_status.as_str(), None), |(status, sample)| {
+            (status, Some(sample))
+        });
+    let status_style = Style::default().fg(if balance_refresh_status_has_warning(ui) {
+        p.warn
+    } else {
+        p.muted
+    });
     lines.push(Line::from(Span::styled(
-        shorten_middle(&balance_refresh_status(ui), max_width),
-        Style::default().fg(if ui.last_balance_refresh_error.is_some() {
-            p.warn
-        } else {
-            p.muted
-        }),
+        shorten_middle(refresh_status, max_width),
+        status_style,
     )));
+    if let Some(sample_age) = sample_age {
+        lines.push(Line::from(Span::styled(
+            shorten_middle(sample_age, max_width),
+            Style::default().fg(p.muted),
+        )));
+    }
 }
 
 fn selected_candidate_detail_lines(
@@ -715,7 +776,7 @@ fn selected_candidate_detail_lines(
 ) -> Vec<Line<'static>> {
     let max_width = usize::from(width.saturating_sub(4)).max(1);
     let mut lines = Vec::new();
-    push_routing_policy_lines(&mut lines, p, ui, routing, max_width);
+    push_routing_policy_lines(&mut lines, p, ui, snapshot, routing, max_width);
     lines.push(Line::from(""));
     push_routing_action_lines(&mut lines, p, ui);
     lines.push(Line::from(""));
@@ -815,43 +876,6 @@ fn selected_candidate_detail_lines(
             )));
         }
     }
-    lines.push(Line::from(Span::styled(
-        shorten_middle(
-            &match ui.language {
-                Language::Zh => format!(
-                    "余额={}",
-                    balance
-                        .map(|balance| {
-                            provider_balance_compact_lang(balance, max_width, ui.language)
-                        })
-                        .unwrap_or_else(|| "-".to_string())
-                ),
-                Language::En => format!(
-                    "balance={}",
-                    balance
-                        .map(|balance| {
-                            provider_balance_compact_lang(balance, max_width, ui.language)
-                        })
-                        .unwrap_or_else(|| "-".to_string())
-                ),
-            },
-            max_width,
-        ),
-        candidate_style(p, endpoint, balance, new_session_preferred),
-    )));
-    let origin = endpoint
-        .and_then(|endpoint| endpoint.origin.as_deref())
-        .unwrap_or("-");
-    lines.push(Line::from(Span::styled(
-        shorten_middle(
-            &match ui.language {
-                Language::Zh => format!("来源={origin}"),
-                Language::En => format!("origin={origin}"),
-            },
-            max_width,
-        ),
-        Style::default().fg(p.muted),
-    )));
     let mut policy_actions = endpoint
         .map(|endpoint| {
             endpoint
@@ -899,6 +923,43 @@ fn selected_candidate_detail_lines(
         ),
         Style::default().fg(if has_active_cooldown { p.warn } else { p.muted }),
     )));
+    lines.push(Line::from(Span::styled(
+        shorten_middle(
+            &match ui.language {
+                Language::Zh => format!(
+                    "余额={}",
+                    balance
+                        .map(|balance| {
+                            provider_balance_compact_lang(balance, max_width, ui.language)
+                        })
+                        .unwrap_or_else(|| "-".to_string())
+                ),
+                Language::En => format!(
+                    "balance={}",
+                    balance
+                        .map(|balance| {
+                            provider_balance_compact_lang(balance, max_width, ui.language)
+                        })
+                        .unwrap_or_else(|| "-".to_string())
+                ),
+            },
+            max_width,
+        ),
+        candidate_style(p, endpoint, balance, new_session_preferred),
+    )));
+    let origin = endpoint
+        .and_then(|endpoint| endpoint.origin.as_deref())
+        .unwrap_or("-");
+    lines.push(Line::from(Span::styled(
+        shorten_middle(
+            &match ui.language {
+                Language::Zh => format!("来源={origin}"),
+                Language::En => format!("origin={origin}"),
+            },
+            max_width,
+        ),
+        Style::default().fg(p.muted),
+    )));
     let route_path = if candidate.route_path.is_empty() {
         "-".to_string()
     } else {
@@ -920,7 +981,7 @@ fn selected_candidate_detail_lines(
 fn render_routing_detail(
     f: &mut Frame<'_>,
     p: Palette,
-    ui: &UiState,
+    ui: &mut UiState,
     snapshot: &Snapshot,
     providers: &[ProviderOption],
     routing: &OperatorRoutingSummary,
@@ -942,7 +1003,11 @@ fn render_routing_detail(
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.border));
+        .border_style(Style::default().fg(if ui.routing_detail_focused {
+            p.accent
+        } else {
+            p.border
+        }));
     let lines = selected_candidate_detail_lines(
         p,
         ui,
@@ -951,13 +1016,29 @@ fn render_routing_detail(
         routing,
         block.inner(area).width,
     );
+    let inner = block.inner(area);
+    let max_scroll = max_wrapped_vertical_scroll(&lines, inner.width, inner.height);
+    ui.routing_detail_scroll = ui.routing_detail_scroll.min(max_scroll);
     f.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
             .style(Style::default().fg(p.text))
+            .scroll((ui.routing_detail_scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
+    if max_scroll > 0 {
+        let mut scrollbar = ScrollbarState::new(usize::from(max_scroll) + 1)
+            .position(usize::from(ui.routing_detail_scroll));
+        let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight).style(
+            Style::default().fg(if ui.routing_detail_focused {
+                p.accent
+            } else {
+                p.border
+            }),
+        );
+        f.render_stateful_widget(widget, area, &mut scrollbar);
+    }
 }
 
 fn render_legacy_provider_table(
@@ -1050,10 +1131,14 @@ pub(super) fn render_routing_page(
     area: Rect,
 ) {
     let Some(routing) = snapshot.routing.as_ref() else {
+        ui.routing_detail_available = false;
+        ui.routing_detail_focused = false;
+        ui.routing_detail_scroll = 0;
         render_legacy_provider_table(f, p, ui, snapshot, providers, area);
         return;
     };
-    if use_master_detail_layout(area) {
+    ui.routing_detail_available = use_master_detail_layout(area);
+    if ui.routing_detail_available {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -1071,23 +1156,31 @@ pub(super) fn render_routing_page(
         render_routing_detail(f, p, ui, snapshot, providers, routing, columns[1]);
         return;
     }
+    ui.routing_detail_focused = false;
+    ui.routing_detail_scroll = 0;
 
     let layout = RoutingTableLayout::for_width(area.width);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(4), Constraint::Min(3)])
         .split(area);
-    let summary = Paragraph::new(routing_summary_lines(routing, ui, sections[0].width))
-        .block(
-            Block::default()
-                .title(match ui.language {
-                    Language::Zh => " 路由策略 ",
-                    Language::En => " Routing policy ",
-                })
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(p.border)),
-        )
-        .style(Style::default().fg(p.text));
+    let summary = Paragraph::new(routing_summary_lines(
+        p,
+        snapshot,
+        routing,
+        ui,
+        sections[0].width,
+    ))
+    .block(
+        Block::default()
+            .title(match ui.language {
+                Language::Zh => " 路由策略 ",
+                Language::En => " Routing policy ",
+            })
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.border)),
+    )
+    .style(Style::default().fg(p.text));
     f.render_widget(summary, sections[0]);
     render_candidate_table(f, p, ui, snapshot, providers, routing, sections[1], layout);
 }
@@ -1095,6 +1188,7 @@ pub(super) fn render_routing_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage_providers::{UsageProviderConfigDiagnostic, UsageProviderRefreshSummary};
 
     fn endpoint_with_credential(
         readiness: CredentialReadinessCode,
@@ -1179,6 +1273,59 @@ mod tests {
                 RoutingTableLayout::Tiny
             );
         }
+    }
+
+    #[test]
+    fn partial_balance_refresh_uses_warning_status() {
+        let snapshot = Snapshot::default();
+        let ui = UiState {
+            language: Language::Zh,
+            last_balance_refresh_summary: Some(UsageProviderRefreshSummary {
+                providers_configured: 2,
+                providers_rejected: 1,
+                rejected_providers: vec![UsageProviderConfigDiagnostic {
+                    provider_id: "siliconflow".to_string(),
+                    code: "invalid_config".to_string(),
+                    message: "endpoint templates are not supported".to_string(),
+                }],
+                attempted: 1,
+                refreshed: 1,
+                ..Default::default()
+            }),
+            last_balance_refresh_message: Some("余额/额度：成功 1/1，跳过无效配置 1".to_string()),
+            ..UiState::default()
+        };
+
+        assert!(balance_refresh_status_has_warning(&ui));
+        assert!(balance_refresh_status(&snapshot, &ui).contains("成功 1/1"));
+    }
+
+    #[test]
+    fn balance_refresh_status_shows_latest_sample_age() {
+        let mut snapshot = Snapshot::default();
+        snapshot.provider_balances.insert(
+            "input".to_string(),
+            vec![
+                ProviderBalanceSnapshot {
+                    fetched_at_ms: 1_000,
+                    ..ProviderBalanceSnapshot::default()
+                },
+                ProviderBalanceSnapshot {
+                    fetched_at_ms: 4_000,
+                    ..ProviderBalanceSnapshot::default()
+                },
+            ],
+        );
+        let ui = UiState {
+            language: Language::En,
+            ..UiState::default()
+        };
+
+        assert!(balance_refresh_status_at(&snapshot, &ui, 6_500).contains("balance sample age=2s"));
+        assert!(
+            balance_refresh_status_at(&Snapshot::default(), &ui, 6_500)
+                .contains("balance sample=none")
+        );
     }
 
     #[test]

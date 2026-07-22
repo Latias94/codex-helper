@@ -2,19 +2,21 @@ use ratatui::widgets::TableState;
 
 use crate::codex_integration::CodexStartupReadiness;
 use crate::dashboard_core::{
-    ControlProfileOption, OperatorActionCapabilities, OperatorReadModel, OperatorRetrySummary,
+    ControlProfileOption, OperatorActionCapabilities, OperatorLocalSessionMetadata,
+    OperatorReadModel, OperatorRetrySummary,
 };
 use crate::proxy::{OperatorRoutingMutationRequest, OperatorSessionAffinityMutationRequest};
 use crate::sessions::{
     SessionMeta, SessionSummary, SessionSummarySource, SessionTranscriptMessage,
 };
+use crate::usage_providers::UsageProviderRefreshSummary;
 use codex_helper_core::fleet::FleetSnapshot;
 use std::collections::HashMap;
 
 use super::Language;
 use super::i18n::{self, msg};
 use super::model::{
-    Snapshot, codex_recent_window_threshold_ms, filtered_requests_len, now_ms,
+    Snapshot, codex_recent_window_threshold_ms, dashboard_request_filtered_indices, now_ms,
     request_matches_page_filters, request_page_focus_session_id,
 };
 use super::operator_actions::PendingOperatorAction;
@@ -73,7 +75,7 @@ impl RuntimeConnectionKind {
     }
 
     pub(in crate::tui) fn allows_local_codex_switch(self) -> bool {
-        matches!(self, Self::Integrated)
+        !matches!(self, Self::RemoteObserver)
     }
 
     pub(in crate::tui) fn is_remote_observer(self) -> bool {
@@ -203,6 +205,22 @@ pub(in crate::tui) enum RequestControlFilter {
     Actions,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tui) struct SessionBindingEditContext {
+    pub(in crate::tui) session_key: String,
+    pub(in crate::tui) expected_revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tui) struct ProfileMenuSnapshot {
+    pub(in crate::tui) options: Vec<ControlProfileOption>,
+    pub(in crate::tui) configured_default_profile: Option<String>,
+    pub(in crate::tui) effective_default_profile: Option<String>,
+    pub(in crate::tui) runtime_default_profile_override: Option<String>,
+    pub(in crate::tui) control_revision: u64,
+    pub(in crate::tui) catalog_key: String,
+}
+
 impl RequestControlFilter {
     pub(in crate::tui) fn next(self) -> Self {
         match self {
@@ -233,6 +251,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) language: Language,
     pub(in crate::tui) runtime_connection: RuntimeConnectionKind,
     pub(in crate::tui) operator_read_model: Option<OperatorReadModel>,
+    pub(in crate::tui) host_local_sessions: HashMap<String, OperatorLocalSessionMetadata>,
     pub(in crate::tui) operator_action_capabilities: OperatorActionCapabilities,
     pub(in crate::tui) local_operator_transport_available: bool,
     pub(in crate::tui) runtime_status_error: Option<String>,
@@ -244,15 +263,30 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) session_affinity_action_selected_idx: usize,
     pub(in crate::tui) session_affinity_confirmation:
         Option<OperatorSessionAffinityMutationRequest>,
+    pub(in crate::tui) session_binding_edit: Option<SessionBindingEditContext>,
+    pub(in crate::tui) session_profile_menu_idx: usize,
+    pub(in crate::tui) session_model_menu_idx: usize,
+    pub(in crate::tui) session_model_options: Vec<String>,
+    pub(in crate::tui) session_effort_menu_idx: usize,
+    pub(in crate::tui) session_service_tier_menu_idx: usize,
+    pub(in crate::tui) session_binding_input_kind: super::types::SessionBindingInputKind,
+    pub(in crate::tui) session_binding_input: String,
+    pub(in crate::tui) session_binding_input_hint: Option<String>,
     pub(in crate::tui) startup_readiness: Option<CodexStartupReadiness>,
     pub(in crate::tui) selected_provider_idx: usize,
     pub(in crate::tui) selected_routing_candidate_idx: usize,
     pub(in crate::tui) selected_routing_candidate_key: Option<(String, String)>,
     pub(in crate::tui) routing_candidates_visible_rows: usize,
+    pub(in crate::tui) routing_detail_available: bool,
+    pub(in crate::tui) routing_detail_focused: bool,
+    pub(in crate::tui) routing_detail_scroll: u16,
+    pub(in crate::tui) dashboard_details_scroll: u16,
     pub(in crate::tui) selected_session_idx: usize,
     pub(in crate::tui) selected_session_id: Option<String>,
     pub(in crate::tui) selected_request_idx: usize,
+    pub(in crate::tui) selected_request_id: Option<u64>,
     pub(in crate::tui) selected_request_page_idx: usize,
+    pub(in crate::tui) selected_request_page_id: Option<u64>,
     pub(in crate::tui) focused_request_session_id: Option<String>,
     pub(in crate::tui) request_page_errors_only: bool,
     pub(in crate::tui) request_page_scope_session: bool,
@@ -260,6 +294,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_sessions_page_idx: usize,
     pub(in crate::tui) sessions_page_active_only: bool,
     pub(in crate::tui) sessions_page_errors_only: bool,
+    pub(in crate::tui) sessions_page_overrides_only: bool,
     pub(in crate::tui) fleet_snapshot: Option<FleetSnapshot>,
     pub(in crate::tui) fleet_loading: bool,
     pub(in crate::tui) fleet_refresh_generation: u64,
@@ -275,16 +310,35 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) profile_options: Vec<ControlProfileOption>,
     pub(in crate::tui) configured_default_profile: Option<String>,
     pub(in crate::tui) effective_default_profile: Option<String>,
+    pub(in crate::tui) runtime_default_profile_override: Option<String>,
+    pub(in crate::tui) default_profile_control_revision: u64,
+    pub(in crate::tui) profile_catalog_key: String,
+    pub(in crate::tui) profile_menu_snapshot: Option<ProfileMenuSnapshot>,
+    pub(in crate::tui) settings_profile_menu_idx: usize,
+    pub(in crate::tui) settings_scroll: u16,
+    pub(in crate::tui) help_scroll: u16,
+    pub(in crate::tui) sessions_details_scroll: u16,
+    pub(in crate::tui) requests_details_scroll: u16,
+    pub(in crate::tui) codex_relay_diagnostics: super::settings_relay::CodexRelayDiagnosticsState,
+    pub(in crate::tui) codex_relay_live_smoke: super::settings_relay::CodexRelayLiveSmokeState,
     pub(in crate::tui) stats_focus: StatsFocus,
     pub(in crate::tui) stats_errors_only: bool,
     pub(in crate::tui) stats_attention_only: bool,
     pub(in crate::tui) selected_stats_provider_endpoint_idx: usize,
+    pub(in crate::tui) selected_stats_provider_endpoint_key: Option<String>,
     pub(in crate::tui) selected_stats_pool_idx: usize,
     pub(in crate::tui) selected_stats_pool_key: Option<String>,
     pub(in crate::tui) selected_stats_project_idx: usize,
     pub(in crate::tui) selected_stats_project_key: Option<String>,
     pub(in crate::tui) selected_stats_provider_idx: usize,
+    pub(in crate::tui) selected_stats_provider_key: Option<String>,
     pub(in crate::tui) stats_provider_detail_scroll: u16,
+    pub(in crate::tui) selected_service_status_idx: usize,
+    pub(in crate::tui) selected_service_status_key: Option<(String, Option<String>)>,
+    pub(in crate::tui) service_status_visible_rows: usize,
+    pub(in crate::tui) service_status_detail_available: bool,
+    pub(in crate::tui) service_status_detail_focused: bool,
+    pub(in crate::tui) service_status_detail_scroll: u16,
     pub(in crate::tui) needs_snapshot_refresh: bool,
     pub(in crate::tui) pending_operator_action: Option<PendingOperatorAction>,
     pub(in crate::tui) deferred_auto_balance_refresh: bool,
@@ -292,6 +346,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) balance_refresh_in_flight: bool,
     pub(in crate::tui) last_balance_refresh_requested_at: Option<std::time::Instant>,
     pub(in crate::tui) last_balance_refresh_finished_at: Option<std::time::Instant>,
+    pub(in crate::tui) last_balance_refresh_summary: Option<UsageProviderRefreshSummary>,
     pub(in crate::tui) last_balance_refresh_message: Option<String>,
     pub(in crate::tui) last_balance_refresh_error: Option<String>,
     pub(in crate::tui) toast: Option<(String, std::time::Instant)>,
@@ -304,6 +359,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) selected_codex_history_idx: usize,
     pub(in crate::tui) selected_codex_history_id: Option<String>,
     pub(in crate::tui) codex_history_external_focus: Option<CodexHistoryExternalFocus>,
+    pub(in crate::tui) codex_history_details_scroll: u16,
     pub(in crate::tui) codex_recent_rows: Vec<RecentCodexRow>,
     pub(in crate::tui) codex_recent_error: Option<String>,
     pub(in crate::tui) codex_recent_loaded_at_ms: Option<u64>,
@@ -315,6 +371,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) codex_recent_selected_id: Option<String>,
     pub(in crate::tui) codex_recent_raw_cwd: bool,
     pub(in crate::tui) codex_recent_branch_cache: CodexRecentBranchCache,
+    pub(in crate::tui) codex_recent_details_scroll: u16,
     pub(in crate::tui) session_transcript_meta: Option<SessionMeta>,
     pub(in crate::tui) session_transcript_sid: Option<String>,
     pub(in crate::tui) session_transcript_file: Option<String>,
@@ -341,6 +398,7 @@ pub(in crate::tui) struct UiState {
     pub(in crate::tui) stats_providers_table: TableState,
     pub(in crate::tui) stats_pools_table: TableState,
     pub(in crate::tui) stats_projects_table: TableState,
+    pub(in crate::tui) service_status_table: TableState,
     pub(in crate::tui) provider_info_scroll: u16,
     pub(in crate::tui) provider_info_endpoint_id: Option<String>,
 }
@@ -385,6 +443,7 @@ impl Default for UiState {
             language: Language::En,
             runtime_connection: RuntimeConnectionKind::Integrated,
             operator_read_model: None,
+            host_local_sessions: HashMap::new(),
             operator_action_capabilities: OperatorActionCapabilities::default(),
             local_operator_transport_available: true,
             runtime_status_error: None,
@@ -395,15 +454,30 @@ impl Default for UiState {
             routing_confirmation: None,
             session_affinity_action_selected_idx: 0,
             session_affinity_confirmation: None,
+            session_binding_edit: None,
+            session_profile_menu_idx: 0,
+            session_model_menu_idx: 0,
+            session_model_options: Vec::new(),
+            session_effort_menu_idx: 0,
+            session_service_tier_menu_idx: 0,
+            session_binding_input_kind: super::types::SessionBindingInputKind::Model,
+            session_binding_input: String::new(),
+            session_binding_input_hint: None,
             startup_readiness: None,
             selected_provider_idx: 0,
             selected_routing_candidate_idx: 0,
             selected_routing_candidate_key: None,
             routing_candidates_visible_rows: 10,
+            routing_detail_available: false,
+            routing_detail_focused: false,
+            routing_detail_scroll: 0,
+            dashboard_details_scroll: 0,
             selected_session_idx: 0,
             selected_session_id: None,
             selected_request_idx: 0,
+            selected_request_id: None,
             selected_request_page_idx: 0,
+            selected_request_page_id: None,
             focused_request_session_id: None,
             request_page_errors_only: false,
             request_page_scope_session: false,
@@ -411,6 +485,7 @@ impl Default for UiState {
             selected_sessions_page_idx: 0,
             sessions_page_active_only: false,
             sessions_page_errors_only: false,
+            sessions_page_overrides_only: false,
             fleet_snapshot: None,
             fleet_loading: false,
             fleet_refresh_generation: 0,
@@ -426,16 +501,35 @@ impl Default for UiState {
             profile_options: Vec::new(),
             configured_default_profile: None,
             effective_default_profile: None,
+            runtime_default_profile_override: None,
+            default_profile_control_revision: 0,
+            profile_catalog_key: String::new(),
+            profile_menu_snapshot: None,
+            settings_profile_menu_idx: 0,
+            settings_scroll: 0,
+            help_scroll: 0,
+            sessions_details_scroll: 0,
+            requests_details_scroll: 0,
+            codex_relay_diagnostics: Default::default(),
+            codex_relay_live_smoke: Default::default(),
             stats_focus: StatsFocus::Pools,
             stats_errors_only: false,
             stats_attention_only: false,
             selected_stats_provider_endpoint_idx: 0,
+            selected_stats_provider_endpoint_key: None,
             selected_stats_pool_idx: 0,
             selected_stats_pool_key: None,
             selected_stats_project_idx: 0,
             selected_stats_project_key: None,
             selected_stats_provider_idx: 0,
+            selected_stats_provider_key: None,
             stats_provider_detail_scroll: 0,
+            selected_service_status_idx: 0,
+            selected_service_status_key: None,
+            service_status_visible_rows: 10,
+            service_status_detail_available: false,
+            service_status_detail_focused: false,
+            service_status_detail_scroll: 0,
             needs_snapshot_refresh: false,
             pending_operator_action: None,
             deferred_auto_balance_refresh: false,
@@ -443,6 +537,7 @@ impl Default for UiState {
             balance_refresh_in_flight: false,
             last_balance_refresh_requested_at: None,
             last_balance_refresh_finished_at: None,
+            last_balance_refresh_summary: None,
             last_balance_refresh_message: None,
             last_balance_refresh_error: None,
             toast: None,
@@ -455,6 +550,7 @@ impl Default for UiState {
             selected_codex_history_idx: 0,
             selected_codex_history_id: None,
             codex_history_external_focus: None,
+            codex_history_details_scroll: 0,
             codex_recent_rows: Vec::new(),
             codex_recent_error: None,
             codex_recent_loaded_at_ms: None,
@@ -466,6 +562,7 @@ impl Default for UiState {
             codex_recent_selected_id: None,
             codex_recent_raw_cwd: false,
             codex_recent_branch_cache: CodexRecentBranchCache::new(),
+            codex_recent_details_scroll: 0,
             session_transcript_meta: None,
             session_transcript_sid: None,
             session_transcript_file: None,
@@ -492,6 +589,7 @@ impl Default for UiState {
             stats_providers_table: TableState::default(),
             stats_pools_table: TableState::default(),
             stats_projects_table: TableState::default(),
+            service_status_table: TableState::default(),
             provider_info_scroll: 0,
             provider_info_endpoint_id: None,
         }
@@ -499,8 +597,40 @@ impl Default for UiState {
 }
 
 impl UiState {
+    pub(in crate::tui) fn capture_profile_menu_snapshot(&mut self) {
+        self.profile_menu_snapshot = Some(ProfileMenuSnapshot {
+            options: self.profile_options.clone(),
+            configured_default_profile: self.configured_default_profile.clone(),
+            effective_default_profile: self.effective_default_profile.clone(),
+            runtime_default_profile_override: self.runtime_default_profile_override.clone(),
+            control_revision: self.default_profile_control_revision,
+            catalog_key: self.profile_catalog_key.clone(),
+        });
+    }
+
+    pub(in crate::tui) fn profile_menu_options(&self) -> &[ControlProfileOption] {
+        self.profile_menu_snapshot
+            .as_ref()
+            .map_or(self.profile_options.as_slice(), |snapshot| {
+                snapshot.options.as_slice()
+            })
+    }
+
+    pub(in crate::tui) fn clear_profile_menu_snapshot(&mut self) {
+        self.profile_menu_snapshot = None;
+    }
+
     pub(in crate::tui) fn allows_local_codex_switch(&self) -> bool {
         self.service_name == "codex" && self.runtime_connection.allows_local_codex_switch()
+    }
+
+    pub(in crate::tui) fn can_bridge_runtime_sessions_to_local_codex(&self) -> bool {
+        self.service_name == "codex"
+            && match self.runtime_connection {
+                RuntimeConnectionKind::Integrated => true,
+                RuntimeConnectionKind::LocalAttached => self.local_operator_transport_available,
+                RuntimeConnectionKind::RemoteObserver => false,
+            }
     }
 
     fn operator_read_model_allows_actions(&self) -> bool {
@@ -540,6 +670,68 @@ impl UiState {
                 RuntimeConnectionKind::LocalAttached => {
                     self.local_operator_transport_available
                         && self.operator_action_capabilities.mutate_session_affinity
+                }
+                RuntimeConnectionKind::RemoteObserver => false,
+            }
+    }
+
+    pub(in crate::tui) fn can_mutate_session_binding(&self) -> bool {
+        self.operator_read_model_allows_actions()
+            && match self.runtime_connection {
+                RuntimeConnectionKind::Integrated => true,
+                RuntimeConnectionKind::LocalAttached => {
+                    self.local_operator_transport_available
+                        && self.operator_action_capabilities.mutate_session_binding
+                }
+                RuntimeConnectionKind::RemoteObserver => false,
+            }
+    }
+
+    pub(in crate::tui) fn can_reload_runtime(&self) -> bool {
+        self.operator_read_model_allows_actions()
+            && match self.runtime_connection {
+                RuntimeConnectionKind::Integrated => true,
+                RuntimeConnectionKind::LocalAttached => {
+                    self.local_operator_transport_available
+                        && self.operator_action_capabilities.reload_runtime
+                }
+                RuntimeConnectionKind::RemoteObserver => false,
+            }
+    }
+
+    pub(in crate::tui) fn can_mutate_default_profile(&self) -> bool {
+        self.operator_read_model_allows_actions()
+            && match self.runtime_connection {
+                RuntimeConnectionKind::Integrated => true,
+                RuntimeConnectionKind::LocalAttached => {
+                    self.local_operator_transport_available
+                        && self.operator_action_capabilities.mutate_default_profile
+                }
+                RuntimeConnectionKind::RemoteObserver => false,
+            }
+    }
+
+    pub(in crate::tui) fn can_inspect_relay_capabilities(&self) -> bool {
+        self.service_name == "codex"
+            && self.operator_read_model_allows_actions()
+            && match self.runtime_connection {
+                RuntimeConnectionKind::Integrated => true,
+                RuntimeConnectionKind::LocalAttached => {
+                    self.local_operator_transport_available
+                        && self.operator_action_capabilities.inspect_relay_capabilities
+                }
+                RuntimeConnectionKind::RemoteObserver => false,
+            }
+    }
+
+    pub(in crate::tui) fn can_run_relay_live_smoke(&self) -> bool {
+        self.service_name == "codex"
+            && self.operator_read_model_allows_actions()
+            && match self.runtime_connection {
+                RuntimeConnectionKind::Integrated => true,
+                RuntimeConnectionKind::LocalAttached => {
+                    self.local_operator_transport_available
+                        && self.operator_action_capabilities.run_relay_live_smoke
                 }
                 RuntimeConnectionKind::RemoteObserver => false,
             }
@@ -637,6 +829,11 @@ impl UiState {
                     return false;
                 };
                 self.selected_stats_provider_idx = next;
+                self.selected_stats_provider_key = snapshot
+                    .usage_day
+                    .provider_rows
+                    .get(next)
+                    .map(|row| row.name.clone());
                 self.stats_provider_detail_scroll = 0;
                 true
             }
@@ -648,6 +845,11 @@ impl UiState {
                     return false;
                 };
                 self.selected_stats_provider_endpoint_idx = next;
+                self.selected_stats_provider_endpoint_key = snapshot
+                    .usage_day
+                    .provider_endpoint_rows
+                    .get(next)
+                    .map(|row| row.name.clone());
                 true
             }
         }
@@ -661,6 +863,7 @@ impl UiState {
         )
         .unwrap_or(0);
 
+        let previous_routing_candidate_key = self.selected_routing_candidate_key.clone();
         if let Some(routing) = snapshot.routing.as_ref() {
             if let Some((provider_id, endpoint_id)) = self.selected_routing_candidate_key.as_ref()
                 && let Some(index) = routing.candidates.iter().position(|candidate| {
@@ -687,9 +890,15 @@ impl UiState {
                 .candidates
                 .get(self.selected_routing_candidate_idx)
                 .map(|candidate| (candidate.provider_id.clone(), candidate.endpoint_id.clone()));
+            if self.selected_routing_candidate_key != previous_routing_candidate_key {
+                self.routing_detail_scroll = 0;
+            }
         } else {
             self.selected_routing_candidate_idx = 0;
             self.selected_routing_candidate_key = None;
+            self.routing_detail_available = false;
+            self.routing_detail_focused = false;
+            self.routing_detail_scroll = 0;
             clamp_table_selection(&mut self.routing_candidates_table, None, 0);
         }
 
@@ -697,9 +906,6 @@ impl UiState {
             self.selected_session_idx = 0;
             self.selected_session_id = None;
             clamp_table_selection(&mut self.sessions_table, None, 0);
-
-            self.selected_request_idx = 0;
-            clamp_table_selection(&mut self.requests_table, None, 0);
         } else {
             if let Some(sid) = self.selected_session_id.clone()
                 && let Some(idx) = snapshot
@@ -719,15 +925,8 @@ impl UiState {
                 snapshot.rows.len(),
             )
             .unwrap_or(0);
-
-            let req_len = filtered_requests_len(snapshot, self.selected_session_idx);
-            self.selected_request_idx = clamp_table_selection(
-                &mut self.requests_table,
-                Some(self.selected_request_idx),
-                req_len,
-            )
-            .unwrap_or(0);
         }
+        self.sync_dashboard_request_selection(snapshot);
 
         if let Some(pool_key) = self.selected_stats_pool_key.as_deref()
             && let Some(index) = snapshot
@@ -770,6 +969,15 @@ impl UiState {
         self.selected_stats_project_key = selected_pool
             .and_then(|pool| stats_project_row_key(pool, self.selected_stats_project_idx));
 
+        if let Some(endpoint_key) = self.selected_stats_provider_endpoint_key.as_deref()
+            && let Some(index) = snapshot
+                .usage_day
+                .provider_endpoint_rows
+                .iter()
+                .position(|row| row.name == endpoint_key)
+        {
+            self.selected_stats_provider_endpoint_idx = index;
+        }
         let stats_provider_endpoints_len = snapshot.usage_day.provider_endpoint_rows.len();
         self.selected_stats_provider_endpoint_idx = clamp_table_selection(
             &mut self.stats_provider_endpoints_table,
@@ -777,7 +985,22 @@ impl UiState {
             stats_provider_endpoints_len,
         )
         .unwrap_or(0);
+        self.selected_stats_provider_endpoint_key = snapshot
+            .usage_day
+            .provider_endpoint_rows
+            .get(self.selected_stats_provider_endpoint_idx)
+            .map(|row| row.name.clone());
 
+        let previous_stats_provider_key = self.selected_stats_provider_key.clone();
+        if let Some(provider_key) = self.selected_stats_provider_key.as_deref()
+            && let Some(index) = snapshot
+                .usage_day
+                .provider_rows
+                .iter()
+                .position(|row| row.name == provider_key)
+        {
+            self.selected_stats_provider_idx = index;
+        }
         let stats_providers_len = snapshot.usage_day.provider_rows.len();
         self.selected_stats_provider_idx = clamp_table_selection(
             &mut self.stats_providers_table,
@@ -785,9 +1008,18 @@ impl UiState {
             stats_providers_len,
         )
         .unwrap_or(0);
-        if stats_providers_len == 0 {
+        self.selected_stats_provider_key = snapshot
+            .usage_day
+            .provider_rows
+            .get(self.selected_stats_provider_idx)
+            .map(|row| row.name.clone());
+        if stats_providers_len == 0
+            || self.selected_stats_provider_key != previous_stats_provider_key
+        {
             self.stats_provider_detail_scroll = 0;
         }
+
+        self.sync_service_status_selection(snapshot);
     }
 
     pub(in crate::tui) fn reset_table_viewports(&mut self) {
@@ -806,10 +1038,16 @@ impl UiState {
             &mut self.stats_providers_table,
             &mut self.stats_pools_table,
             &mut self.stats_projects_table,
+            &mut self.service_status_table,
         ] {
             *table.offset_mut() = 0;
         }
+        self.routing_detail_scroll = 0;
+        self.dashboard_details_scroll = 0;
         self.stats_provider_detail_scroll = 0;
+        self.codex_history_details_scroll = 0;
+        self.codex_recent_details_scroll = 0;
+        self.service_status_detail_scroll = 0;
     }
 
     pub(in crate::tui) fn sync_providers_table_viewport(
@@ -869,6 +1107,7 @@ impl UiState {
             .candidates
             .get(next)
             .map(|candidate| (candidate.provider_id.clone(), candidate.endpoint_id.clone()));
+        self.routing_detail_scroll = 0;
         true
     }
 
@@ -887,6 +1126,7 @@ impl UiState {
         self.selected_routing_candidate_key =
             Some((candidate.provider_id.clone(), candidate.endpoint_id.clone()));
         self.routing_candidates_table.select(Some(index));
+        self.routing_detail_scroll = 0;
         true
     }
 
@@ -918,6 +1158,92 @@ impl UiState {
             .as_ref()?
             .candidates
             .get(self.selected_routing_candidate_idx)
+    }
+
+    pub(in crate::tui) fn sync_service_status_selection(&mut self, snapshot: &Snapshot) {
+        let keys = service_status_row_keys(snapshot);
+        let previous_key = self.selected_service_status_key.clone();
+        if let Some(key) = previous_key.as_ref()
+            && let Some(index) = keys.iter().position(|candidate| candidate == key)
+        {
+            self.selected_service_status_idx = index;
+        }
+        self.selected_service_status_idx = clamp_table_selection(
+            &mut self.service_status_table,
+            Some(self.selected_service_status_idx),
+            keys.len(),
+        )
+        .unwrap_or(0);
+        self.selected_service_status_key = keys.get(self.selected_service_status_idx).cloned();
+        if self.selected_service_status_key != previous_key {
+            self.service_status_detail_scroll = 0;
+        }
+        if keys.is_empty() {
+            self.service_status_detail_available = false;
+            self.service_status_detail_focused = false;
+            self.service_status_detail_scroll = 0;
+        }
+    }
+
+    pub(in crate::tui) fn sync_service_status_table_viewport(
+        &mut self,
+        snapshot: &Snapshot,
+        visible_rows: usize,
+    ) {
+        self.service_status_visible_rows = visible_rows.max(1);
+        let keys = service_status_row_keys(snapshot);
+        self.selected_service_status_idx = clamp_table_viewport(
+            &mut self.service_status_table,
+            Some(self.selected_service_status_idx),
+            keys.len(),
+            visible_rows,
+        )
+        .unwrap_or(0);
+        self.selected_service_status_key = keys.get(self.selected_service_status_idx).cloned();
+    }
+
+    pub(in crate::tui) fn select_service_status_index(
+        &mut self,
+        snapshot: &Snapshot,
+        index: usize,
+    ) -> bool {
+        let keys = service_status_row_keys(snapshot);
+        let Some(key) = keys.get(index) else {
+            return false;
+        };
+        self.selected_service_status_idx = index;
+        self.selected_service_status_key = Some(key.clone());
+        self.service_status_table.select(Some(index));
+        self.service_status_detail_scroll = 0;
+        true
+    }
+
+    pub(in crate::tui) fn move_service_status_selection(
+        &mut self,
+        snapshot: &Snapshot,
+        delta: i32,
+    ) -> bool {
+        let keys = service_status_row_keys(snapshot);
+        let Some(index) = adjust_table_selection(&mut self.service_status_table, delta, keys.len())
+        else {
+            return false;
+        };
+        self.selected_service_status_idx = index;
+        self.selected_service_status_key = keys.get(index).cloned();
+        self.service_status_detail_scroll = 0;
+        true
+    }
+
+    pub(in crate::tui) fn select_service_status_edge(
+        &mut self,
+        snapshot: &Snapshot,
+        last: bool,
+    ) -> bool {
+        let len = service_status_row_keys(snapshot).len();
+        if len == 0 {
+            return false;
+        }
+        self.select_service_status_index(snapshot, if last { len - 1 } else { 0 })
     }
 
     pub(in crate::tui) fn sync_selected_provider_from_routing(
@@ -1034,9 +1360,11 @@ impl UiState {
                 if self.sessions_page_errors_only && row.last_status.is_some_and(|s| s < 400) {
                     return false;
                 }
+                if self.sessions_page_overrides_only && !row.binding.has_manual_values() {
+                    return false;
+                }
                 true
             })
-            .take(200)
             .map(|(idx, _)| idx)
             .collect()
     }
@@ -1100,25 +1428,101 @@ impl UiState {
             .collect()
     }
 
+    pub(in crate::tui) fn sync_dashboard_request_selection(&mut self, snapshot: &Snapshot) {
+        let visible = dashboard_request_filtered_indices(snapshot, self.selected_session_idx);
+        let previous_id = self.selected_request_id;
+        let selected_idx = previous_id
+            .and_then(|request_id| {
+                visible.iter().position(|request_idx| {
+                    snapshot.recent.get(*request_idx).map(|request| request.id) == Some(request_id)
+                })
+            })
+            .unwrap_or(
+                self.selected_request_idx
+                    .min(visible.len().saturating_sub(1)),
+            );
+        self.selected_request_idx =
+            clamp_table_selection(&mut self.requests_table, Some(selected_idx), visible.len())
+                .unwrap_or(0);
+        self.selected_request_id = visible
+            .get(self.selected_request_idx)
+            .and_then(|request_idx| snapshot.recent.get(*request_idx))
+            .map(|request| request.id);
+    }
+
+    pub(in crate::tui) fn select_dashboard_request_index(
+        &mut self,
+        snapshot: &Snapshot,
+        index: usize,
+    ) -> bool {
+        let visible = dashboard_request_filtered_indices(snapshot, self.selected_session_idx);
+        let Some(request) = visible
+            .get(index)
+            .and_then(|request_idx| snapshot.recent.get(*request_idx))
+        else {
+            return false;
+        };
+        self.selected_request_idx = index;
+        self.selected_request_id = Some(request.id);
+        self.requests_table.select(Some(index));
+        true
+    }
+
     pub(in crate::tui) fn sync_request_page_selection(&mut self, snapshot: &Snapshot) {
-        let len = self.request_page_filtered_indices(snapshot).len();
+        let visible = self.request_page_filtered_indices(snapshot);
+        let previous_id = self.selected_request_page_id;
+        let selected_idx = previous_id
+            .and_then(|request_id| {
+                visible.iter().position(|request_idx| {
+                    snapshot.recent.get(*request_idx).map(|request| request.id) == Some(request_id)
+                })
+            })
+            .unwrap_or(
+                self.selected_request_page_idx
+                    .min(visible.len().saturating_sub(1)),
+            );
         self.selected_request_page_idx = clamp_table_selection(
             &mut self.request_page_table,
-            Some(self.selected_request_page_idx),
-            len,
+            Some(selected_idx),
+            visible.len(),
         )
         .unwrap_or(0);
+        self.selected_request_page_id = visible
+            .get(self.selected_request_page_idx)
+            .and_then(|request_idx| snapshot.recent.get(*request_idx))
+            .map(|request| request.id);
+        if self.selected_request_page_id != previous_id {
+            self.requests_details_scroll = 0;
+        }
+    }
+
+    pub(in crate::tui) fn select_request_page_index(
+        &mut self,
+        snapshot: &Snapshot,
+        index: usize,
+    ) -> bool {
+        let visible = self.request_page_filtered_indices(snapshot);
+        let Some(request) = visible
+            .get(index)
+            .and_then(|request_idx| snapshot.recent.get(*request_idx))
+        else {
+            return false;
+        };
+        self.selected_request_page_idx = index;
+        self.selected_request_page_id = Some(request.id);
+        self.request_page_table.select(Some(index));
+        self.requests_details_scroll = 0;
+        true
     }
 
     pub(in crate::tui) fn sync_codex_history_selection(&mut self) {
-        let len = self.codex_history_sessions.len().min(300);
+        let len = self.codex_history_visible_len();
         let selected_idx = self
             .selected_codex_history_id
             .as_deref()
             .and_then(|sid| {
                 self.codex_history_sessions
                     .iter()
-                    .take(300)
                     .position(|summary| summary.id == sid)
             })
             .unwrap_or(self.selected_codex_history_idx.min(len.saturating_sub(1)));
@@ -1136,13 +1540,16 @@ impl UiState {
         .unwrap_or(0);
     }
 
+    pub(in crate::tui) fn codex_history_visible_len(&self) -> usize {
+        self.codex_history_sessions.len()
+    }
+
     pub(in crate::tui) fn codex_recent_visible_indices(&self, now_ms: u64) -> Vec<usize> {
         let threshold_ms = codex_recent_window_threshold_ms(now_ms, self.codex_recent_window_idx);
         self.codex_recent_rows
             .iter()
             .enumerate()
             .filter(|(_, row)| row.mtime_ms >= threshold_ms)
-            .take(300)
             .map(|(idx, _)| idx)
             .collect()
     }
@@ -1189,8 +1596,28 @@ impl UiState {
         }
         self.selected_codex_history_idx = 0;
         self.selected_codex_history_id = Some(sid);
+        self.codex_history_details_scroll = 0;
         self.sync_codex_history_selection();
     }
+}
+
+fn service_status_row_keys(snapshot: &Snapshot) -> Vec<(String, Option<String>)> {
+    snapshot
+        .service_status
+        .iter()
+        .flat_map(|status| &status.probes)
+        .flat_map(|probe| {
+            if probe.services.is_empty() {
+                vec![(probe.id.clone(), None)]
+            } else {
+                probe
+                    .services
+                    .iter()
+                    .map(|service| (probe.id.clone(), Some(service.model.clone())))
+                    .collect()
+            }
+        })
+        .collect()
 }
 
 fn clamp_table_selection(
@@ -1280,6 +1707,67 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn local_codex_switch_is_available_for_integrated_and_local_attached_modes_only() {
+        for runtime_connection in [
+            RuntimeConnectionKind::Integrated,
+            RuntimeConnectionKind::LocalAttached,
+        ] {
+            let ui = UiState {
+                service_name: "codex",
+                runtime_connection,
+                ..UiState::default()
+            };
+            assert!(ui.allows_local_codex_switch());
+        }
+
+        let remote = UiState {
+            service_name: "codex",
+            runtime_connection: RuntimeConnectionKind::RemoteObserver,
+            ..UiState::default()
+        };
+        assert!(!remote.allows_local_codex_switch());
+    }
+
+    #[test]
+    fn runtime_to_local_codex_bridge_requires_codex_and_local_session_metadata() {
+        let integrated = UiState {
+            service_name: "codex",
+            runtime_connection: RuntimeConnectionKind::Integrated,
+            ..UiState::default()
+        };
+        assert!(integrated.can_bridge_runtime_sessions_to_local_codex());
+
+        let local_attached = UiState {
+            service_name: "codex",
+            runtime_connection: RuntimeConnectionKind::LocalAttached,
+            local_operator_transport_available: true,
+            ..UiState::default()
+        };
+        assert!(local_attached.can_bridge_runtime_sessions_to_local_codex());
+
+        for ui in [
+            UiState {
+                service_name: "codex",
+                runtime_connection: RuntimeConnectionKind::LocalAttached,
+                local_operator_transport_available: false,
+                ..UiState::default()
+            },
+            UiState {
+                service_name: "codex",
+                runtime_connection: RuntimeConnectionKind::RemoteObserver,
+                ..UiState::default()
+            },
+            UiState {
+                service_name: "claude",
+                runtime_connection: RuntimeConnectionKind::Integrated,
+                ..UiState::default()
+            },
+        ] {
+            assert!(!ui.can_bridge_runtime_sessions_to_local_codex());
+        }
+    }
     use crate::dashboard_core::{
         OperatorRequestObservability, OperatorRequestSummary, OperatorRouteCandidateSummary,
         OperatorRoutingSummary,
@@ -1486,6 +1974,7 @@ mod tests {
             avg_output_tokens_per_second: None,
             binding_profile_name: None,
             binding_continuity_mode: None,
+            binding: crate::state::SessionBindingProjection::default(),
             last_route_decision: None,
             route_affinity: None,
             effective_model: None,
@@ -1501,6 +1990,7 @@ mod tests {
     ) -> OperatorRequestSummary {
         OperatorRequestSummary {
             id,
+            trace_key: None,
             session_key: session_id.map(ToOwned::to_owned),
             model: None,
             reasoning_effort: None,
@@ -1511,6 +2001,7 @@ mod tests {
             route_path: Vec::new(),
             upstream_origin: None,
             usage: None,
+            cache_accounting_convention: Default::default(),
             cost: crate::pricing::CostBreakdown::default(),
             retry: None,
             provider_signal_codes: Vec::new(),
@@ -1536,6 +2027,44 @@ mod tests {
             ttfb_ms: None,
             streaming: false,
             ended_at_ms: id,
+        }
+    }
+
+    fn service_status_snapshot(
+        rows: &[(&str, &str)],
+    ) -> codex_helper_core::service_status::ServiceStatusSnapshot {
+        use codex_helper_core::service_status::{
+            ServiceStatusKind, ServiceStatusProbeSnapshot, ServiceStatusServiceSnapshot,
+            ServiceStatusSnapshot,
+        };
+
+        ServiceStatusSnapshot {
+            generated_at_ms: 1,
+            configured: true,
+            enabled: true,
+            refresh_interval_secs: 60,
+            history_cells: 60,
+            probes: rows
+                .iter()
+                .map(|(probe_id, model)| ServiceStatusProbeSnapshot {
+                    id: (*probe_id).to_string(),
+                    url: format!("https://{probe_id}.example"),
+                    fetched_at_ms: 1,
+                    generated_at_ms: None,
+                    all_ok: Some(true),
+                    services: vec![ServiceStatusServiceSnapshot {
+                        model: (*model).to_string(),
+                        uptime_pct: Some("100%".to_string()),
+                        latest_kind: ServiceStatusKind::Ok,
+                        latest: None,
+                        history: Vec::new(),
+                    }],
+                    credential_readiness: None,
+                    credential_details: Vec::new(),
+                    error: None,
+                })
+                .collect(),
+            error: None,
         }
     }
 
@@ -1612,6 +2141,28 @@ mod tests {
     }
 
     #[test]
+    fn codex_recent_visible_indices_do_not_hide_rows_after_three_hundred() {
+        let now = now_ms();
+        let ui = UiState {
+            codex_recent_rows: (0..350)
+                .map(|index| RecentCodexRow {
+                    root: format!("root-{index}"),
+                    branch: None,
+                    session_id: format!("session-{index}"),
+                    cwd: None,
+                    mtime_ms: now,
+                })
+                .collect(),
+            ..UiState::default()
+        };
+
+        let visible = ui.codex_recent_visible_indices(now);
+
+        assert_eq!(visible.len(), 350);
+        assert_eq!(visible.last(), Some(&349));
+    }
+
+    #[test]
     fn sync_sessions_page_selection_updates_global_selection_after_filter() {
         let mut inactive = empty_session_row("sid-inactive");
         inactive.active_count = 0;
@@ -1638,6 +2189,50 @@ mod tests {
     }
 
     #[test]
+    fn sessions_page_keeps_all_operator_rows_reachable() {
+        let snapshot = Snapshot {
+            rows: (0..250)
+                .map(|index| empty_session_row(&format!("sid-{index:03}")))
+                .collect(),
+            ..sample_usage_snapshot()
+        };
+        let mut ui = UiState {
+            selected_session_id: Some("sid-249".to_string()),
+            ..UiState::default()
+        };
+
+        assert_eq!(ui.filtered_sessions_page_indices(&snapshot).len(), 250);
+        ui.sync_sessions_page_selection(&snapshot);
+
+        assert_eq!(ui.selected_sessions_page_idx, 249);
+        assert_eq!(ui.selected_session_idx, 249);
+        assert_eq!(ui.selected_session_id.as_deref(), Some("sid-249"));
+        assert_eq!(ui.sessions_page_table.selected(), Some(249));
+    }
+
+    #[test]
+    fn session_manual_control_filter_uses_binding_projection() {
+        let automatic = empty_session_row("sid-automatic");
+        let mut manual = empty_session_row("sid-manual");
+        manual.binding = crate::state::SessionBindingProjection {
+            revision: "binding:v1:manual".to_string(),
+            reasoning_effort: Some("high".to_string()),
+            continuity_mode: Some(crate::state::SessionContinuityMode::ManualProfile),
+            ..crate::state::SessionBindingProjection::default()
+        };
+        let snapshot = Snapshot {
+            rows: vec![automatic, manual],
+            ..sample_usage_snapshot()
+        };
+        let ui = UiState {
+            sessions_page_overrides_only: true,
+            ..UiState::default()
+        };
+
+        assert_eq!(ui.filtered_sessions_page_indices(&snapshot), vec![1]);
+    }
+
+    #[test]
     fn sync_request_page_selection_clamps_filtered_selection() {
         let snapshot = Snapshot {
             recent: vec![
@@ -1656,6 +2251,100 @@ mod tests {
 
         assert_eq!(ui.selected_request_page_idx, 0);
         assert_eq!(ui.request_page_table.selected(), Some(0));
+    }
+
+    #[test]
+    fn request_selections_follow_request_identity_across_prepend_refresh() {
+        let mut snapshot = Snapshot {
+            rows: vec![empty_session_row("sid")],
+            recent: vec![
+                operator_request(3, Some("sid"), 200),
+                operator_request(2, Some("sid"), 200),
+                operator_request(1, Some("sid"), 200),
+            ],
+            ..sample_usage_snapshot()
+        };
+        let mut ui = UiState {
+            selected_session_id: Some("sid".to_string()),
+            selected_request_idx: 1,
+            selected_request_id: Some(2),
+            selected_request_page_idx: 1,
+            selected_request_page_id: Some(2),
+            ..UiState::default()
+        };
+
+        ui.clamp_selection(&snapshot, 0);
+        ui.sync_request_page_selection(&snapshot);
+        snapshot
+            .recent
+            .insert(0, operator_request(4, Some("sid"), 200));
+        ui.clamp_selection(&snapshot, 0);
+        ui.sync_request_page_selection(&snapshot);
+
+        assert_eq!(ui.selected_request_idx, 2);
+        assert_eq!(ui.selected_request_id, Some(2));
+        assert_eq!(ui.requests_table.selected(), Some(2));
+        assert_eq!(ui.selected_request_page_idx, 2);
+        assert_eq!(ui.selected_request_page_id, Some(2));
+        assert_eq!(ui.request_page_table.selected(), Some(2));
+    }
+
+    #[test]
+    fn dashboard_requests_keep_the_bounded_operator_tail_reachable() {
+        let snapshot = Snapshot {
+            rows: vec![empty_session_row("sid")],
+            recent: (1..=75)
+                .map(|id| operator_request(id, Some("sid"), 200))
+                .collect(),
+            ..sample_usage_snapshot()
+        };
+        let mut ui = UiState {
+            selected_session_id: Some("sid".to_string()),
+            selected_request_idx: 59,
+            selected_request_id: Some(75),
+            ..UiState::default()
+        };
+
+        ui.clamp_selection(&snapshot, 0);
+
+        assert_eq!(dashboard_request_filtered_indices(&snapshot, 0).len(), 75);
+        assert_eq!(ui.selected_request_idx, 74);
+        assert_eq!(ui.selected_request_id, Some(75));
+        assert_eq!(ui.requests_table.selected(), Some(74));
+    }
+
+    #[test]
+    fn service_status_selection_follows_probe_identity_across_reordering() {
+        let before = Snapshot {
+            service_status: Some(service_status_snapshot(&[
+                ("provider-a", "model-a"),
+                ("provider-b", "model-b"),
+            ])),
+            ..sample_usage_snapshot()
+        };
+        let after = Snapshot {
+            service_status: Some(service_status_snapshot(&[
+                ("provider-b", "model-b"),
+                ("provider-a", "model-a"),
+            ])),
+            ..sample_usage_snapshot()
+        };
+        let mut ui = UiState::default();
+
+        assert!(ui.move_service_status_selection(&before, 1));
+        assert_eq!(
+            ui.selected_service_status_key,
+            Some(("provider-b".to_string(), Some("model-b".to_string())))
+        );
+
+        ui.clamp_selection(&after, 0);
+
+        assert_eq!(ui.selected_service_status_idx, 0);
+        assert_eq!(ui.service_status_table.selected(), Some(0));
+        assert_eq!(
+            ui.selected_service_status_key,
+            Some(("provider-b".to_string(), Some("model-b".to_string())))
+        );
     }
 
     #[test]

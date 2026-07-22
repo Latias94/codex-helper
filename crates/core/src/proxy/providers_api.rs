@@ -32,8 +32,14 @@ pub(super) fn enqueue_provider_balance_probe(
     client: reqwest::Client,
     state: Arc<crate::state::ProxyState>,
     target: CapturedRouteCandidate,
+    provider_catalog: Arc<crate::usage_providers::UsageProviderCatalog>,
 ) {
-    crate::usage_providers::enqueue_poll_for_captured_route_candidate(client, state, target);
+    crate::usage_providers::enqueue_poll_for_captured_route_candidate(
+        client,
+        state,
+        target,
+        provider_catalog,
+    );
 }
 
 fn capacity_limit_group(limits: &ProviderConcurrencyLimits) -> Option<String> {
@@ -329,6 +335,7 @@ pub(super) async fn refresh_provider_balances_for_proxy(
         UsageProviderRuntimeCapture::new(
             runtime_snapshot.config(),
             runtime_snapshot.credential_generation(),
+            runtime_snapshot.usage_provider_catalog(),
         ),
         proxy.state.clone(),
         proxy.service_name,

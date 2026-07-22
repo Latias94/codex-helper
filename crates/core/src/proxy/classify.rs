@@ -2,16 +2,92 @@ use axum::http::{HeaderMap, StatusCode};
 use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::endpoint_health::{RouteCapability, RuntimeHealthDomain};
+
 use super::reasoning_guard::{REASONING_GUARD_BLOCKED_CLASS, REASONING_GUARD_TRIGGERED_CLASS};
 
 pub(super) const ROUTING_MISMATCH_CAPABILITY_CLASS: &str = "routing_mismatch_capability";
 pub(super) const UPSTREAM_RATE_LIMITED_CLASS: &str = "upstream_rate_limited";
 pub(super) const UPSTREAM_OVERLOADED_CLASS: &str = "upstream_overloaded";
 pub(super) const CLIENT_ERROR_NON_RETRYABLE_CLASS: &str = "client_error_non_retryable";
+pub(super) const UPSTREAM_CREDENTIAL_CLASS: &str = "upstream_credential_error";
+pub(super) const UPSTREAM_SERVER_ERROR_CLASS: &str = "upstream_server_error";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtocolFailureScope {
+    RequestLocal,
+    Credential,
+    Capacity,
+    Capability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ProtocolFailureDisposition {
+    pub class: &'static str,
+    pub retry_after_secs: Option<u64>,
+    scope: ProtocolFailureScope,
+}
+
+impl ProtocolFailureDisposition {
+    pub fn unknown_upstream_failure() -> Self {
+        Self {
+            class: UPSTREAM_SERVER_ERROR_CLASS,
+            retry_after_secs: None,
+            scope: ProtocolFailureScope::Capability,
+        }
+    }
+
+    pub fn health_domain(self, capability: RouteCapability) -> Option<RuntimeHealthDomain> {
+        match self.scope {
+            ProtocolFailureScope::RequestLocal => None,
+            ProtocolFailureScope::Credential => Some(RuntimeHealthDomain::Credential),
+            ProtocolFailureScope::Capacity => Some(RuntimeHealthDomain::Capacity(capability)),
+            ProtocolFailureScope::Capability => Some(RuntimeHealthDomain::Capability(capability)),
+        }
+    }
+
+    pub fn requires_credential_refresh(self) -> bool {
+        self.scope == ProtocolFailureScope::Credential
+    }
+
+    pub fn applies_immediate_cooldown(self) -> bool {
+        matches!(
+            self.scope,
+            ProtocolFailureScope::Credential | ProtocolFailureScope::Capability
+        )
+    }
+
+    pub fn with_retry_after_headers(mut self, headers: &HeaderMap) -> Self {
+        if self.retry_after_secs.is_none() {
+            self.retry_after_secs = header_value_u64(headers, "retry-after-ms")
+                .map(|millis| millis.div_ceil(1_000))
+                .filter(|seconds| *seconds > 0)
+                .or_else(|| retry_after_secs_from_header(headers, "retry-after"));
+        }
+        self
+    }
+
+    fn with_scope(mut self, scope: ProtocolFailureScope) -> Self {
+        self.scope = scope;
+        self
+    }
+}
 
 pub(super) fn is_credential_auth_failure(status: StatusCode, class: Option<&str>) -> bool {
-    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        && class != Some("cloudflare_challenge")
+    match status {
+        StatusCode::UNAUTHORIZED => class != Some("cloudflare_challenge"),
+        StatusCode::FORBIDDEN => class == Some(UPSTREAM_CREDENTIAL_CLASS),
+        _ => false,
+    }
+}
+
+// A forbidden response needs positive credential evidence; 403 also represents authorization,
+// model-access, and policy failures that credential refresh cannot repair.
+pub(super) fn is_buffered_http_credential_auth_failure(
+    status: StatusCode,
+    class: Option<&str>,
+) -> bool {
+    is_credential_auth_failure(status, class)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,6 +287,223 @@ fn throttle_json_text(v: &Value) -> String {
     parts.join(" ").to_ascii_lowercase()
 }
 
+fn collect_protocol_failure_text(value: &Value, parts: &mut Vec<String>) {
+    collect_throttle_json_text_parts(value, parts);
+    for key in ["error", "response"] {
+        if let Some(nested) = value.get(key)
+            && nested.is_object()
+        {
+            collect_protocol_failure_text(nested, parts);
+        }
+    }
+}
+
+fn protocol_failure_text(value: &Value) -> String {
+    let mut parts = Vec::new();
+    collect_protocol_failure_text(value, &mut parts);
+    parts.join(" ").to_ascii_lowercase()
+}
+
+fn protocol_retry_after_secs(headers: &HeaderMap, value: &Value) -> Option<u64> {
+    header_value_u64(headers, "retry-after-ms")
+        .map(|millis| millis.div_ceil(1_000))
+        .filter(|seconds| *seconds > 0)
+        .or_else(|| retry_after_secs_from_header(headers, "retry-after"))
+        .or_else(|| retry_after_secs_from_json(value))
+        .or_else(|| value.get("response").and_then(retry_after_secs_from_json))
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .and_then(retry_after_secs_from_json)
+        })
+}
+
+fn protocol_failure_indicates_credential(message: &str) -> bool {
+    explicit_credential_failure_evidence(message) || message.contains("unauthorized")
+}
+
+fn explicit_credential_failure_evidence(message: &str) -> bool {
+    [
+        "api_key_required",
+        "invalid_api_key",
+        "api_key_invalid",
+        "missing_api_key",
+        "incorrect_api_key",
+        "authentication_error",
+        "invalid_authentication",
+        "authentication_failed",
+        "authentication_required",
+        "auth_failed",
+        "unauthenticated",
+        "invalid_token",
+        "missing_token",
+        "invalid_bearer_token",
+        "missing_bearer_token",
+        "invalid_access_token",
+        "missing_access_token",
+        "token_expired",
+        "expired_token",
+        "access_token_expired",
+        "auth_token_expired",
+        "token_revoked",
+        "revoked_token",
+        "access_token_revoked",
+        "auth_token_revoked",
+        "invalid_credentials",
+        "missing_credentials",
+        "credentials_expired",
+        "credentials_revoked",
+        "invalid_client",
+    ]
+    .into_iter()
+    .any(|identifier| protocol_failure_has_token(message, identifier))
+        || message.contains("api key is required")
+        || message.contains("api key required")
+        || message.contains("missing api key")
+        || message.contains("invalid api key")
+        || message.contains("incorrect api key")
+        || message.contains("authentication_error")
+        || message.contains("authentication failed")
+        || message.contains("authentication required")
+        || message.contains("auth failed")
+        || message.contains("invalid bearer token")
+        || message.contains("missing bearer token")
+        || message.contains("invalid access token")
+        || message.contains("missing access token")
+        || message.contains("access token is required")
+        || message.contains("access token required")
+        || message.contains("token has expired")
+        || message.contains("token is expired")
+        || message.contains("expired access token")
+        || message.contains("token has been revoked")
+        || message.contains("token was revoked")
+        || message.contains("revoked access token")
+        || message.contains("invalid authorization header")
+        || message.contains("missing authorization header")
+        || message.contains("authorization header is required")
+        || message.contains("authorization header required")
+}
+
+fn protocol_failure_has_token(message: &str, expected: &str) -> bool {
+    message
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|token| token == expected)
+}
+
+fn response_indicates_explicit_credential_failure(headers: &HeaderMap, body: &[u8]) -> bool {
+    let authenticate_header_has_evidence = headers
+        .get_all("www-authenticate")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .any(|value| explicit_credential_failure_evidence(value.as_str()));
+    if authenticate_header_has_evidence {
+        return true;
+    }
+
+    let evidence = serde_json::from_slice::<Value>(body)
+        .ok()
+        .map(|value| protocol_failure_text(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| lower_body_text(body));
+    explicit_credential_failure_evidence(evidence.as_str())
+}
+
+pub(super) fn classify_dedicated_capability_handshake_failure(
+    headers: &HeaderMap,
+    body: &[u8],
+    observed_class: Option<&str>,
+) -> ProtocolFailureDisposition {
+    let value = match observed_class {
+        Some(UPSTREAM_OVERLOADED_CLASS) => {
+            serde_json::json!({ "error": { "message": "overloaded" } })
+        }
+        Some(UPSTREAM_RATE_LIMITED_CLASS) => {
+            serde_json::json!({ "error": { "message": "rate_limited" } })
+        }
+        _ => serde_json::from_slice::<Value>(body).unwrap_or_else(|_| {
+            serde_json::json!({
+                "error": {
+                    "message": String::from_utf8_lossy(body),
+                }
+            })
+        }),
+    };
+    let disposition =
+        classify_protocol_terminal_failure(headers, &value).with_retry_after_headers(headers);
+
+    if response_indicates_explicit_credential_failure(headers, body) {
+        return ProtocolFailureDisposition {
+            class: UPSTREAM_CREDENTIAL_CLASS,
+            retry_after_secs: disposition.retry_after_secs,
+            scope: ProtocolFailureScope::Credential,
+        };
+    }
+
+    match disposition.scope {
+        ProtocolFailureScope::Credential => ProtocolFailureDisposition {
+            class: UPSTREAM_SERVER_ERROR_CLASS,
+            retry_after_secs: disposition.retry_after_secs,
+            scope: ProtocolFailureScope::Capability,
+        },
+        ProtocolFailureScope::RequestLocal => {
+            disposition.with_scope(ProtocolFailureScope::Capability)
+        }
+        ProtocolFailureScope::Capacity | ProtocolFailureScope::Capability => disposition,
+    }
+}
+
+fn protocol_failure_is_request_local(message: &str) -> bool {
+    message.contains("invalid_request_error")
+        || message.contains("invalid_request")
+        || message.contains("validation_error")
+        || message.contains("bad_request")
+        || message.contains("context_length_exceeded")
+        || message.contains("context_window_exceeded")
+        || message.contains("model_not_found")
+        || message.contains("unsupported_model")
+        || message.contains("unsupported_parameter")
+        || message.contains("unsupported_value")
+        || message.contains("content_filter")
+        || message.contains("content_policy")
+        || message.contains("policy_violation")
+        || message.contains("safety_violation")
+        || message.contains("safety refusal")
+        || protocol_failure_has_token(message, "safety")
+        || protocol_failure_has_token(message, "cancelled")
+        || protocol_failure_has_token(message, "canceled")
+}
+
+fn chinese_message_indicates_overloaded(message: &str) -> bool {
+    let concurrency_limited = message.contains("并发")
+        && [
+            "上限", "限制", "已满", "超限", "过多", "最大", "达到", "已达", "耗尽", "用尽", "饱和",
+        ]
+        .into_iter()
+        .any(|signal| message.contains(signal));
+    let queue_limited = message.contains("排队")
+        && [
+            "已满",
+            "等待",
+            "人数",
+            "队列",
+            "进入",
+            "正在",
+            "加入",
+            "过长",
+            "上限",
+            "限制",
+            "超限",
+            "过多",
+            "排队中",
+        ]
+        .into_iter()
+        .any(|signal| message.contains(signal));
+
+    concurrency_limited || queue_limited
+}
+
 fn throttle_message_indicates_overloaded(message: &str) -> bool {
     message.contains("overloaded")
         || message.contains("overloaded_error")
@@ -240,8 +533,7 @@ fn throttle_message_indicates_overloaded(message: &str) -> bool {
         || message.contains("too many concurrent")
         || message.contains("负载已饱和")
         || (message.contains("负载") && message.contains("饱和"))
-        || message.contains("并发")
-        || message.contains("排队")
+        || chinese_message_indicates_overloaded(message)
         || (message.contains("capacity")
             && (message.contains("at capacity")
                 || message.contains("capacity available")
@@ -539,6 +831,45 @@ pub(super) fn classify_upstream_throttle_response(
     }
 }
 
+pub(super) fn classify_protocol_terminal_failure(
+    headers: &HeaderMap,
+    value: &Value,
+) -> ProtocolFailureDisposition {
+    let message = protocol_failure_text(value);
+    let retry_after_secs = protocol_retry_after_secs(headers, value);
+
+    if throttle_message_indicates_overloaded(&message) {
+        return ProtocolFailureDisposition {
+            class: UPSTREAM_OVERLOADED_CLASS,
+            retry_after_secs,
+            scope: ProtocolFailureScope::Capacity,
+        };
+    }
+    if throttle_message_indicates_rate_limited(&message) {
+        return ProtocolFailureDisposition {
+            class: UPSTREAM_RATE_LIMITED_CLASS,
+            retry_after_secs,
+            scope: ProtocolFailureScope::Capability,
+        };
+    }
+    if protocol_failure_indicates_credential(&message) {
+        return ProtocolFailureDisposition {
+            class: UPSTREAM_CREDENTIAL_CLASS,
+            retry_after_secs,
+            scope: ProtocolFailureScope::Credential,
+        };
+    }
+    if protocol_failure_is_request_local(&message) {
+        return ProtocolFailureDisposition {
+            class: CLIENT_ERROR_NON_RETRYABLE_CLASS,
+            retry_after_secs,
+            scope: ProtocolFailureScope::RequestLocal,
+        };
+    }
+
+    ProtocolFailureDisposition::unknown_upstream_failure()
+}
+
 pub(super) fn class_is_health_neutral(class: Option<&str>) -> bool {
     matches!(
         class,
@@ -672,6 +1003,16 @@ pub(super) fn classify_upstream_response(
         );
     }
 
+    if status_code == StatusCode::FORBIDDEN.as_u16()
+        && response_indicates_explicit_credential_failure(headers, body)
+    {
+        return (
+            Some(UPSTREAM_CREDENTIAL_CLASS.to_string()),
+            Some("检测到明确的上游凭据认证失败；将刷新凭据，但不会自动重放当前请求。".to_string()),
+            cf_ray,
+        );
+    }
+
     // Be conservative for 4xx classification: we only mark a subset of obvious client-side mistakes
     // as non-retryable. Statuses like 401/403/404 are often provider/configuration-specific and
     // should still be eligible for provider-level failover.
@@ -790,6 +1131,26 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_concurrent_tools_remains_a_request_local_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let body = r#"{"error":{"type":"invalid_request_error","message":"当前模型不支持并发工具调用，请修改请求参数"}}"#
+            .as_bytes();
+
+        assert!(classify_upstream_throttle_response(400, &headers, body).is_none());
+
+        let classified = classify_observed_upstream_response(400, &headers, body);
+        assert_eq!(
+            classified.class.as_deref(),
+            Some(CLIENT_ERROR_NON_RETRYABLE_CLASS)
+        );
+
+        let value = serde_json::from_slice::<Value>(body).expect("valid error fixture");
+        let disposition = classify_protocol_terminal_failure(&headers, &value);
+        assert_eq!(disposition.scope, ProtocolFailureScope::RequestLocal);
+    }
+
+    #[test]
     fn non_retryable_client_errors_are_health_neutral() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -846,15 +1207,338 @@ mod tests {
         let body = r#"{"error":{"type":"new_api_error","code":"insufficient_user_quota","message":"用户额度不足，预扣费额度失败"}}"#
             .as_bytes();
 
-        let signal = classify_upstream_throttle_response(403, &headers, body)
-            .expect("quota exhausted signal");
-        assert_eq!(signal.class, UPSTREAM_RATE_LIMITED_CLASS);
-        assert!(signal.strong);
+        let classified = classify_observed_upstream_response(403, &headers, body);
+        assert_eq!(
+            classified.class.as_deref(),
+            Some(UPSTREAM_RATE_LIMITED_CLASS)
+        );
+        assert!(
+            classified
+                .throttle_signal
+                .as_ref()
+                .is_some_and(|signal| signal.strong)
+        );
+        assert!(!is_buffered_http_credential_auth_failure(
+            StatusCode::FORBIDDEN,
+            classified.class.as_deref(),
+        ));
 
         let body = br#"{"error":{"type":"billing_error","code":"insufficient_quota","message":"insufficient balance or billing issue"}}"#;
         let signal = classify_upstream_throttle_response(402, &headers, body)
             .expect("billing exhausted signal");
         assert_eq!(signal.class, UPSTREAM_RATE_LIMITED_CLASS);
+
+        let classified = classify_observed_upstream_response(403, &headers, body);
+        assert_eq!(
+            classified.class.as_deref(),
+            Some(UPSTREAM_RATE_LIMITED_CLASS)
+        );
+        assert!(!is_buffered_http_credential_auth_failure(
+            StatusCode::FORBIDDEN,
+            classified.class.as_deref(),
+        ));
+    }
+
+    #[test]
+    fn api_key_required_401_and_403_remain_credential_failures() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let body = br#"{"error":{"code":"API_KEY_REQUIRED","message":"API key is required in Authorization header"}}"#;
+
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let classified = classify_observed_upstream_response(status.as_u16(), &headers, body);
+            assert_eq!(
+                classified.class.as_deref(),
+                (status == StatusCode::FORBIDDEN).then_some(UPSTREAM_CREDENTIAL_CLASS),
+            );
+            assert!(is_buffered_http_credential_auth_failure(
+                status,
+                classified.class.as_deref(),
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_forbidden_responses_are_not_credential_failures() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let bodies: &[&[u8]] = &[
+            br#"{"error":{"code":"model_not_found","message":"The API key's project does not have access to model gpt-5"}}"#,
+            br#"{"error":{"status":"PERMISSION_DENIED","reason":"PROJECT_PERMISSION","message":"Caller project is not authorized to use this endpoint"}}"#,
+            br#"{"error":{"type":"content_filter","reason":"SAFETY","message":"Request blocked by content policy"}}"#,
+            b"Forbidden",
+        ];
+
+        for body in bodies {
+            let classified = classify_observed_upstream_response(403, &headers, body);
+            assert_ne!(
+                classified.class.as_deref(),
+                Some(UPSTREAM_CREDENTIAL_CLASS),
+                "body={}",
+                String::from_utf8_lossy(body),
+            );
+            assert!(!is_buffered_http_credential_auth_failure(
+                StatusCode::FORBIDDEN,
+                classified.class.as_deref(),
+            ));
+        }
+    }
+
+    #[test]
+    fn forbidden_credential_failures_require_explicit_evidence() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let bodies: &[&[u8]] = &[
+            br#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided"}}"#,
+            br#"{"error":{"type":"authentication_error","message":"Authentication failed"}}"#,
+            br#"{"error":{"code":"access_token_expired","message":"The access token has expired"}}"#,
+            br#"{"error":{"code":"auth_token_revoked","message":"The token has been revoked"}}"#,
+        ];
+
+        for body in bodies {
+            let classified = classify_observed_upstream_response(403, &headers, body);
+            assert_eq!(
+                classified.class.as_deref(),
+                Some(UPSTREAM_CREDENTIAL_CLASS),
+                "body={}",
+                String::from_utf8_lossy(body),
+            );
+            assert!(is_buffered_http_credential_auth_failure(
+                StatusCode::FORBIDDEN,
+                classified.class.as_deref(),
+            ));
+        }
+
+        headers.insert(
+            "www-authenticate",
+            HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+        );
+        let classified = classify_observed_upstream_response(
+            403,
+            &headers,
+            br#"{"error":{"status":"PERMISSION_DENIED"}}"#,
+        );
+        assert_eq!(classified.class.as_deref(), Some(UPSTREAM_CREDENTIAL_CLASS));
+    }
+
+    #[test]
+    fn dedicated_capability_handshake_requires_explicit_credential_evidence() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        for (status, body) in [
+            (
+                StatusCode::UNAUTHORIZED,
+                br#"{"error":{"message":"Unauthorized"}}"#.as_slice(),
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                br#"{"error":{"code":"websocket_auth_scheme_unsupported","message":"use query authorization for websocket upgrade"}}"#.as_slice(),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                br#"{"error":{"message":"WebSocket endpoint not found"}}"#.as_slice(),
+            ),
+            (
+                StatusCode::UPGRADE_REQUIRED,
+                br#"{"error":{"message":"WebSocket beta required"}}"#.as_slice(),
+            ),
+        ] {
+            let observed =
+                classify_observed_upstream_response(status.as_u16(), &headers, body);
+            let disposition = classify_dedicated_capability_handshake_failure(
+                &headers,
+                body,
+                observed.class.as_deref(),
+            );
+            assert_eq!(
+                disposition.health_domain(RouteCapability::ResponsesWebSocket),
+                Some(RuntimeHealthDomain::Capability(
+                    RouteCapability::ResponsesWebSocket
+                )),
+                "status={status} body={}",
+                String::from_utf8_lossy(body),
+            );
+            assert!(!disposition.requires_credential_refresh());
+        }
+
+        for body in [
+            br#"{"error":{"code":"API_KEY_REQUIRED","message":"API key is required in Authorization header"}}"#.as_slice(),
+            br#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided"}}"#.as_slice(),
+        ] {
+            let observed = classify_observed_upstream_response(
+                StatusCode::UNAUTHORIZED.as_u16(),
+                &headers,
+                body,
+            );
+            let disposition = classify_dedicated_capability_handshake_failure(
+                &headers,
+                body,
+                observed.class.as_deref(),
+            );
+            assert_eq!(
+                disposition.health_domain(RouteCapability::ResponsesWebSocket),
+                Some(RuntimeHealthDomain::Credential),
+            );
+            assert!(disposition.requires_credential_refresh());
+        }
+
+        headers.insert(
+            "www-authenticate",
+            HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+        );
+        let body = br#"{"error":{"message":"Unauthorized"}}"#;
+        let observed =
+            classify_observed_upstream_response(StatusCode::UNAUTHORIZED.as_u16(), &headers, body);
+        let disposition = classify_dedicated_capability_handshake_failure(
+            &headers,
+            body,
+            observed.class.as_deref(),
+        );
+        assert_eq!(
+            disposition.health_domain(RouteCapability::ResponsesWebSocket),
+            Some(RuntimeHealthDomain::Credential),
+        );
+        assert!(disposition.requires_credential_refresh());
+    }
+
+    #[test]
+    fn protocol_terminal_failures_have_typed_health_scope() {
+        let headers = HeaderMap::new();
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": "insufficient_quota",
+                            "message": "quota exhausted",
+                            "retry_after": 19
+                        }
+                    }
+                }),
+                UPSTREAM_RATE_LIMITED_CLASS,
+                Some(RuntimeHealthDomain::Capability(RouteCapability::Inference)),
+                Some(19),
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "code": "API_KEY_REQUIRED",
+                        "message": "API key is required"
+                    }
+                }),
+                UPSTREAM_CREDENTIAL_CLASS,
+                Some(RuntimeHealthDomain::Credential),
+                None,
+                true,
+            ),
+            (
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "invalid tool schema"
+                        }
+                    }
+                }),
+                CLIENT_ERROR_NON_RETRYABLE_CLASS,
+                None,
+                None,
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "type": "server_error",
+                            "message": "internal server error"
+                        }
+                    }
+                }),
+                UPSTREAM_SERVER_ERROR_CLASS,
+                Some(RuntimeHealthDomain::Capability(RouteCapability::Inference)),
+                None,
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "overloaded_error",
+                        "message": "overloaded"
+                    }
+                }),
+                UPSTREAM_OVERLOADED_CLASS,
+                Some(RuntimeHealthDomain::Capacity(RouteCapability::Inference)),
+                None,
+                false,
+            ),
+        ];
+
+        for (body, class, domain, retry_after_secs, refresh) in cases {
+            let disposition = classify_protocol_terminal_failure(&headers, &body);
+            assert_eq!(disposition.class, class);
+            assert_eq!(
+                disposition.health_domain(RouteCapability::Inference),
+                domain
+            );
+            assert_eq!(disposition.retry_after_secs, retry_after_secs);
+            assert_eq!(disposition.requires_credential_refresh(), refresh);
+        }
+    }
+
+    #[test]
+    fn protocol_safety_and_cancellation_failures_are_request_local() {
+        let headers = HeaderMap::new();
+        for error in [
+            serde_json::json!({"type": "content_filter", "message": "safety refusal"}),
+            serde_json::json!({"code": "request_cancelled", "message": "user cancelled"}),
+        ] {
+            let body = serde_json::json!({
+                "type": "response.failed",
+                "response": { "error": error }
+            });
+            let disposition = classify_protocol_terminal_failure(&headers, &body);
+            assert_eq!(disposition.class, CLIENT_ERROR_NON_RETRYABLE_CLASS);
+            assert_eq!(disposition.health_domain(RouteCapability::Inference), None);
+        }
+    }
+
+    #[test]
+    fn protocol_permission_denied_requires_strong_auth_evidence() {
+        let headers = HeaderMap::new();
+        let safety = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "PERMISSION_DENIED",
+                "reason": "SAFETY",
+                "message": "request blocked by safety policy"
+            }
+        });
+        let safety = classify_protocol_terminal_failure(&headers, &safety);
+        assert_eq!(safety.class, CLIENT_ERROR_NON_RETRYABLE_CLASS);
+        assert_eq!(safety.health_domain(RouteCapability::Inference), None);
+        assert!(!safety.requires_credential_refresh());
+
+        let ordinary = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "PERMISSION_DENIED",
+                "message": "access denied"
+            }
+        });
+        let ordinary = classify_protocol_terminal_failure(&headers, &ordinary);
+        assert_eq!(ordinary.class, UPSTREAM_SERVER_ERROR_CLASS);
+        assert_eq!(
+            ordinary.health_domain(RouteCapability::Inference),
+            Some(RuntimeHealthDomain::Capability(RouteCapability::Inference))
+        );
+        assert!(!ordinary.requires_credential_refresh());
     }
 
     #[test]

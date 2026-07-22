@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -9,21 +10,29 @@ use thiserror::Error;
 use toml::Value as TomlValue;
 use toml_edit::{DocumentMut, Item, Table, Value as EditableValue, value as editable_value};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
+use crate::auth_resolution::{
+    CodexAuthMetadata, codex_auth_metadata_from_json, read_codex_auth_metadata,
+};
 use crate::config::{
     CODEX_CLIENT_RUNTIME_PATCH_HEADER, CodexAuthFacadeStrategy, CodexClientPatchConfig,
-    CodexClientPreset, CodexClientRuntimePatch, CodexCompactionStrategy, CodexFeatureBoolPatch,
-    CodexHostedImageGenerationMode, CodexProviderIdentity, CodexTomlBoolPatch,
+    CodexClientRuntimePatch, CodexFeatureBoolPatch, CodexTomlBoolPatch,
 };
+#[cfg(test)]
+use crate::config::{CodexClientPreset, CodexCompactionStrategy};
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
+const LEGACY_STATE_VERSION: u32 = 1;
 const PROVIDER_ID: &str = "codex_proxy";
 const COMPATIBLE_PROVIDER_NAME: &str = "codex-helper";
 // Current Codex treats a non-empty actor header as a client capability gate. The proxy consumes
 // this exact non-secret marker locally before applying upstream authentication policy.
 pub const CODEX_CLIENT_FACADE_ACTOR_HEADER: &str = "x-openai-actor-authorization";
 pub const CODEX_CLIENT_FACADE_ACTOR_VALUE: &str = "codex-helper-client-facade-v1";
-const STATE_FILE_NAME: &str = "codex-switch.json";
+const UNSCOPED_STATE_FILE_NAME: &str = "codex-switch.json";
+const SCOPED_STATE_FILE_PREFIX: &str = "codex-switch-";
+const SCOPED_STATE_FILE_SUFFIX: &str = ".json";
 const LOCK_FILE_NAME: &str = "codex-switch.lock";
 const LEGACY_STATE_FILE_NAME: &str = "codex-helper-switch-state.json";
 const SWITCH_TEMP_FILE_PREFIX: &str = ".codex-switch-v1-";
@@ -33,6 +42,8 @@ const SWITCH_DELETE_TOMBSTONE_PREFIX: &str = ".codex-switch-delete-v1-";
 const SWITCH_CAPTURE_FILE_PREFIX: &str = ".codex-switch-capture-v1-";
 const AUTH_BACKUP_FILE_PREFIX: &str = "codex-switch-auth-v1-";
 const AUTH_BACKUP_FILE_SUFFIX: &str = ".bak";
+const HELPER_STANZA_BACKUP_FILE_PREFIX: &str = "codex-switch-helper-stanza-v1-";
+const HELPER_STANZA_BACKUP_FILE_SUFFIX: &str = ".bak";
 #[cfg(windows)]
 const WINDOWS_FILE_OPERATION_ATTEMPTS: usize = 10;
 #[cfg(windows)]
@@ -78,63 +89,6 @@ impl ValidatedCodexBaseUrl {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CodexClientFacade {
-    #[default]
-    Compatible,
-    OpenAi,
-    OpenAiTools,
-}
-
-impl CodexClientFacade {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Compatible => "compatible",
-            Self::OpenAi => "openai",
-            Self::OpenAiTools => "openai-tools",
-        }
-    }
-
-    pub const fn client_patch(self) -> CodexClientPatchConfig {
-        match self {
-            Self::Compatible => CodexClientPatchConfig {
-                preset: CodexClientPreset::Default,
-                responses_websocket: false,
-                compaction: CodexCompactionStrategy::Auto,
-                translate_models: false,
-                hosted_image_generation: CodexHostedImageGenerationMode::Auto,
-            },
-            Self::OpenAi => CodexClientPatchConfig {
-                preset: CodexClientPreset::OfficialRelay,
-                responses_websocket: false,
-                compaction: CodexCompactionStrategy::Auto,
-                translate_models: false,
-                hosted_image_generation: CodexHostedImageGenerationMode::Auto,
-            },
-            Self::OpenAiTools => CodexClientPatchConfig {
-                preset: CodexClientPreset::OfficialImagegen,
-                responses_websocket: false,
-                compaction: CodexCompactionStrategy::Auto,
-                translate_models: false,
-                hosted_image_generation: CodexHostedImageGenerationMode::Auto,
-            },
-        }
-    }
-
-    fn for_client_patch(client_patch: CodexClientPatchConfig) -> Result<Self, CodexSwitchError> {
-        let compiled = client_patch.compile().map_err(invalid_client_patch_error)?;
-        if compiled.provider_identity != CodexProviderIdentity::OfficialOpenAi {
-            return Ok(Self::Compatible);
-        }
-        if compiled.actor_marker {
-            Ok(Self::OpenAiTools)
-        } else {
-            Ok(Self::OpenAi)
-        }
     }
 }
 
@@ -191,7 +145,6 @@ pub struct CodexSwitchStatus {
     pub enabled: bool,
     pub managed: bool,
     pub base_url: Option<String>,
-    pub client_facade: Option<CodexClientFacade>,
     pub client_patch: Option<CodexClientPatchConfig>,
     pub recovery_reason: Option<String>,
     pub config_path: PathBuf,
@@ -202,6 +155,22 @@ pub struct CodexSwitchStatus {
 pub struct CodexSwitchOutcome {
     pub change: CodexSwitchChange,
     pub status: CodexSwitchStatus,
+    pub restore_lease: Option<CodexSwitchRestoreLease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexSwitchTargetRestoreOutcome {
+    Restored(CodexSwitchOutcome),
+    Unchanged(CodexSwitchStatus),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSwitchRestoreLease {
+    state_path: PathBuf,
+    config_path_fingerprint: String,
+    operation_id: String,
+    applied_fingerprint: String,
+    auto_restore_generation: String,
 }
 
 #[derive(Debug, Error)]
@@ -225,10 +194,6 @@ pub enum CodexSwitchError {
     InvalidState { path: PathBuf, reason: String },
     #[error("Codex switch operation is already running; lock is held at {path:?}")]
     LockBusy { path: PathBuf },
-    #[error(
-        "model_providers.codex_proxy already exists without helper ownership state; refusing to overwrite it"
-    )]
-    ForeignProviderStanza,
     #[error(
         "Codex config already selects codex_proxy without helper ownership state; manual reconciliation is required"
     )]
@@ -258,8 +223,17 @@ pub enum CodexSwitchError {
     RecoveryRequired { reason: String },
     #[error("Codex switch state changed repeatedly while it was being inspected")]
     UnstableInspection,
-    #[error("restoring the helper stanza would not reproduce the original config fingerprint")]
+    #[error(
+        "restoring helper-owned Codex fields would not reproduce the original managed projection"
+    )]
     RestoreFingerprintMismatch,
+    #[error(
+        "ephemeral Codex switch failed ({apply_error}); automatic recovery also failed ({recovery_error})"
+    )]
+    EphemeralRecoveryFailed {
+        apply_error: String,
+        recovery_error: String,
+    },
     #[cfg(test)]
     #[error("injected Codex switch failure at {0}")]
     InjectedFailure(&'static str),
@@ -297,15 +271,21 @@ struct SwitchJournal {
     original_config_present: bool,
     original_fingerprint: String,
     applied_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_config: Option<PendingConfigCommit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_restore_generation: Option<String>,
     original_model_provider: Option<String>,
     original_model_provider_repr: Option<String>,
+    #[serde(default, skip_serializing)]
     original_helper_stanza: Option<TomlValue>,
+    #[serde(default, skip_serializing)]
+    original_helper_stanza_repr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    helper_stanza_backup: Option<HelperStanzaJournal>,
     original_model_providers_present: bool,
     target_base_url: String,
-    #[serde(default)]
-    client_facade: CodexClientFacade,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    client_patch: Option<CodexClientPatchConfig>,
+    client_patch: CodexClientPatchConfig,
     #[serde(default)]
     original_features_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,14 +300,41 @@ struct SwitchJournal {
     recovery_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct PendingConfigCommit {
+    source_present: bool,
+    source_fingerprint: String,
+    destination_present: bool,
+    destination_fingerprint: String,
+}
+
+impl PendingConfigCommit {
+    fn new(source: &ConfigSnapshot, destination: &ConfigSnapshot) -> Self {
+        Self {
+            source_present: source.present,
+            source_fingerprint: source.fingerprint.clone(),
+            destination_present: destination.present,
+            destination_fingerprint: destination.fingerprint.clone(),
+        }
+    }
+
+    fn source_matches(&self, snapshot: &ConfigSnapshot) -> bool {
+        snapshot.present == self.source_present && snapshot.fingerprint == self.source_fingerprint
+    }
+
+    fn destination_matches(&self, snapshot: &ConfigSnapshot) -> bool {
+        snapshot.present == self.destination_present
+            && snapshot.fingerprint == self.destination_fingerprint
+    }
+}
+
 impl SwitchJournal {
     fn recovery_client_patch(&self) -> CodexClientPatchConfig {
         self.client_patch
-            .unwrap_or_else(|| self.client_facade.client_patch())
     }
 
     fn records_complete_client_patch(&self, client_patch: CodexClientPatchConfig) -> bool {
-        self.client_patch == Some(client_patch)
+        self.client_patch == client_patch
     }
 
     fn recorded_auth_client_patch(&self) -> CodexClientPatchConfig {
@@ -342,6 +349,14 @@ struct AuthJournal {
     original_present: bool,
     original_fingerprint: String,
     applied_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup_file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct HelperStanzaJournal {
+    original_present: bool,
+    original_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     backup_file_name: Option<String>,
 }
@@ -453,6 +468,11 @@ struct JournalSnapshot {
     journal: SwitchJournal,
 }
 
+struct LocatedJournalSnapshot {
+    path: PathBuf,
+    snapshot: JournalSnapshot,
+}
+
 impl ConfigSnapshot {
     fn from_text(present: bool, text: String) -> Self {
         let fingerprint = fingerprint(text.as_bytes());
@@ -481,16 +501,16 @@ impl ConfigSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedConfigMatches {
+    original: bool,
+    applied: bool,
+}
+
 #[derive(Debug)]
 enum ConfigEdit {
     Write(String),
     Remove,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ExpectedConfigState {
-    Original,
-    Applied,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -502,7 +522,7 @@ enum ExpectedAuthState {
 #[derive(Clone, Copy)]
 struct ConfigCommitExpectation<'a> {
     journal: &'a SwitchJournal,
-    state: ExpectedConfigState,
+    expected: &'a ConfigSnapshot,
 }
 
 #[derive(Clone, Copy)]
@@ -555,10 +575,7 @@ impl<'a> FileCommitExpectation<'a> {
 
     fn expected_present(self) -> bool {
         match self {
-            Self::Journal(expectation) => match expectation.state {
-                ExpectedConfigState::Original => expectation.journal.original_config_present,
-                ExpectedConfigState::Applied => true,
-            },
+            Self::Journal(expectation) => expectation.expected.present,
             Self::Auth(expectation) => match expectation.state {
                 ExpectedAuthState::Original => expectation.journal.original_present,
                 ExpectedAuthState::Applied => true,
@@ -569,15 +586,10 @@ impl<'a> FileCommitExpectation<'a> {
 }
 
 impl ConfigEdit {
-    fn matches_original(&self, journal: &SwitchJournal) -> bool {
+    fn snapshot(&self) -> ConfigSnapshot {
         match self {
-            Self::Write(text) => {
-                journal.original_config_present
-                    && fingerprint(text.as_bytes()) == journal.original_fingerprint
-            }
-            Self::Remove => {
-                !journal.original_config_present && fingerprint(&[]) == journal.original_fingerprint
-            }
+            Self::Write(text) => ConfigSnapshot::from_text(true, text.clone()),
+            Self::Remove => ConfigSnapshot::from_text(false, String::new()),
         }
     }
 
@@ -600,6 +612,7 @@ enum ApplyFailpoint {
     AfterConfigWrite,
     AfterAuthWrite,
     AfterAuthRestore,
+    AfterHelperStanzaBackupRemoval,
     AfterLegacyConfigRestore,
     AfterLegacyAuthRestore,
 }
@@ -613,6 +626,7 @@ impl ApplyFailpoint {
             Self::AfterConfigWrite => "after_config_write",
             Self::AfterAuthWrite => "after_auth_write",
             Self::AfterAuthRestore => "after_auth_restore",
+            Self::AfterHelperStanzaBackupRemoval => "after_helper_stanza_backup_removal",
             Self::AfterLegacyConfigRestore => "after_legacy_config_restore",
             Self::AfterLegacyAuthRestore => "after_legacy_auth_restore",
         }
@@ -622,6 +636,7 @@ impl ApplyFailpoint {
 struct OnPatch {
     text: String,
     original_model_provider_repr: Option<String>,
+    original_helper_stanza_repr: Option<String>,
     original_features_present: bool,
     original_remote_compaction_v2: Option<bool>,
     original_image_generation: Option<bool>,
@@ -636,18 +651,28 @@ pub fn apply(intent: CodexSwitchIntent) -> Result<CodexSwitchOutcome, CodexSwitc
     apply_with_client_patch(intent, CodexClientPatchConfig::default())
 }
 
-pub fn apply_with_client_facade(
-    intent: CodexSwitchIntent,
-    client_facade: CodexClientFacade,
-) -> Result<CodexSwitchOutcome, CodexSwitchError> {
-    apply_with_client_patch(intent, client_facade.client_patch())
-}
-
 pub fn apply_with_client_patch(
     intent: CodexSwitchIntent,
     client_patch: CodexClientPatchConfig,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     apply_with_client_patch_and_failpoint(intent, client_patch, ApplyFailpoint::None)
+}
+
+pub fn acquire_ephemeral_local_codex(
+    runtime_owner: &crate::runtime_manager::RuntimeOwnerLease,
+    client_patch: CodexClientPatchConfig,
+) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    if runtime_owner.service_name() != "codex" || !runtime_owner.lifecycle_mode().owns_runtime() {
+        return Err(CodexSwitchError::InvalidBaseUrl {
+            reason: "ephemeral Codex switching requires an owned local Codex runtime".to_string(),
+        });
+    }
+    acquire_ephemeral_with_client_patch_and_failpoint(
+        ValidatedCodexBaseUrl::local(runtime_owner.proxy_port()),
+        client_patch,
+        ApplyFailpoint::None,
+        runtime_owner.instance_id().to_string(),
+    )
 }
 
 pub fn inspect() -> Result<CodexSwitchStatus, CodexSwitchError> {
@@ -656,24 +681,106 @@ pub fn inspect() -> Result<CodexSwitchStatus, CodexSwitchError> {
         return legacy_switch_status(&paths);
     }
     for _ in 0..3 {
-        let before = read_journal_snapshot(paths.state.as_path())?;
+        let before = read_inspection_journal_snapshot(&paths)?;
         let current = read_config_snapshot(paths.config.as_path())?;
-        let after = read_optional_text(paths.state.as_path())?;
+        let after = read_inspection_journal_snapshot(&paths)?;
         match (before, after) {
-            (None, None) => return status_after_legacy_recheck(&paths, &current, None),
-            (Some(before), Some(after_raw)) if before.raw == after_raw => {
-                return status_after_legacy_recheck(&paths, &current, Some(&before.journal));
+            (None, None) => return status_after_legacy_recheck(&paths, &current, None, None),
+            (Some(before), Some(after))
+                if before.path == after.path && before.snapshot.raw == after.snapshot.raw =>
+            {
+                return status_after_legacy_recheck(
+                    &paths,
+                    &current,
+                    Some(&after.snapshot.journal),
+                    Some(after.path.as_path()),
+                );
             }
-            (Some(before), Some(after_raw)) => {
-                let after = parse_journal(paths.state.as_path(), after_raw)?;
-                if before.journal == after.journal {
-                    return status_after_legacy_recheck(&paths, &current, Some(&after.journal));
-                }
+            (Some(before), Some(after))
+                if before.path == after.path
+                    && before.snapshot.journal == after.snapshot.journal =>
+            {
+                return status_after_legacy_recheck(
+                    &paths,
+                    &current,
+                    Some(&after.snapshot.journal),
+                    Some(after.path.as_path()),
+                );
             }
             _ => {}
         }
     }
     Err(CodexSwitchError::UnstableInspection)
+}
+
+/// Restores one exact helper-managed target without consulting the process-wide `CODEX_HOME`.
+pub fn restore_managed_applied_for_target(
+    client_home: &Path,
+    expected_target: &ValidatedCodexBaseUrl,
+) -> Result<CodexSwitchTargetRestoreOutcome, CodexSwitchError> {
+    let paths = SwitchPaths::resolve_for_codex_home(client_home)?;
+    let _lock = OperationLock::acquire(paths.lock.as_path())?;
+    if legacy_state_present(paths.legacy_state.as_path())? {
+        if let Some(current_path) = current_journal_path_entry(&paths)? {
+            return Err(CodexSwitchError::LegacySwitchStateConflict {
+                legacy_path: paths.legacy_state.clone(),
+                current_path,
+            });
+        }
+        let current = read_config_snapshot(paths.config.as_path())?;
+        validate_config_topology(paths.config.as_path(), current.present)?;
+        let inspection = inspect_config(paths.config.as_path(), current.text.as_str())?;
+        let exact_applied_target = inspection.model_provider.as_deref() == Some(PROVIDER_ID)
+            && inspection.helper_base_url.as_deref() == Some(expected_target.as_str());
+        if !exact_applied_target {
+            return legacy_switch_status(&paths).map(CodexSwitchTargetRestoreOutcome::Unchanged);
+        }
+        recover_legacy_switch_state(&paths, ApplyFailpoint::None)?;
+        return outcome(&paths, CodexSwitchChange::Recovered)
+            .map(CodexSwitchTargetRestoreOutcome::Restored);
+    }
+
+    let current = read_config_snapshot(paths.config.as_path())?;
+    let journal = read_journal(paths.state.as_path())?;
+    if journal.is_some() && read_matching_unscoped_journal_snapshot(&paths)?.is_some() {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: format!(
+                "matching unscoped switch state at {:?} conflicts with scoped switch state at {:?}; neither state was modified",
+                paths.unscoped_state, paths.state
+            ),
+        });
+    }
+    let status = status_from_snapshot(&paths, &current, journal.as_ref(), None)?;
+    let exact_applied_target = journal.as_ref().is_some_and(|journal| {
+        journal.phase == JournalPhase::Applied
+            && journal.operation == JournalOperation::On
+            && journal.config_path_fingerprint == paths.config_fingerprint
+            && journal.target_base_url == expected_target.as_str()
+    }) && status.phase == CodexSwitchPhase::Applied
+        && status.enabled
+        && status.base_url.as_deref() == Some(expected_target.as_str());
+    if !exact_applied_target {
+        return Ok(CodexSwitchTargetRestoreOutcome::Unchanged(status));
+    }
+
+    let mut journal =
+        read_journal(paths.state.as_path())?.ok_or(CodexSwitchError::UnstableInspection)?;
+    if journal.phase != JournalPhase::Applied
+        || journal.operation != JournalOperation::On
+        || journal.config_path_fingerprint != paths.config_fingerprint
+        || journal.target_base_url != expected_target.as_str()
+    {
+        return Err(CodexSwitchError::UnstableInspection);
+    }
+    let current = read_config_snapshot(paths.config.as_path())?;
+    if let Err(error) = ensure_helper_stanza_backup(&paths, &mut journal, &current) {
+        return match error {
+            CodexSwitchError::RecoveryRequired { reason } => mark_recovery(&paths, journal, reason),
+            error => Err(error),
+        };
+    }
+    apply_off(&paths, current, Some(journal), ApplyFailpoint::None)
+        .map(CodexSwitchTargetRestoreOutcome::Restored)
 }
 
 #[cfg(test)]
@@ -684,15 +791,6 @@ fn apply_with_failpoint(
     apply_with_client_patch_and_failpoint(intent, CodexClientPatchConfig::default(), failpoint)
 }
 
-#[cfg(test)]
-fn apply_with_client_facade_and_failpoint(
-    intent: CodexSwitchIntent,
-    client_facade: CodexClientFacade,
-    failpoint: ApplyFailpoint,
-) -> Result<CodexSwitchOutcome, CodexSwitchError> {
-    apply_with_client_patch_and_failpoint(intent, client_facade.client_patch(), failpoint)
-}
-
 fn apply_with_client_patch_and_failpoint(
     intent: CodexSwitchIntent,
     client_patch: CodexClientPatchConfig,
@@ -701,47 +799,197 @@ fn apply_with_client_patch_and_failpoint(
     client_patch.compile().map_err(invalid_client_patch_error)?;
     let paths = SwitchPaths::resolve()?;
     let _lock = OperationLock::acquire(paths.lock.as_path())?;
-    cleanup_managed_switch_artifacts(&paths)?;
-    let current_state_present =
-        switch_path_entry_present(paths.state.as_path(), "inspect current switch state at")?;
+    apply_with_client_patch_locked(&paths, intent, client_patch, failpoint, None)
+}
+
+fn acquire_ephemeral_with_client_patch_and_failpoint(
+    validated_base_url: ValidatedCodexBaseUrl,
+    client_patch: CodexClientPatchConfig,
+    failpoint: ApplyFailpoint,
+    auto_restore_generation: String,
+) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    client_patch.compile().map_err(invalid_client_patch_error)?;
+    let paths = SwitchPaths::resolve()?;
+    let _lock = OperationLock::acquire(paths.lock.as_path())?;
+    let result = apply_with_client_patch_locked(
+        &paths,
+        CodexSwitchIntent::On { validated_base_url },
+        client_patch,
+        failpoint,
+        Some(auto_restore_generation.clone()),
+    );
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(apply_error) => {
+            match compensate_ephemeral_apply_locked(&paths, auto_restore_generation.as_str()) {
+                Ok(()) => Err(apply_error),
+                Err(recovery_error) => Err(CodexSwitchError::EphemeralRecoveryFailed {
+                    apply_error: apply_error.to_string(),
+                    recovery_error: recovery_error.to_string(),
+                }),
+            }
+        }
+    }
+}
+
+fn compensate_ephemeral_apply_locked(
+    paths: &SwitchPaths,
+    auto_restore_generation: &str,
+) -> Result<(), CodexSwitchError> {
+    let Some(journal) = read_journal(paths.state.as_path())? else {
+        return Ok(());
+    };
+    if journal.auto_restore_generation.as_deref() != Some(auto_restore_generation) {
+        return Ok(());
+    }
+    apply_with_client_patch_locked(
+        paths,
+        CodexSwitchIntent::Off,
+        journal.recovery_client_patch(),
+        ApplyFailpoint::None,
+        None,
+    )?;
+    Ok(())
+}
+
+fn apply_with_client_patch_locked(
+    paths: &SwitchPaths,
+    intent: CodexSwitchIntent,
+    client_patch: CodexClientPatchConfig,
+    failpoint: ApplyFailpoint,
+    requested_auto_restore_generation: Option<String>,
+) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+    cleanup_managed_switch_artifacts(paths)?;
+    let current_state_path = current_journal_path_entry(paths)?;
     if legacy_state_present(paths.legacy_state.as_path())? {
-        if current_state_present {
+        if let Some(current_path) = current_state_path {
             return Err(CodexSwitchError::LegacySwitchStateConflict {
                 legacy_path: paths.legacy_state.clone(),
-                current_path: paths.state.clone(),
+                current_path,
             });
         }
-        recover_legacy_switch_state(&paths, failpoint)?;
+        recover_legacy_switch_state(paths, failpoint)?;
         let current = read_config_snapshot(paths.config.as_path())?;
         return match intent {
-            CodexSwitchIntent::On { validated_base_url } => {
-                begin_on(&paths, current, validated_base_url, client_patch, failpoint)
-            }
-            CodexSwitchIntent::Off => outcome(&paths, CodexSwitchChange::Recovered),
+            CodexSwitchIntent::On { validated_base_url } => begin_on(
+                paths,
+                current,
+                validated_base_url,
+                client_patch,
+                failpoint,
+                requested_auto_restore_generation,
+            ),
+            CodexSwitchIntent::Off => outcome(paths, CodexSwitchChange::Recovered),
         };
     }
+    migrate_matching_unscoped_journal(paths)?;
     let mut journal = read_journal(paths.state.as_path())?;
-    if let Some(journal) = journal.as_mut() {
-        ensure_journal_config_matches(&paths, journal)?;
-        recover_interrupted_file_captures(&paths, journal)?;
+    let mut current = read_config_snapshot(paths.config.as_path())?;
+    if let Some(mut loaded) = journal.take() {
+        ensure_journal_config_matches(paths, &loaded)?;
+        if let Err(error) = ensure_helper_stanza_backup(paths, &mut loaded, &current) {
+            return match error {
+                CodexSwitchError::RecoveryRequired { reason } => {
+                    mark_recovery(paths, loaded, reason)
+                }
+                error => Err(error),
+            };
+        }
+        recover_interrupted_file_captures(paths, &mut loaded)?;
+        journal = Some(loaded);
+        current = read_config_snapshot(paths.config.as_path())?;
     }
-    let current = read_config_snapshot(paths.config.as_path())?;
 
     match intent {
         CodexSwitchIntent::On { validated_base_url } => apply_on(
-            &paths,
+            paths,
             current,
             journal,
             validated_base_url,
             client_patch,
             failpoint,
+            requested_auto_restore_generation,
         ),
-        CodexSwitchIntent::Off => apply_off(&paths, current, journal, failpoint),
+        CodexSwitchIntent::Off => apply_off(paths, current, journal, failpoint),
     }
+}
+
+pub fn restore_if_owned(
+    lease: &CodexSwitchRestoreLease,
+) -> Result<Option<CodexSwitchOutcome>, CodexSwitchError> {
+    let paths = SwitchPaths::resolve()?;
+    if paths.state != lease.state_path || paths.config_fingerprint != lease.config_path_fingerprint
+    {
+        return Ok(None);
+    }
+    let _lock = OperationLock::acquire(paths.lock.as_path())?;
+    if legacy_state_present(paths.legacy_state.as_path())? {
+        return Ok(None);
+    }
+    let Some(journal) = read_journal(paths.state.as_path())? else {
+        return Ok(None);
+    };
+    if journal.phase != JournalPhase::Applied
+        || journal.operation != JournalOperation::On
+        || journal.operation_id != lease.operation_id
+        || journal.applied_fingerprint != lease.applied_fingerprint
+        || journal.config_path_fingerprint != lease.config_path_fingerprint
+        || journal.auto_restore_generation.as_deref()
+            != Some(lease.auto_restore_generation.as_str())
+    {
+        return Ok(None);
+    }
+
+    apply_with_client_patch_locked(
+        &paths,
+        CodexSwitchIntent::Off,
+        journal.recovery_client_patch(),
+        ApplyFailpoint::None,
+        None,
+    )
+    .map(Some)
+}
+
+pub fn restore_if_owned_with_retry(
+    lease: &CodexSwitchRestoreLease,
+) -> Result<Option<CodexSwitchOutcome>, CodexSwitchError> {
+    const RETRY_DELAYS_MS: [u64; 6] = [0, 20, 50, 100, 200, 400];
+    let mut last_error = None;
+    for delay_ms in RETRY_DELAYS_MS {
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+        match restore_if_owned(lease) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if retryable_restore_error(&error) => last_error = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("restore retry schedule is non-empty"))
+}
+
+fn retryable_restore_error(error: &CodexSwitchError) -> bool {
+    if matches!(error, CodexSwitchError::LockBusy { .. }) {
+        return true;
+    }
+    #[cfg(windows)]
+    if let CodexSwitchError::Io { source, .. } = error {
+        return matches!(source.raw_os_error(), Some(32 | 33));
+    }
+    false
 }
 
 fn legacy_state_present(path: &Path) -> Result<bool, CodexSwitchError> {
     switch_path_entry_present(path, "inspect legacy switch state at")
+}
+
+fn current_journal_path_entry(paths: &SwitchPaths) -> Result<Option<PathBuf>, CodexSwitchError> {
+    if switch_path_entry_present(paths.state.as_path(), "inspect scoped switch state at")? {
+        return Ok(Some(paths.state.clone()));
+    }
+    Ok(read_matching_unscoped_journal_snapshot(paths)?
+        .is_some()
+        .then(|| paths.unscoped_state.clone()))
 }
 
 fn switch_path_entry_present(path: &Path, action: &'static str) -> Result<bool, CodexSwitchError> {
@@ -1215,8 +1463,7 @@ fn recover_legacy_switch_state_with_before_remove(
 }
 
 fn legacy_switch_status(paths: &SwitchPaths) -> Result<CodexSwitchStatus, CodexSwitchError> {
-    let current_state_present =
-        switch_path_entry_present(paths.state.as_path(), "inspect current switch state at")?;
+    let current_state_path = current_journal_path_entry(paths)?;
     let config = read_config_snapshot(paths.config.as_path())
         .and_then(|current| inspect_config(paths.config.as_path(), current.text.as_str()))
         .ok();
@@ -1225,11 +1472,11 @@ fn legacy_switch_status(paths: &SwitchPaths) -> Result<CodexSwitchStatus, CodexS
     });
     let base_url = config.and_then(|config| config.helper_base_url);
     let mut recovery_reason = legacy_switch_error(paths).to_string();
-    if current_state_present {
+    if let Some(current_state_path) = current_state_path.as_ref() {
         recovery_reason.push_str(
             format!(
                 ". A current switch journal also exists at {:?}; neither journal was modified",
-                paths.state
+                current_state_path
             )
             .as_str(),
         );
@@ -1238,9 +1485,8 @@ fn legacy_switch_status(paths: &SwitchPaths) -> Result<CodexSwitchStatus, CodexS
     Ok(CodexSwitchStatus {
         phase: CodexSwitchPhase::RecoveryRequired,
         enabled,
-        managed: current_state_present,
+        managed: current_state_path.is_some(),
         base_url,
-        client_facade: None,
         client_patch: None,
         recovery_reason: Some(recovery_reason),
         config_path: paths.config.clone(),
@@ -1252,11 +1498,12 @@ fn status_after_legacy_recheck(
     paths: &SwitchPaths,
     current: &ConfigSnapshot,
     journal: Option<&SwitchJournal>,
+    journal_state_path: Option<&Path>,
 ) -> Result<CodexSwitchStatus, CodexSwitchError> {
     if legacy_state_present(paths.legacy_state.as_path())? {
         return legacy_switch_status(paths);
     }
-    status_from_snapshot(paths, current, journal)
+    status_from_snapshot(paths, current, journal, journal_state_path)
 }
 
 fn write_current_journal(
@@ -1276,7 +1523,7 @@ fn write_current_config_edit(
     paths: &SwitchPaths,
     edit: ConfigEdit,
     journal: &SwitchJournal,
-    expected: ExpectedConfigState,
+    expected: &ConfigSnapshot,
 ) -> Result<(), CodexSwitchError> {
     reject_legacy_switch_state(paths)?;
     write_config_edit(paths.config.as_path(), edit, journal, expected)
@@ -1298,6 +1545,324 @@ fn write_current_auth_edit(
         auth_journal,
         expected,
     )
+}
+
+fn managed_helper_stanza_backup_name(name: &str) -> bool {
+    name.strip_prefix(HELPER_STANZA_BACKUP_FILE_PREFIX)
+        .and_then(|suffix| suffix.strip_suffix(HELPER_STANZA_BACKUP_FILE_SUFFIX))
+        .is_some_and(managed_switch_artifact_uuid)
+}
+
+fn helper_stanza_backup_path(
+    paths: &SwitchPaths,
+    journal: &HelperStanzaJournal,
+) -> Result<Option<PathBuf>, CodexSwitchError> {
+    match (
+        journal.original_present,
+        journal.backup_file_name.as_deref(),
+    ) {
+        (false, None) => Ok(None),
+        (true, Some(name)) if managed_helper_stanza_backup_name(name) => {
+            let parent = paths
+                .state
+                .parent()
+                .ok_or_else(|| CodexSwitchError::InvalidState {
+                    path: paths.state.clone(),
+                    reason: "switch state path has no parent directory".to_string(),
+                })?;
+            Ok(Some(parent.join(name)))
+        }
+        (true, None) => Err(CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: "helper stanza recovery metadata is missing its backup file name".to_string(),
+        }),
+        (false, Some(_)) => Err(CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason:
+                "helper stanza recovery metadata records a backup for an absent original stanza"
+                    .to_string(),
+        }),
+        (true, Some(_)) => Err(CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: "helper stanza recovery metadata contains an invalid backup file name"
+                .to_string(),
+        }),
+    }
+}
+
+fn parse_helper_stanza_repr(path: &Path, repr: &str) -> Result<TomlValue, CodexSwitchError> {
+    repr.parse::<DocumentMut>()
+        .map_err(|error| CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: sanitized_toml_parse_reason(error.message(), error.span(), repr),
+        })?;
+    toml::from_str::<TomlValue>(repr)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_table()?
+                .get("model_providers")?
+                .as_table()?
+                .get(PROVIDER_ID)
+                .cloned()
+        })
+        .ok_or_else(|| CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: "original helper stanza representation is not a TOML table".to_string(),
+        })
+}
+
+fn validate_legacy_helper_stanza_fields(
+    path: &Path,
+    journal: &SwitchJournal,
+) -> Result<(), CodexSwitchError> {
+    match (
+        journal.original_helper_stanza.as_ref(),
+        journal.original_helper_stanza_repr.as_deref(),
+    ) {
+        (Some(expected), Some(repr)) => {
+            if &parse_helper_stanza_repr(path, repr)? == expected {
+                Ok(())
+            } else {
+                Err(CodexSwitchError::InvalidState {
+                    path: path.to_path_buf(),
+                    reason: "original helper stanza representation does not match its value"
+                        .to_string(),
+                })
+            }
+        }
+        (None, None) => Ok(()),
+        _ => Err(CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: "original helper stanza value and representation must agree".to_string(),
+        }),
+    }
+}
+
+fn prepare_helper_stanza_journal(
+    path: &Path,
+    original: Option<&TomlValue>,
+    repr: Option<&str>,
+    backup_id: Option<&str>,
+) -> Result<HelperStanzaJournal, CodexSwitchError> {
+    match (original, repr) {
+        (Some(expected), Some(repr)) => {
+            if &parse_helper_stanza_repr(path, repr)? != expected {
+                return Err(CodexSwitchError::InvalidState {
+                    path: path.to_path_buf(),
+                    reason: "original helper stanza representation does not match its value"
+                        .to_string(),
+                });
+            }
+            let backup_id = backup_id
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            if !managed_switch_artifact_uuid(backup_id.as_str()) {
+                return Err(CodexSwitchError::InvalidState {
+                    path: path.to_path_buf(),
+                    reason: "helper stanza backup identifier is invalid".to_string(),
+                });
+            }
+            Ok(HelperStanzaJournal {
+                original_present: true,
+                original_fingerprint: fingerprint(repr.as_bytes()),
+                backup_file_name: Some(format!(
+                    "{HELPER_STANZA_BACKUP_FILE_PREFIX}{backup_id}{HELPER_STANZA_BACKUP_FILE_SUFFIX}"
+                )),
+            })
+        }
+        (None, None) => {
+            if backup_id.is_some() {
+                return Err(CodexSwitchError::InvalidState {
+                    path: path.to_path_buf(),
+                    reason: "absent original helper stanza cannot reserve a backup identifier"
+                        .to_string(),
+                });
+            }
+            Ok(HelperStanzaJournal {
+                original_present: false,
+                original_fingerprint: fingerprint(&[]),
+                backup_file_name: None,
+            })
+        }
+        _ => Err(CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: "original helper stanza value and representation must agree".to_string(),
+        }),
+    }
+}
+
+fn load_helper_stanza_backup_read_only(
+    paths: &SwitchPaths,
+    journal: &mut SwitchJournal,
+) -> Result<(), CodexSwitchError> {
+    let Some(metadata) = journal.helper_stanza_backup.clone() else {
+        return validate_legacy_helper_stanza_fields(paths.state.as_path(), journal);
+    };
+    let Some(path) = helper_stanza_backup_path(paths, &metadata)? else {
+        journal.original_helper_stanza = None;
+        journal.original_helper_stanza_repr = None;
+        return Ok(());
+    };
+    let backup = read_config_snapshot(path.as_path())?;
+    validate_config_topology(path.as_path(), backup.present)?;
+    if !backup.present {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "the secure Codex helper stanza backup is missing".to_string(),
+        });
+    }
+    if backup.fingerprint != metadata.original_fingerprint {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "the secure Codex helper stanza backup does not match its recorded fingerprint"
+                .to_string(),
+        });
+    }
+    let semantic = parse_helper_stanza_repr(path.as_path(), backup.text.as_str())?;
+    journal.original_helper_stanza = Some(semantic);
+    journal.original_helper_stanza_repr = Some(backup.text);
+    Ok(())
+}
+
+fn current_original_helper_stanza_repr(
+    paths: &SwitchPaths,
+    current: &ConfigSnapshot,
+    metadata: &HelperStanzaJournal,
+) -> Result<Option<String>, CodexSwitchError> {
+    if !current.present || !metadata.original_present {
+        return Ok(None);
+    }
+    let document = editable_document(paths.config.as_path(), current.text.as_str())?;
+    Ok(
+        helper_stanza_repr_from_document(paths.config.as_path(), &document)?
+            .filter(|repr| fingerprint(repr.as_bytes()) == metadata.original_fingerprint),
+    )
+}
+
+fn load_helper_stanza_backup_or_restored_config(
+    paths: &SwitchPaths,
+    journal: &mut SwitchJournal,
+    current: &ConfigSnapshot,
+) -> Result<(), CodexSwitchError> {
+    match load_helper_stanza_backup_read_only(paths, journal) {
+        Ok(()) => Ok(()),
+        Err(CodexSwitchError::RecoveryRequired { .. })
+            if journal.phase == JournalPhase::Restored
+                && journal.operation == JournalOperation::Off =>
+        {
+            let metadata = journal.helper_stanza_backup.clone().ok_or_else(|| {
+                CodexSwitchError::InvalidState {
+                    path: paths.state.clone(),
+                    reason: "helper stanza recovery metadata is missing".to_string(),
+                }
+            })?;
+            let Some(repr) = current_original_helper_stanza_repr(paths, current, &metadata)? else {
+                return Err(CodexSwitchError::RecoveryRequired {
+                    reason: "the secure Codex helper stanza backup is missing or changed after the original stanza was replaced"
+                        .to_string(),
+                });
+            };
+            let semantic = parse_helper_stanza_repr(paths.config.as_path(), repr.as_str())?;
+            journal.original_helper_stanza = Some(semantic);
+            journal.original_helper_stanza_repr = Some(repr);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_helper_stanza_backup(
+    paths: &SwitchPaths,
+    journal: &mut SwitchJournal,
+    current: &ConfigSnapshot,
+) -> Result<(), CodexSwitchError> {
+    let migrates_version = journal.version == LEGACY_STATE_VERSION;
+    if journal.helper_stanza_backup.is_none() {
+        if !migrates_version {
+            return Err(CodexSwitchError::InvalidState {
+                path: paths.state.clone(),
+                reason: "version 2 switch state is missing helper stanza recovery metadata"
+                    .to_string(),
+            });
+        }
+        validate_legacy_helper_stanza_fields(paths.state.as_path(), journal)?;
+        let legacy_repr = journal.original_helper_stanza_repr.clone();
+        let deterministic_backup_id = legacy_repr.as_ref().map(|_| journal.operation_id.as_str());
+        journal.helper_stanza_backup = Some(prepare_helper_stanza_journal(
+            paths.state.as_path(),
+            journal.original_helper_stanza.as_ref(),
+            journal.original_helper_stanza_repr.as_deref(),
+            deterministic_backup_id,
+        )?);
+        if let Some(repr) = legacy_repr {
+            let metadata = journal.helper_stanza_backup.as_ref().ok_or_else(|| {
+                CodexSwitchError::InvalidState {
+                    path: paths.state.clone(),
+                    reason: "helper stanza recovery metadata is missing".to_string(),
+                }
+            })?;
+            let path = helper_stanza_backup_path(paths, metadata)?.ok_or_else(|| {
+                CodexSwitchError::InvalidState {
+                    path: paths.state.clone(),
+                    reason: "present original helper stanza is missing its backup path".to_string(),
+                }
+            })?;
+            atomic_write_text(path.as_path(), repr.as_str(), FilePermissions::Secure, None)?;
+        }
+        load_helper_stanza_backup_read_only(paths, journal)?;
+        journal.version = STATE_VERSION;
+        write_current_journal(paths, journal)?;
+        return Ok(());
+    }
+
+    match load_helper_stanza_backup_read_only(paths, journal) {
+        Ok(()) => {
+            if migrates_version {
+                journal.version = STATE_VERSION;
+                write_current_journal(paths, journal)?;
+            }
+            return Ok(());
+        }
+        Err(CodexSwitchError::RecoveryRequired { .. }) => {}
+        Err(error) => return Err(error),
+    }
+
+    let metadata =
+        journal
+            .helper_stanza_backup
+            .clone()
+            .ok_or_else(|| CodexSwitchError::InvalidState {
+                path: paths.state.clone(),
+                reason: "helper stanza recovery metadata is missing".to_string(),
+            })?;
+    let Some(repr) = current_original_helper_stanza_repr(paths, current, &metadata)? else {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: "the secure Codex helper stanza backup is missing or changed after the original stanza was replaced"
+                .to_string(),
+        });
+    };
+    let path = helper_stanza_backup_path(paths, &metadata)?.ok_or_else(|| {
+        CodexSwitchError::InvalidState {
+            path: paths.state.clone(),
+            reason: "present original helper stanza is missing its backup path".to_string(),
+        }
+    })?;
+    atomic_write_text(path.as_path(), repr.as_str(), FilePermissions::Secure, None)?;
+    load_helper_stanza_backup_read_only(paths, journal)?;
+    if migrates_version {
+        journal.version = STATE_VERSION;
+        write_current_journal(paths, journal)?;
+    }
+    Ok(())
+}
+
+fn remove_helper_stanza_backup(
+    paths: &SwitchPaths,
+    journal: &HelperStanzaJournal,
+) -> Result<(), CodexSwitchError> {
+    if let Some(path) = helper_stanza_backup_path(paths, journal)? {
+        remove_file_durable(path.as_path())?;
+    }
+    Ok(())
 }
 
 fn managed_auth_backup_name(name: &str) -> bool {
@@ -1565,9 +2130,17 @@ fn apply_on(
     target: ValidatedCodexBaseUrl,
     client_patch: CodexClientPatchConfig,
     failpoint: ApplyFailpoint,
+    requested_auto_restore_generation: Option<String>,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     match journal {
-        None => begin_on(paths, current, target, client_patch, failpoint),
+        None => begin_on(
+            paths,
+            current,
+            target,
+            client_patch,
+            failpoint,
+            requested_auto_restore_generation,
+        ),
         Some(journal) => match journal.phase {
             JournalPhase::RecoveryRequired => Err(CodexSwitchError::RecoveryRequired {
                 reason: journal
@@ -1576,11 +2149,13 @@ fn apply_on(
             }),
             JournalPhase::Applied => {
                 let mut repaired_retained_auth = false;
-                if !current.matches_applied(&journal) {
+                let config_matches =
+                    managed_config_matches(paths.config.as_path(), &current, &journal)?;
+                if !config_matches.applied {
                     return mark_recovery(
                         paths,
                         journal,
-                        "Codex config changed after helper applied its provider stanza",
+                        "helper-owned Codex fields changed after the switch was applied",
                     );
                 }
                 if let Some(auth_journal) = journal.auth_patch.clone() {
@@ -1632,6 +2207,12 @@ fn apply_on(
                 }
                 ensure_target_matches(&journal, &target)?;
                 if journal.records_complete_client_patch(client_patch) {
+                    let mut journal = journal;
+                    reconcile_auto_restore_generation(
+                        paths,
+                        &mut journal,
+                        requested_auto_restore_generation.as_deref(),
+                    )?;
                     outcome(
                         paths,
                         if repaired_retained_auth {
@@ -1641,17 +2222,47 @@ fn apply_on(
                         },
                     )
                 } else {
-                    reapply_on_after_off(paths, current, journal, target, client_patch, failpoint)
+                    reapply_on_after_off(
+                        paths,
+                        current,
+                        journal,
+                        target,
+                        client_patch,
+                        failpoint,
+                        requested_auto_restore_generation,
+                    )
                 }
             }
-            JournalPhase::Prepared => match journal.operation {
-                JournalOperation::On
-                    if current.matches_applied(&journal) || current.matches_original(&journal) =>
-                {
-                    ensure_target_matches(&journal, &target)?;
-                    if journal.records_complete_client_patch(client_patch) {
-                        resume_on(paths, journal, failpoint, None)
-                    } else {
+            JournalPhase::Prepared => {
+                let config_matches =
+                    managed_config_matches(paths.config.as_path(), &current, &journal)?;
+                match journal.operation {
+                    JournalOperation::On
+                        if current.matches_original(&journal) || config_matches.applied =>
+                    {
+                        ensure_target_matches(&journal, &target)?;
+                        if journal.records_complete_client_patch(client_patch) {
+                            let mut journal = journal;
+                            reconcile_auto_restore_generation(
+                                paths,
+                                &mut journal,
+                                requested_auto_restore_generation.as_deref(),
+                            )?;
+                            resume_on(paths, journal, failpoint, None)
+                        } else {
+                            reapply_on_after_off(
+                                paths,
+                                current,
+                                journal,
+                                target,
+                                client_patch,
+                                failpoint,
+                                requested_auto_restore_generation,
+                            )
+                        }
+                    }
+                    JournalOperation::Off if config_matches.original || config_matches.applied => {
+                        ensure_target_matches(&journal, &target)?;
                         reapply_on_after_off(
                             paths,
                             current,
@@ -1659,33 +2270,57 @@ fn apply_on(
                             target,
                             client_patch,
                             failpoint,
+                            requested_auto_restore_generation,
                         )
                     }
+                    _ => mark_recovery(
+                        paths,
+                        journal,
+                        "helper-owned Codex fields match neither the prepared original nor applied projection",
+                    ),
                 }
-                JournalOperation::Off
-                    if current.matches_original(&journal) || current.matches_applied(&journal) =>
-                {
-                    ensure_target_matches(&journal, &target)?;
-                    reapply_on_after_off(paths, current, journal, target, client_patch, failpoint)
-                }
-                _ => mark_recovery(
-                    paths,
-                    journal,
-                    "Codex config matches neither the prepared original nor applied fingerprint",
-                ),
-            },
+            }
             JournalPhase::Restored => {
-                if !current.matches_original(&journal) && !current.matches_applied(&journal) {
+                let config_matches =
+                    managed_config_matches(paths.config.as_path(), &current, &journal)?;
+                if !config_matches.original && !config_matches.applied {
                     return mark_recovery(
                         paths,
                         journal,
-                        "Codex config no longer matches the retained switch recovery point",
+                        "helper-owned Codex fields no longer match the retained switch recovery point",
                     );
                 }
-                reapply_on_after_off(paths, current, journal, target, client_patch, failpoint)
+                reapply_on_after_off(
+                    paths,
+                    current,
+                    journal,
+                    target,
+                    client_patch,
+                    failpoint,
+                    requested_auto_restore_generation,
+                )
             }
         },
     }
+}
+
+fn reconcile_auto_restore_generation(
+    paths: &SwitchPaths,
+    journal: &mut SwitchJournal,
+    requested: Option<&str>,
+) -> Result<(), CodexSwitchError> {
+    let next = match requested {
+        None => None,
+        Some(generation) if journal.auto_restore_generation.is_some() => {
+            Some(generation.to_string())
+        }
+        Some(_) => None,
+    };
+    if journal.auto_restore_generation != next {
+        journal.auto_restore_generation = next;
+        write_current_journal(paths, journal)?;
+    }
+    Ok(())
 }
 
 fn reapply_on_after_off(
@@ -1695,13 +2330,18 @@ fn reapply_on_after_off(
     target: ValidatedCodexBaseUrl,
     client_patch: CodexClientPatchConfig,
     failpoint: ApplyFailpoint,
+    requested_auto_restore_generation: Option<String>,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     let retained_auth = journal.auth_patch.clone().map(|auth| RetainedAuthJournal {
         client_patch: journal.recorded_auth_client_patch(),
         auth,
     });
+    let retained_helper_stanza_backup = journal.helper_stanza_backup.clone();
     preflight_reapply_after_off(paths, &current, &journal, &target, client_patch)?;
     apply_off(paths, current, Some(journal), failpoint)?;
+    if let Some(helper_stanza_backup) = retained_helper_stanza_backup.as_ref() {
+        remove_helper_stanza_backup(paths, helper_stanza_backup)?;
+    }
     let restored = read_config_snapshot(paths.config.as_path())?;
     if let Some(retained_auth) = retained_auth.as_ref() {
         ensure_retained_auth_is_still_original(paths, &retained_auth.auth)?;
@@ -1712,6 +2352,7 @@ fn reapply_on_after_off(
         target,
         client_patch,
         failpoint,
+        requested_auto_restore_generation,
         retained_auth.as_ref(),
     )
 }
@@ -1739,17 +2380,20 @@ fn preflight_reapply_after_off(
     target: &ValidatedCodexBaseUrl,
     client_patch: CodexClientPatchConfig,
 ) -> Result<(), CodexSwitchError> {
-    let restored = if current.matches_original(journal) {
+    let config_matches = managed_config_matches(paths.config.as_path(), current, journal)?;
+    let restored = if config_matches.original {
         current.clone()
-    } else if current.matches_applied(journal) {
+    } else if config_matches.applied {
         let edit = patch_off(paths.config.as_path(), current.text.as_str(), journal)?;
-        if !edit.matches_original(journal) {
+        if !managed_config_matches(paths.config.as_path(), &edit.snapshot(), journal)?.original {
             return Err(CodexSwitchError::RestoreFingerprintMismatch);
         }
         edit.into_snapshot()
     } else {
         return Err(CodexSwitchError::RecoveryRequired {
-            reason: "Codex config cannot be preflighted from its recorded switch state".to_string(),
+            reason:
+                "helper-owned Codex fields cannot be preflighted from their recorded switch state"
+                    .to_string(),
         });
     };
     let original = inspect_config(paths.config.as_path(), restored.text.as_str())?;
@@ -1848,8 +2492,17 @@ fn begin_on(
     target: ValidatedCodexBaseUrl,
     client_patch: CodexClientPatchConfig,
     failpoint: ApplyFailpoint,
+    auto_restore_generation: Option<String>,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
-    begin_on_with_retained_auth(paths, current, target, client_patch, failpoint, None)
+    begin_on_with_retained_auth(
+        paths,
+        current,
+        target,
+        client_patch,
+        failpoint,
+        auto_restore_generation,
+        None,
+    )
 }
 
 fn begin_on_with_retained_auth(
@@ -1858,6 +2511,7 @@ fn begin_on_with_retained_auth(
     target: ValidatedCodexBaseUrl,
     client_patch: CodexClientPatchConfig,
     failpoint: ApplyFailpoint,
+    auto_restore_generation: Option<String>,
     retained_auth: Option<&RetainedAuthJournal>,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
     validate_config_topology(paths.config.as_path(), current.present)?;
@@ -1872,7 +2526,15 @@ fn begin_on_with_retained_auth(
         target.as_str(),
         client_patch,
     )?;
+    let helper_stanza_backup = prepare_helper_stanza_journal(
+        paths.config.as_path(),
+        original.helper_stanza.as_ref(),
+        patch.original_helper_stanza_repr.as_deref(),
+        None,
+    )?;
     let applied_fingerprint = fingerprint(patch.text.as_bytes());
+    let planned_destination = ConfigSnapshot::from_text(true, patch.text.clone());
+    let pending_config = PendingConfigCommit::new(&current, &planned_destination);
     let planned_write = PlannedOnWrite {
         original_text: current.text,
         applied_text: patch.text,
@@ -1886,13 +2548,16 @@ fn begin_on_with_retained_auth(
         original_config_present: current.present,
         original_fingerprint: current.fingerprint,
         applied_fingerprint,
+        pending_config: Some(pending_config),
+        auto_restore_generation,
         original_model_provider: original.model_provider,
         original_model_provider_repr: patch.original_model_provider_repr,
         original_helper_stanza: original.helper_stanza,
+        original_helper_stanza_repr: patch.original_helper_stanza_repr,
+        helper_stanza_backup: Some(helper_stanza_backup),
         original_model_providers_present: original.model_providers_present,
         target_base_url: target.0,
-        client_facade: CodexClientFacade::for_client_patch(client_patch)?,
-        client_patch: Some(client_patch),
+        client_patch,
         original_features_present: patch.original_features_present,
         original_remote_compaction_v2: patch.original_remote_compaction_v2,
         original_image_generation: patch.original_image_generation,
@@ -1976,15 +2641,21 @@ fn resume_on(
     failpoint: ApplyFailpoint,
     planned_write: Option<PlannedOnWrite>,
 ) -> Result<CodexSwitchOutcome, CodexSwitchError> {
-    fail_if_requested(failpoint, ApplyFailpoint::AfterPrepared)?;
-
     let current = read_config_snapshot(paths.config.as_path())?;
-    let mut resumed_existing_write = current.matches_applied(&journal);
-    if !current.matches_original(&journal) && !current.matches_applied(&journal) {
+    if let Err(error) = ensure_helper_stanza_backup(paths, &mut journal, &current) {
+        return match error {
+            CodexSwitchError::RecoveryRequired { reason } => mark_recovery(paths, journal, reason),
+            error => Err(error),
+        };
+    }
+    fail_if_requested(failpoint, ApplyFailpoint::AfterPrepared)?;
+    let config_matches = managed_config_matches(paths.config.as_path(), &current, &journal)?;
+    let mut resumed_existing_write = config_matches.applied;
+    if !current.matches_original(&journal) && !config_matches.applied {
         return mark_recovery(
             paths,
             journal,
-            "Codex config changed between switch preparation and write",
+            "Codex config changed before the prepared switch write, or helper-owned fields changed after it",
         );
     }
     if let Err(error) = validate_config_topology(paths.config.as_path(), current.present) {
@@ -2056,12 +2727,8 @@ fn resume_on(
             );
         }
 
-        match write_current_config_edit(
-            paths,
-            ConfigEdit::Write(applied_text),
-            &journal,
-            ExpectedConfigState::Original,
-        ) {
+        match write_current_config_edit(paths, ConfigEdit::Write(applied_text), &journal, &current)
+        {
             Ok(()) => {}
             Err(CodexSwitchError::RecoveryRequired { reason }) => {
                 return mark_recovery(paths, journal, reason);
@@ -2071,11 +2738,11 @@ fn resume_on(
         fail_if_requested(failpoint, ApplyFailpoint::AfterConfigWrite)?;
     }
     let written = read_config_snapshot(paths.config.as_path())?;
-    if !written.matches_applied(&journal) {
+    if !managed_config_matches(paths.config.as_path(), &written, &journal)?.applied {
         return mark_recovery(
             paths,
             journal,
-            "Codex config changed before the applied switch state was committed",
+            "helper-owned Codex fields changed before the applied switch state was committed",
         );
     }
 
@@ -2157,9 +2824,10 @@ fn resume_on(
         }
     }
 
-    journal.phase = JournalPhase::Applied;
-    write_current_journal(paths, &journal)?;
     recover_interrupted_file_captures(paths, &mut journal)?;
+    journal.phase = JournalPhase::Applied;
+    journal.pending_config = None;
+    write_current_journal(paths, &journal)?;
     outcome(
         paths,
         if resumed_existing_write {
@@ -2189,11 +2857,13 @@ fn apply_off(
                 .unwrap_or_else(|| "stored switch state requires reconciliation".to_string()),
         }),
         JournalPhase::Applied => {
-            if !current.matches_applied(&journal) && !current.matches_original(&journal) {
+            let config_matches =
+                managed_config_matches(paths.config.as_path(), &current, &journal)?;
+            if !config_matches.applied && !config_matches.original {
                 return mark_recovery(
                     paths,
                     journal,
-                    "Codex config changed after helper applied its provider stanza",
+                    "helper-owned Codex fields changed after the switch was applied",
                 );
             }
             if let Some(auth_journal) = journal.auth_patch.clone() {
@@ -2230,11 +2900,13 @@ fn apply_off(
             begin_off(paths, journal, failpoint, false)
         }
         JournalPhase::Prepared => {
-            if !current.matches_original(&journal) && !current.matches_applied(&journal) {
+            let config_matches =
+                managed_config_matches(paths.config.as_path(), &current, &journal)?;
+            if !config_matches.original && !config_matches.applied {
                 return mark_recovery(
                     paths,
                     journal,
-                    "Codex config matches neither the prepared original nor applied fingerprint",
+                    "helper-owned Codex fields match neither the prepared original nor applied projection",
                 );
             }
             if let Some(auth_journal) = journal.auth_patch.clone() {
@@ -2273,17 +2945,19 @@ fn apply_off(
             match journal.operation {
                 JournalOperation::On => begin_off(paths, journal, failpoint, true),
                 JournalOperation::Off => {
-                    let resumed = current.matches_original(&journal);
+                    let resumed = config_matches.original;
                     resume_off(paths, journal, failpoint, resumed)
                 }
             }
         }
         JournalPhase::Restored => {
-            if !current.matches_original(&journal) && !current.matches_applied(&journal) {
+            let config_matches =
+                managed_config_matches(paths.config.as_path(), &current, &journal)?;
+            if !config_matches.original && !config_matches.applied {
                 return mark_recovery(
                     paths,
                     journal,
-                    "Codex config no longer matches the retained switch recovery point",
+                    "helper-owned Codex fields no longer match the retained switch recovery point",
                 );
             }
             if let Some(auth_journal) = journal.auth_patch.clone() {
@@ -2331,6 +3005,7 @@ fn begin_off(
     journal.phase = JournalPhase::Prepared;
     journal.operation = JournalOperation::Off;
     journal.operation_id = Uuid::new_v4().to_string();
+    journal.pending_config = None;
     journal.recovery_reason = None;
     write_current_journal(paths, &journal)?;
     resume_off(paths, journal, failpoint, resumed)
@@ -2345,29 +3020,33 @@ fn resume_off(
     fail_if_requested(failpoint, ApplyFailpoint::AfterPrepared)?;
 
     let current = read_config_snapshot(paths.config.as_path())?;
-    if !current.matches_applied(&journal) && !current.matches_original(&journal) {
+    let config_matches = managed_config_matches(paths.config.as_path(), &current, &journal)?;
+    if !config_matches.applied && !config_matches.original {
         return mark_recovery(
             paths,
             journal,
-            "Codex config changed between switch-off preparation and write",
+            "helper-owned Codex fields changed between switch-off preparation and write",
         );
     }
     if let Err(error) = validate_config_topology(paths.config.as_path(), current.present) {
         return mark_recovery(paths, journal, error.to_string());
     }
-    if current.matches_applied(&journal) && !current.matches_original(&journal) {
+    if config_matches.applied && !config_matches.original {
         let edit = patch_off(paths.config.as_path(), current.text.as_str(), &journal)?;
-        if !edit.matches_original(&journal) {
+        let destination = edit.snapshot();
+        if !managed_config_matches(paths.config.as_path(), &destination, &journal)?.original {
             journal.phase = JournalPhase::RecoveryRequired;
             journal.recovery_reason = Some(
-                "restoring the helper stanza would not reproduce the original fingerprint"
+                "restoring helper-owned Codex fields would not reproduce the original managed projection"
                     .to_string(),
             );
             write_current_journal(paths, &journal)?;
             return Err(CodexSwitchError::RestoreFingerprintMismatch);
         }
+        journal.pending_config = Some(PendingConfigCommit::new(&current, &destination));
+        write_current_journal(paths, &journal)?;
 
-        match write_current_config_edit(paths, edit, &journal, ExpectedConfigState::Applied) {
+        match write_current_config_edit(paths, edit, &journal, &current) {
             Ok(()) => {}
             Err(CodexSwitchError::RecoveryRequired { reason }) => {
                 return mark_recovery(paths, journal, reason);
@@ -2377,11 +3056,11 @@ fn resume_off(
         fail_if_requested(failpoint, ApplyFailpoint::AfterConfigWrite)?;
     }
     let written = read_config_snapshot(paths.config.as_path())?;
-    if !written.matches_original(&journal) {
+    if !managed_config_matches(paths.config.as_path(), &written, &journal)?.original {
         return mark_recovery(
             paths,
             journal,
-            "Codex config changed before switch-off completion was committed",
+            "helper-owned Codex fields changed before switch-off completion was committed",
         );
     }
 
@@ -2457,12 +3136,17 @@ fn resume_off(
             );
         }
     }
+    recover_interrupted_file_captures(paths, &mut journal)?;
     journal.phase = JournalPhase::Restored;
     journal.operation = JournalOperation::Off;
+    journal.pending_config = None;
     journal.recovery_reason = None;
     write_current_journal(paths, &journal)?;
-    recover_interrupted_file_captures(paths, &mut journal)?;
     if journal.auth_patch.is_none() {
+        if let Some(helper_stanza_backup) = journal.helper_stanza_backup.as_ref() {
+            remove_helper_stanza_backup(paths, helper_stanza_backup)?;
+        }
+        fail_if_requested(failpoint, ApplyFailpoint::AfterHelperStanzaBackupRemoval)?;
         remove_current_journal(paths)?;
     }
     outcome(
@@ -2507,9 +3191,26 @@ fn outcome(
     reject_legacy_switch_state(paths)?;
     let current = read_config_snapshot(paths.config.as_path())?;
     let journal = read_journal(paths.state.as_path())?;
+    let restore_lease = journal.as_ref().and_then(|journal| {
+        (journal.phase == JournalPhase::Applied && journal.operation == JournalOperation::On)
+            .then(|| {
+                journal
+                    .auto_restore_generation
+                    .as_ref()
+                    .map(|generation| CodexSwitchRestoreLease {
+                        state_path: paths.state.clone(),
+                        config_path_fingerprint: journal.config_path_fingerprint.clone(),
+                        operation_id: journal.operation_id.clone(),
+                        applied_fingerprint: journal.applied_fingerprint.clone(),
+                        auto_restore_generation: generation.clone(),
+                    })
+            })
+            .flatten()
+    });
     Ok(CodexSwitchOutcome {
         change,
-        status: status_from_snapshot(paths, &current, journal.as_ref())?,
+        status: status_from_snapshot(paths, &current, journal.as_ref(), None)?,
+        restore_lease,
     })
 }
 
@@ -2517,7 +3218,9 @@ fn status_from_snapshot(
     paths: &SwitchPaths,
     current: &ConfigSnapshot,
     journal: Option<&SwitchJournal>,
+    journal_state_path: Option<&Path>,
 ) -> Result<CodexSwitchStatus, CodexSwitchError> {
+    let state_path = journal_state_path.unwrap_or(paths.state.as_path());
     if let Some(journal) = journal
         && journal.config_path_fingerprint != paths.config_fingerprint
     {
@@ -2526,13 +3229,12 @@ fn status_from_snapshot(
             enabled: false,
             managed: true,
             base_url: Some(journal.target_base_url.clone()),
-            client_facade: Some(journal.client_facade),
-            client_patch: journal.client_patch,
+            client_patch: Some(journal.client_patch),
             recovery_reason: Some(
                 "switch state belongs to a different Codex config path".to_string(),
             ),
             config_path: paths.config.clone(),
-            state_path: paths.state.clone(),
+            state_path: state_path.to_path_buf(),
         });
     }
     if let Some(journal) = journal
@@ -2545,13 +3247,12 @@ fn status_from_snapshot(
             enabled: false,
             managed: true,
             base_url: Some(journal.target_base_url.clone()),
-            client_facade: Some(journal.client_facade),
-            client_patch: journal.client_patch,
+            client_patch: Some(journal.client_patch),
             recovery_reason: Some(
                 "switch state belongs to a different Codex auth.json path".to_string(),
             ),
             config_path: paths.config.clone(),
-            state_path: paths.state.clone(),
+            state_path: state_path.to_path_buf(),
         });
     }
 
@@ -2561,8 +3262,7 @@ fn status_from_snapshot(
     let config_base_url = config.helper_base_url;
 
     let Some(journal) = journal else {
-        let orphaned =
-            config.model_provider.as_deref() == Some(PROVIDER_ID) || config.helper_stanza.is_some();
+        let orphaned = config.model_provider.as_deref() == Some(PROVIDER_ID);
         return Ok(CodexSwitchStatus {
             phase: if orphaned {
                 CodexSwitchPhase::RecoveryRequired
@@ -2572,15 +3272,20 @@ fn status_from_snapshot(
             enabled,
             managed: false,
             base_url: config_base_url,
-            client_facade: None,
             client_patch: None,
             recovery_reason: orphaned.then(|| {
                 "helper provider config exists without helper-owned switch state".to_string()
             }),
             config_path: paths.config.clone(),
-            state_path: paths.state.clone(),
+            state_path: state_path.to_path_buf(),
         });
     };
+    let mut journal = journal.clone();
+    let helper_stanza_recovery_reason =
+        load_helper_stanza_backup_or_restored_config(paths, &mut journal, current)
+            .err()
+            .map(|error| error.to_string());
+    let journal = &journal;
     let auth_should_be_applied = journal_patches_auth(paths, journal)?;
 
     if let Err(error) = validate_config_topology(paths.config.as_path(), current.present) {
@@ -2589,11 +3294,10 @@ fn status_from_snapshot(
             enabled,
             managed: true,
             base_url: config_base_url.or_else(|| Some(journal.target_base_url.clone())),
-            client_facade: Some(journal.client_facade),
-            client_patch: journal.client_patch,
+            client_patch: Some(journal.client_patch),
             recovery_reason: Some(error.to_string()),
             config_path: paths.config.clone(),
-            state_path: paths.state.clone(),
+            state_path: state_path.to_path_buf(),
         });
     }
 
@@ -2640,8 +3344,17 @@ fn status_from_snapshot(
         } else {
             (true, true, None)
         };
+    let config_matches = if helper_stanza_recovery_reason.is_none() {
+        managed_config_matches(paths.config.as_path(), current, journal)?
+    } else {
+        ManagedConfigMatches {
+            original: false,
+            applied: false,
+        }
+    };
 
-    let (phase, recovery_reason) = if let Some(reason) = auth_recovery_reason {
+    let recovery_material_reason = helper_stanza_recovery_reason.or(auth_recovery_reason);
+    let (phase, recovery_reason) = if let Some(reason) = recovery_material_reason {
         (CodexSwitchPhase::RecoveryRequired, Some(reason))
     } else {
         match journal.phase {
@@ -2650,7 +3363,7 @@ fn status_from_snapshot(
                 journal.recovery_reason.clone(),
             ),
             JournalPhase::Applied
-                if current.matches_applied(journal)
+                if config_matches.applied
                     && if auth_should_be_applied {
                         auth_matches_applied
                     } else {
@@ -2660,7 +3373,7 @@ fn status_from_snapshot(
                 (CodexSwitchPhase::Applied, None)
             }
             JournalPhase::Restored
-                if current.matches_original(journal) && auth_matches_original =>
+                if config_matches.original && auth_matches_original =>
             {
                 (CodexSwitchPhase::Off, None)
             }
@@ -2672,14 +3385,17 @@ fn status_from_snapshot(
                 ),
             ),
             JournalPhase::Prepared
-                if (current.matches_original(journal) || current.matches_applied(journal))
+                if (config_matches.original || config_matches.applied)
                     && (auth_matches_original || auth_matches_applied) =>
             {
                 (CodexSwitchPhase::Prepared, None)
             }
             _ => (
                 CodexSwitchPhase::RecoveryRequired,
-                Some("current Codex config does not match switch journal fingerprints".to_string()),
+                Some(
+                    "helper-owned Codex fields do not match the switch journal projection"
+                        .to_string(),
+                ),
             ),
         }
     };
@@ -2689,11 +3405,10 @@ fn status_from_snapshot(
         enabled,
         managed: true,
         base_url: config_base_url.or_else(|| Some(journal.target_base_url.clone())),
-        client_facade: Some(journal.client_facade),
-        client_patch: journal.client_patch,
+        client_patch: Some(journal.client_patch),
         recovery_reason,
         config_path: paths.config.clone(),
-        state_path: paths.state.clone(),
+        state_path: state_path.to_path_buf(),
     })
 }
 
@@ -2702,16 +3417,122 @@ struct ConfigInspection {
     helper_stanza: Option<TomlValue>,
     helper_base_url: Option<String>,
     model_providers_present: bool,
+    features: Option<TomlValue>,
 }
 
 fn reject_unowned_helper_config(config: &ConfigInspection) -> Result<(), CodexSwitchError> {
     if config.model_provider.as_deref() == Some(PROVIDER_ID) {
         return Err(CodexSwitchError::OrphanedActiveProvider);
     }
-    if config.helper_stanza.is_some() {
-        return Err(CodexSwitchError::ForeignProviderStanza);
-    }
     Ok(())
+}
+
+pub(crate) fn project_original_codex_config<T>(
+    project: impl FnOnce(Option<&str>, CodexAuthMetadata) -> T,
+) -> Result<T, CodexSwitchError> {
+    let paths = SwitchPaths::resolve()?;
+    let _lock = OperationLock::acquire(paths.lock.as_path())?;
+    reject_legacy_switch_state(&paths)?;
+
+    project_original_codex_config_locked(&paths, project)
+}
+
+pub(crate) fn project_original_codex_config_for_onboarding<T>(
+    project: impl FnOnce(Option<&str>, CodexAuthMetadata) -> T,
+) -> Result<T, CodexSwitchError> {
+    let paths = SwitchPaths::resolve()?;
+    let _lock = OperationLock::acquire(paths.lock.as_path())?;
+    cleanup_managed_switch_artifacts(&paths)?;
+    if legacy_state_present(paths.legacy_state.as_path())? {
+        if let Some(current_path) = current_journal_path_entry(&paths)? {
+            return Err(CodexSwitchError::LegacySwitchStateConflict {
+                legacy_path: paths.legacy_state.clone(),
+                current_path,
+            });
+        }
+        recover_legacy_switch_state(&paths, ApplyFailpoint::None)?;
+    }
+
+    project_original_codex_config_locked(&paths, project)
+}
+
+fn project_original_codex_config_locked<T>(
+    paths: &SwitchPaths,
+    project: impl FnOnce(Option<&str>, CodexAuthMetadata) -> T,
+) -> Result<T, CodexSwitchError> {
+    let current = read_config_snapshot(paths.config.as_path())?;
+    validate_config_topology(paths.config.as_path(), current.present)?;
+    let located_journal = read_inspection_journal_snapshot(paths)?;
+    let (mut original, mut original_auth) = match located_journal {
+        None => {
+            let inspection = inspect_config(paths.config.as_path(), current.text.as_str())?;
+            reject_unowned_helper_config(&inspection)?;
+            (current, None)
+        }
+        Some(located) => {
+            let mut journal = located.snapshot.journal;
+            load_helper_stanza_backup_or_restored_config(paths, &mut journal, &current)?;
+            let journal = &journal;
+            ensure_journal_config_matches(paths, journal)?;
+            let status =
+                status_from_snapshot(paths, &current, Some(journal), Some(located.path.as_path()))?;
+            let journal_is_stable = matches!(
+                (journal.phase, status.phase),
+                (JournalPhase::Applied, CodexSwitchPhase::Applied)
+                    | (JournalPhase::Restored, CodexSwitchPhase::Off)
+            );
+            if !journal_is_stable {
+                return Err(CodexSwitchError::RecoveryRequired {
+                    reason: status.recovery_reason.unwrap_or_else(|| {
+                        format!(
+                            "Codex switch is {}; recover it before automatic onboarding",
+                            status.phase.as_str()
+                        )
+                    }),
+                });
+            }
+            let config_matches = managed_config_matches(paths.config.as_path(), &current, journal)?;
+            let original = match journal.phase {
+                JournalPhase::Applied if config_matches.applied => {
+                    let edit = patch_off(paths.config.as_path(), current.text.as_str(), journal)?;
+                    if !managed_config_matches(paths.config.as_path(), &edit.snapshot(), journal)?
+                        .original
+                    {
+                        return Err(CodexSwitchError::RestoreFingerprintMismatch);
+                    }
+                    edit.into_snapshot()
+                }
+                JournalPhase::Restored if config_matches.original => current,
+                _ => {
+                    return Err(CodexSwitchError::RecoveryRequired {
+                        reason: "current Codex config does not match the switch journal; recover it before automatic onboarding"
+                            .to_string(),
+                    });
+                }
+            };
+            let original_auth = journal
+                .auth_patch
+                .as_ref()
+                .map(|_| original_auth_snapshot_for_reapply(paths, journal))
+                .transpose()?;
+            (original, original_auth)
+        }
+    };
+
+    let original_present = original.present;
+    let original_text = Zeroizing::new(std::mem::take(&mut original.text));
+    let auth_metadata = if let Some(snapshot) = original_auth.as_mut() {
+        let present = snapshot.present;
+        let text = Zeroizing::new(std::mem::take(&mut snapshot.text));
+        codex_auth_metadata_from_json(present.then_some(text.as_str()))
+    } else {
+        read_codex_auth_metadata()
+    };
+    let output = project(
+        original_present.then_some(original_text.as_str()),
+        auth_metadata,
+    );
+    Ok(output)
 }
 
 fn inspect_config(path: &Path, text: &str) -> Result<ConfigInspection, CodexSwitchError> {
@@ -2721,6 +3542,7 @@ fn inspect_config(path: &Path, text: &str) -> Result<ConfigInspection, CodexSwit
             helper_stanza: None,
             helper_base_url: None,
             model_providers_present: false,
+            features: None,
         });
     }
     let value =
@@ -2764,13 +3586,117 @@ fn inspect_config(path: &Path, text: &str) -> Result<ConfigInspection, CodexSwit
         .and_then(|table| table.get("base_url"))
         .and_then(TomlValue::as_str)
         .map(ToOwned::to_owned);
+    let features = root.get("features").cloned();
 
     Ok(ConfigInspection {
         model_provider,
         helper_stanza,
         helper_base_url,
         model_providers_present: providers.is_some(),
+        features,
     })
+}
+
+fn managed_config_matches(
+    path: &Path,
+    current: &ConfigSnapshot,
+    journal: &SwitchJournal,
+) -> Result<ManagedConfigMatches, CodexSwitchError> {
+    let current_config = inspect_config(path, current.text.as_str())?;
+    let client_patch = journal.recovery_client_patch();
+    let compiled = client_patch
+        .compile()
+        .map_err(|error| CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: format!("invalid recorded client patch: {error}"),
+        })?;
+    let expected_applied_text =
+        patch_on(path, "", journal.target_base_url.as_str(), client_patch)?.text;
+    let expected_applied = inspect_config(path, expected_applied_text.as_str())?;
+
+    let original = (!journal.original_config_present || current.present)
+        && current_config.model_provider == journal.original_model_provider
+        && current_config.helper_stanza == journal.original_helper_stanza
+        && managed_feature_matches(
+            path,
+            &current_config,
+            "remote_compaction_v2",
+            compiled.remote_compaction_v2,
+            journal.original_remote_compaction_v2,
+        )?
+        && managed_feature_matches(
+            path,
+            &current_config,
+            "image_generation",
+            compiled.image_generation,
+            journal.original_image_generation,
+        )?;
+    let applied = current.matches_applied(journal)
+        || (current.present
+            && current_config.model_provider.as_deref() == Some(PROVIDER_ID)
+            && current_config.helper_stanza == expected_applied.helper_stanza
+            && managed_feature_matches(
+                path,
+                &current_config,
+                "remote_compaction_v2",
+                compiled.remote_compaction_v2,
+                applied_feature_value(compiled.remote_compaction_v2),
+            )?
+            && managed_feature_matches(
+                path,
+                &current_config,
+                "image_generation",
+                compiled.image_generation,
+                applied_feature_value(compiled.image_generation),
+            )?);
+
+    Ok(ManagedConfigMatches { original, applied })
+}
+
+fn managed_feature_matches(
+    path: &Path,
+    config: &ConfigInspection,
+    key: &str,
+    patch: CodexFeatureBoolPatch,
+    expected: Option<bool>,
+) -> Result<bool, CodexSwitchError> {
+    if patch == CodexFeatureBoolPatch::Preserve {
+        return Ok(true);
+    }
+    Ok(inspected_feature_bool(path, config, key)? == expected)
+}
+
+fn inspected_feature_bool(
+    path: &Path,
+    config: &ConfigInspection,
+    key: &str,
+) -> Result<Option<bool>, CodexSwitchError> {
+    let Some(features) = config.features.as_ref() else {
+        return Ok(None);
+    };
+    let features = features
+        .as_table()
+        .ok_or_else(|| CodexSwitchError::InvalidConfig {
+            path: path.to_path_buf(),
+            reason: "features must be a table".to_string(),
+        })?;
+    let Some(value) = features.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| CodexSwitchError::InvalidConfig {
+            path: path.to_path_buf(),
+            reason: format!("features.{key} must be a boolean"),
+        })
+}
+
+const fn applied_feature_value(patch: CodexFeatureBoolPatch) -> Option<bool> {
+    match patch {
+        CodexFeatureBoolPatch::Preserve => None,
+        CodexFeatureBoolPatch::Set(value) => Some(value),
+    }
 }
 
 fn patch_on(
@@ -2782,6 +3708,7 @@ fn patch_on(
     let compiled = client_patch.compile().map_err(invalid_client_patch_error)?;
     let mut document = editable_document(path, text)?;
     let original_model_provider_repr = model_provider_repr_from_document(path, &document)?;
+    let original_helper_stanza_repr = helper_stanza_repr_from_document(path, &document)?;
     let root = document.as_table_mut();
     let owns_remote_compaction_v2 =
         matches!(compiled.remote_compaction_v2, CodexFeatureBoolPatch::Set(_));
@@ -2847,6 +3774,7 @@ fn patch_on(
     Ok(OnPatch {
         text: document.to_string(),
         original_model_provider_repr,
+        original_helper_stanza_repr,
         original_features_present,
         original_remote_compaction_v2,
         original_image_generation,
@@ -2934,10 +3862,26 @@ fn patch_off(
 
     let remove_model_providers =
         if let Some(providers) = root.get_mut("model_providers").and_then(Item::as_table_mut) {
-            if let Some(original) = journal.original_helper_stanza.as_ref() {
-                providers.insert(PROVIDER_ID, editable_item_from_toml_value(original, path)?);
-            } else {
-                providers.remove(PROVIDER_ID);
+            match (
+                journal.original_helper_stanza.as_ref(),
+                journal.original_helper_stanza_repr.as_deref(),
+            ) {
+                (Some(original), Some(repr)) => {
+                    providers.insert(
+                        PROVIDER_ID,
+                        editable_helper_stanza_from_repr(repr, original, path)?,
+                    );
+                }
+                (None, None) => {
+                    providers.remove(PROVIDER_ID);
+                }
+                _ => {
+                    return Err(CodexSwitchError::InvalidState {
+                        path: path.to_path_buf(),
+                        reason: "original helper stanza value and representation must agree"
+                            .to_string(),
+                    });
+                }
             }
             !journal.original_model_providers_present && providers.is_empty()
         } else {
@@ -2976,10 +3920,12 @@ fn patch_off(
         root.remove("features");
     }
 
-    if !journal.original_config_present && root.is_empty() {
+    let root_is_empty = root.is_empty();
+    let rendered = document.to_string();
+    if !journal.original_config_present && root_is_empty && rendered.trim().is_empty() {
         Ok(ConfigEdit::Remove)
     } else {
-        Ok(ConfigEdit::Write(document.to_string()))
+        Ok(ConfigEdit::Write(rendered))
     }
 }
 
@@ -3054,6 +4000,32 @@ fn model_provider_repr_from_document(
     }
 }
 
+fn helper_stanza_repr_from_document(
+    path: &Path,
+    document: &DocumentMut,
+) -> Result<Option<String>, CodexSwitchError> {
+    let Some(providers) = document.as_table().get("model_providers") else {
+        return Ok(None);
+    };
+    let providers = providers
+        .as_table()
+        .ok_or_else(|| CodexSwitchError::InvalidConfig {
+            path: path.to_path_buf(),
+            reason: "model_providers must be a table".to_string(),
+        })?;
+    let Some(helper) = providers.get(PROVIDER_ID) else {
+        return Ok(None);
+    };
+
+    let mut snapshot = DocumentMut::new();
+    let mut snapshot_providers = Table::new();
+    snapshot_providers.insert(PROVIDER_ID, helper.clone());
+    snapshot
+        .as_table_mut()
+        .insert("model_providers", Item::Table(snapshot_providers));
+    Ok(Some(snapshot.to_string()))
+}
+
 fn editable_string_from_repr(
     repr: &str,
     expected: &str,
@@ -3103,6 +4075,50 @@ fn editable_item_from_toml_value(value: &TomlValue, path: &Path) -> Result<Item,
             path: path.to_path_buf(),
             reason: "original helper stanza is missing".to_string(),
         })
+}
+
+fn editable_helper_stanza_from_repr(
+    repr: &str,
+    expected: &TomlValue,
+    path: &Path,
+) -> Result<Item, CodexSwitchError> {
+    let document = repr
+        .parse::<DocumentMut>()
+        .map_err(|error| CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: sanitized_toml_parse_reason(error.message(), error.span(), repr),
+        })?;
+    let item = document
+        .as_table()
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(PROVIDER_ID))
+        .cloned()
+        .ok_or_else(|| CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: "original helper stanza representation is missing".to_string(),
+        })?;
+    let semantic = toml::from_str::<TomlValue>(repr)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_table()?
+                .get("model_providers")?
+                .as_table()?
+                .get(PROVIDER_ID)
+                .cloned()
+        })
+        .ok_or_else(|| CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: "original helper stanza representation is not a TOML table".to_string(),
+        })?;
+    if &semantic != expected {
+        return Err(CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: "original helper stanza representation does not match its value".to_string(),
+        });
+    }
+    Ok(item)
 }
 
 fn read_config_snapshot(path: &Path) -> Result<ConfigSnapshot, CodexSwitchError> {
@@ -3189,18 +4205,11 @@ fn verify_journal_before_commit(
     expectation: ConfigCommitExpectation<'_>,
 ) -> Result<(), CodexSwitchError> {
     let (present, current_fingerprint) = read_config_identity(path)?;
-    let matches = match expectation.state {
-        ExpectedConfigState::Original => {
-            present == expectation.journal.original_config_present
-                && current_fingerprint == expectation.journal.original_fingerprint
-        }
-        ExpectedConfigState::Applied => {
-            present && current_fingerprint == expectation.journal.applied_fingerprint
-        }
-    };
-    if !matches {
+    if present != expectation.expected.present
+        || current_fingerprint != expectation.expected.fingerprint
+    {
         return Err(CodexSwitchError::RecoveryRequired {
-            reason: "Codex config changed after the final switch fingerprint check".to_string(),
+            reason: "Codex config changed after the final switch snapshot was captured".to_string(),
         });
     }
     validate_config_topology(path, present).map_err(|error| CodexSwitchError::RecoveryRequired {
@@ -3285,6 +4294,85 @@ fn read_journal(path: &Path) -> Result<Option<SwitchJournal>, CodexSwitchError> 
     Ok(read_journal_snapshot(path)?.map(|snapshot| snapshot.journal))
 }
 
+fn read_inspection_journal_snapshot(
+    paths: &SwitchPaths,
+) -> Result<Option<LocatedJournalSnapshot>, CodexSwitchError> {
+    if let Some(snapshot) = read_journal_snapshot(paths.state.as_path())? {
+        return Ok(Some(LocatedJournalSnapshot {
+            path: paths.state.clone(),
+            snapshot,
+        }));
+    }
+    Ok(
+        read_matching_unscoped_journal_snapshot(paths)?.map(|snapshot| LocatedJournalSnapshot {
+            path: paths.unscoped_state.clone(),
+            snapshot,
+        }),
+    )
+}
+
+fn read_matching_unscoped_journal_snapshot(
+    paths: &SwitchPaths,
+) -> Result<Option<JournalSnapshot>, CodexSwitchError> {
+    match std::fs::symlink_metadata(paths.unscoped_state.as_path()) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None),
+    }
+    let snapshot = match read_journal_snapshot(paths.unscoped_state.as_path()) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    Ok((snapshot.journal.config_path_fingerprint == paths.config_fingerprint).then_some(snapshot))
+}
+
+fn migrate_matching_unscoped_journal(paths: &SwitchPaths) -> Result<(), CodexSwitchError> {
+    let Some(before) = read_matching_unscoped_journal_snapshot(paths)? else {
+        return Ok(());
+    };
+    if switch_path_entry_present(paths.state.as_path(), "inspect scoped switch state at")? {
+        return Err(CodexSwitchError::RecoveryRequired {
+            reason: format!(
+                "matching unscoped switch state at {:?} conflicts with scoped switch state at {:?}; neither state was modified",
+                paths.unscoped_state, paths.state
+            ),
+        });
+    }
+
+    prepare_state_directory(paths.state.as_path())?;
+    move_file_no_replace(paths.unscoped_state.as_path(), paths.state.as_path())?;
+    sync_parent_directory(paths.state.as_path())?;
+
+    let migrated = read_journal_snapshot(paths.state.as_path());
+    let unchanged = matches!(
+        migrated.as_ref(),
+        Ok(Some(after)) if after.raw == before.raw && after.journal == before.journal
+    );
+    if unchanged {
+        return Ok(());
+    }
+
+    let reason = match migrated {
+        Ok(Some(_)) => {
+            "the unscoped switch journal changed while it was being migrated".to_string()
+        }
+        Ok(None) => "the migrated switch journal disappeared before verification".to_string(),
+        Err(error) => format!("the migrated switch journal failed verification: {error}"),
+    };
+    match move_file_no_replace(paths.state.as_path(), paths.unscoped_state.as_path()) {
+        Ok(()) => {
+            sync_parent_directory(paths.unscoped_state.as_path())?;
+            Err(CodexSwitchError::RecoveryRequired { reason })
+        }
+        Err(rollback_error) => Err(CodexSwitchError::RecoveryRequired {
+            reason: format!(
+                "{reason}; rollback without replacement also failed ({rollback_error}); both paths were preserved for reconciliation"
+            ),
+        }),
+    }
+}
+
 fn read_journal_snapshot(path: &Path) -> Result<Option<JournalSnapshot>, CodexSwitchError> {
     let Some(raw) = read_optional_text(path)? else {
         return Ok(None);
@@ -3299,25 +4387,101 @@ fn parse_journal(path: &Path, raw: String) -> Result<JournalSnapshot, CodexSwitc
             reason: error.to_string(),
         }
     })?;
-    if journal.version != STATE_VERSION {
+    if !matches!(journal.version, LEGACY_STATE_VERSION | STATE_VERSION) {
         return Err(CodexSwitchError::InvalidState {
             path: path.to_path_buf(),
             reason: format!(
-                "unsupported state version {}; expected {STATE_VERSION}",
+                "unsupported state version {}; expected {LEGACY_STATE_VERSION} or {STATE_VERSION}",
                 journal.version
             ),
         });
     }
-    if let Some(client_patch) = journal.client_patch {
-        client_patch
-            .compile()
-            .map_err(|error| CodexSwitchError::InvalidState {
+    Uuid::parse_str(journal.operation_id.as_str()).map_err(|error| {
+        CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: format!("invalid switch operation identifier: {error}"),
+        }
+    })?;
+    if let Some(auto_restore_generation) = journal.auto_restore_generation.as_deref() {
+        Uuid::parse_str(auto_restore_generation).map_err(|error| {
+            CodexSwitchError::InvalidState {
                 path: path.to_path_buf(),
-                reason: format!("invalid recorded client patch: {error}"),
-            })?;
+                reason: format!("invalid auto-restore generation: {error}"),
+            }
+        })?;
     }
+    if let Some(pending) = journal.pending_config.as_ref() {
+        if !matches!(
+            journal.phase,
+            JournalPhase::Prepared | JournalPhase::RecoveryRequired
+        ) {
+            return Err(CodexSwitchError::InvalidState {
+                path: path.to_path_buf(),
+                reason: "pending config commit requires a prepared or recovery-required journal"
+                    .to_string(),
+            });
+        }
+        let absent_fingerprint = fingerprint(&[]);
+        for (label, present, recorded_fingerprint) in [
+            (
+                "source",
+                pending.source_present,
+                pending.source_fingerprint.as_str(),
+            ),
+            (
+                "destination",
+                pending.destination_present,
+                pending.destination_fingerprint.as_str(),
+            ),
+        ] {
+            if !present && recorded_fingerprint != absent_fingerprint {
+                return Err(CodexSwitchError::InvalidState {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "an absent pending config {label} must use the absent-file fingerprint"
+                    ),
+                });
+            }
+        }
+    }
+    journal
+        .client_patch
+        .compile()
+        .map_err(|error| CodexSwitchError::InvalidState {
+            path: path.to_path_buf(),
+            reason: format!("invalid recorded client patch: {error}"),
+        })?;
     if let Some(auth) = journal.auth_patch.as_ref() {
         validate_auth_journal(path, auth)?;
+    }
+    match journal.version {
+        STATE_VERSION => {
+            if journal.original_helper_stanza.is_some()
+                || journal.original_helper_stanza_repr.is_some()
+            {
+                return Err(CodexSwitchError::InvalidState {
+                    path: path.to_path_buf(),
+                    reason:
+                        "version 2 switch state cannot contain inline helper stanza recovery data"
+                            .to_string(),
+                });
+            }
+            let helper_stanza = journal.helper_stanza_backup.as_ref().ok_or_else(|| {
+                CodexSwitchError::InvalidState {
+                    path: path.to_path_buf(),
+                    reason: "version 2 switch state is missing helper stanza recovery metadata"
+                        .to_string(),
+                }
+            })?;
+            validate_helper_stanza_journal(path, helper_stanza)?;
+        }
+        LEGACY_STATE_VERSION => {
+            validate_legacy_helper_stanza_fields(path, &journal)?;
+            if let Some(helper_stanza) = journal.helper_stanza_backup.as_ref() {
+                validate_helper_stanza_journal(path, helper_stanza)?;
+            }
+        }
+        _ => unreachable!("switch state version was validated above"),
     }
     if let Some(auth_recovery_patch) = journal.auth_recovery_patch {
         if journal.auth_patch.is_none() {
@@ -3371,6 +4535,44 @@ fn parse_journal(path: &Path, raw: String) -> Result<JournalSnapshot, CodexSwitc
     Ok(JournalSnapshot { raw, journal })
 }
 
+fn validate_helper_stanza_journal(
+    path: &Path,
+    helper_stanza: &HelperStanzaJournal,
+) -> Result<(), CodexSwitchError> {
+    let invalid = |reason: &str| CodexSwitchError::InvalidState {
+        path: path.to_path_buf(),
+        reason: reason.to_string(),
+    };
+    if !helper_stanza.original_present && helper_stanza.original_fingerprint != fingerprint(&[]) {
+        return Err(invalid(
+            "an absent original helper stanza must use the absent-value fingerprint",
+        ));
+    }
+    match (
+        helper_stanza.original_present,
+        helper_stanza.backup_file_name.as_deref(),
+    ) {
+        (true, Some(name)) if managed_helper_stanza_backup_name(name) => {}
+        (true, Some(_)) => {
+            return Err(invalid(
+                "helper stanza backup file name is not helper-owned",
+            ));
+        }
+        (true, None) => {
+            return Err(invalid(
+                "present original helper stanza requires a backup file",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid(
+                "absent original helper stanza cannot record a backup file",
+            ));
+        }
+        (false, None) => {}
+    }
+    Ok(())
+}
+
 fn validate_auth_journal(path: &Path, auth: &AuthJournal) -> Result<(), CodexSwitchError> {
     let invalid = |reason: &str| CodexSwitchError::InvalidState {
         path: path.to_path_buf(),
@@ -3420,12 +4622,9 @@ fn write_config_edit(
     path: &Path,
     edit: ConfigEdit,
     journal: &SwitchJournal,
-    expected: ExpectedConfigState,
+    expected: &ConfigSnapshot,
 ) -> Result<(), CodexSwitchError> {
-    let expectation = FileCommitExpectation::Journal(ConfigCommitExpectation {
-        journal,
-        state: expected,
-    });
+    let expectation = FileCommitExpectation::Journal(ConfigCommitExpectation { journal, expected });
     write_file_edit(path, edit, expectation)
 }
 
@@ -3659,8 +4858,7 @@ fn recover_interrupted_file_capture(
     validate_config_topology(capture_path, true).map_err(|error| error.to_string())?;
     let patches_auth = journal_patches_auth(paths, journal).map_err(|error| error.to_string())?;
     let capture_matches_expected = match (role, journal.operation) {
-        (ManagedCommitRole::Config, JournalOperation::On) => capture.matches_original(journal),
-        (ManagedCommitRole::Config, JournalOperation::Off) => capture.matches_applied(journal),
+        (ManagedCommitRole::Config, _) => recorded_config_source_matches(&capture, journal),
         (ManagedCommitRole::Auth, JournalOperation::On) if patches_auth => journal
             .auth_patch
             .as_ref()
@@ -3692,8 +4890,10 @@ fn recover_interrupted_file_capture(
 
     let current = read_config_snapshot(path).map_err(|error| error.to_string())?;
     let current_matches_desired = match (role, journal.operation) {
-        (ManagedCommitRole::Config, JournalOperation::On) => current.matches_applied(journal),
-        (ManagedCommitRole::Config, JournalOperation::Off) => current.matches_original(journal),
+        (ManagedCommitRole::Config, _) => {
+            recorded_config_destination_matches(path, &current, journal)
+                .map_err(|error| error.to_string())?
+        }
         (ManagedCommitRole::Auth, JournalOperation::On) if patches_auth => {
             match journal.auth_patch.as_ref() {
                 Some(auth) => {
@@ -3730,6 +4930,35 @@ fn recover_interrupted_file_capture(
         role.as_str(),
         capture_path
     ))
+}
+
+fn recorded_config_source_matches(snapshot: &ConfigSnapshot, journal: &SwitchJournal) -> bool {
+    match journal.pending_config.as_ref() {
+        Some(pending) => pending.source_matches(snapshot),
+        None => match journal.operation {
+            JournalOperation::On => snapshot.matches_original(journal),
+            JournalOperation::Off => snapshot.matches_applied(journal),
+        },
+    }
+}
+
+fn recorded_config_destination_matches(
+    path: &Path,
+    snapshot: &ConfigSnapshot,
+    journal: &SwitchJournal,
+) -> Result<bool, CodexSwitchError> {
+    if journal
+        .pending_config
+        .as_ref()
+        .is_some_and(|pending| pending.destination_matches(snapshot))
+    {
+        return Ok(true);
+    }
+    let managed = managed_config_matches(path, snapshot, journal)?;
+    Ok(match journal.operation {
+        JournalOperation::On => managed.applied,
+        JournalOperation::Off => managed.original,
+    })
 }
 
 fn capture_expected_file(
@@ -4108,6 +5337,7 @@ fn cleanup_managed_switch_artifacts(paths: &SwitchPaths) -> Result<(), CodexSwit
         paths.config.as_path(),
         paths.auth.as_path(),
         paths.state.as_path(),
+        paths.unscoped_state.as_path(),
         paths.legacy_state.as_path(),
     ] {
         if let Some(parent) = path.parent()
@@ -4279,27 +5509,38 @@ struct SwitchPaths {
     auth: PathBuf,
     config_fingerprint: String,
     state: PathBuf,
+    unscoped_state: PathBuf,
     lock: PathBuf,
     legacy_state: PathBuf,
 }
 
 impl SwitchPaths {
     fn resolve() -> Result<Self, CodexSwitchError> {
+        Self::resolve_for_codex_home(crate::config::codex_home().as_path())
+    }
+
+    fn resolve_for_codex_home(codex_home: &Path) -> Result<Self, CodexSwitchError> {
         let state_dir = crate::config::proxy_home_dir().join("state");
         let state_dir = absolute_path(state_dir.as_path())?;
         let state_dir = resolve_existing_ancestor(state_dir.as_path())?;
-        let config = resolve_config_path(crate::config::codex_config_path().as_path())?;
+        let config = resolve_config_path(codex_home.join("config.toml").as_path())?;
+        let config_fingerprint = config_path_fingerprint(config.as_path());
         let legacy_state = config.with_file_name(LEGACY_STATE_FILE_NAME);
         let auth = config.with_file_name("auth.json");
         Ok(Self {
-            config_fingerprint: config_path_fingerprint(config.as_path()),
+            state: state_dir.join(scoped_state_file_name(config_fingerprint.as_str())),
+            unscoped_state: state_dir.join(UNSCOPED_STATE_FILE_NAME),
+            config_fingerprint,
             config,
             auth,
-            state: state_dir.join(STATE_FILE_NAME),
             lock: state_dir.join(LOCK_FILE_NAME),
             legacy_state,
         })
     }
+}
+
+fn scoped_state_file_name(config_fingerprint: &str) -> String {
+    format!("{SCOPED_STATE_FILE_PREFIX}{config_fingerprint}{SCOPED_STATE_FILE_SUFFIX}")
 }
 
 fn resolve_config_path(path: &Path) -> Result<PathBuf, CodexSwitchError> {
@@ -4390,19 +5631,12 @@ fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, CodexSwitchError> {
 mod tests {
     use std::sync::{Mutex, OnceLock};
 
+    use crate::auth_resolution::CodexAuthModeMetadata;
+
     use super::*;
 
     #[test]
     fn switch_wire_labels_are_stable_and_exhaustive() {
-        let facades = [
-            (CodexClientFacade::Compatible, "compatible"),
-            (CodexClientFacade::OpenAi, "openai"),
-            (CodexClientFacade::OpenAiTools, "openai-tools"),
-        ];
-        for (facade, expected) in facades {
-            assert_eq!(facade.as_str(), expected);
-        }
-
         let phases = [
             (CodexSwitchPhase::Off, "off"),
             (CodexSwitchPhase::Prepared, "prepared"),
@@ -4467,7 +5701,26 @@ mod tests {
         }
 
         fn state_path(&self) -> PathBuf {
-            self.helper_home.join("state").join(STATE_FILE_NAME)
+            self.state_path_for_home(self.codex_home.as_path())
+        }
+
+        fn state_path_for_home(&self, codex_home: &Path) -> PathBuf {
+            let config = resolve_config_path(codex_home.join("config.toml").as_path())
+                .expect("resolve test Codex config path");
+            let config_fingerprint = config_path_fingerprint(config.as_path());
+            self.resolved_state_dir()
+                .join(scoped_state_file_name(config_fingerprint.as_str()))
+        }
+
+        fn unscoped_state_path(&self) -> PathBuf {
+            self.resolved_state_dir().join(UNSCOPED_STATE_FILE_NAME)
+        }
+
+        fn resolved_state_dir(&self) -> PathBuf {
+            let state_dir = absolute_path(self.helper_home.join("state").as_path())
+                .expect("resolve absolute test helper state path");
+            resolve_existing_ancestor(state_dir.as_path())
+                .expect("resolve canonical test helper state path")
         }
 
         fn legacy_state_path(&self) -> PathBuf {
@@ -4501,6 +5754,34 @@ mod tests {
                         .file_name()
                         .to_str()
                         .is_some_and(managed_auth_backup_name)
+                })
+                .map(|entry| entry.path())
+                .collect()
+        }
+
+        fn helper_stanza_backup_path(&self) -> PathBuf {
+            let journal = read_journal(self.state_path().as_path())
+                .expect("read switch journal")
+                .expect("switch journal");
+            let name = journal
+                .helper_stanza_backup
+                .and_then(|helper_stanza| helper_stanza.backup_file_name)
+                .expect("helper stanza backup file name");
+            self.helper_home.join("state").join(name)
+        }
+
+        fn helper_stanza_backup_files(&self) -> Vec<PathBuf> {
+            let state_dir = self.helper_home.join("state");
+            let Ok(entries) = std::fs::read_dir(state_dir) else {
+                return Vec::new();
+            };
+            entries
+                .map(|entry| entry.expect("read state entry"))
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(managed_helper_stanza_backup_name)
                 })
                 .map(|entry| entry.path())
                 .collect()
@@ -4541,6 +5822,15 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn acquire_test_ephemeral_switch(port: u16) -> Result<CodexSwitchOutcome, CodexSwitchError> {
+        acquire_ephemeral_with_client_patch_and_failpoint(
+            ValidatedCodexBaseUrl::local(port),
+            CodexClientPatchConfig::default(),
+            ApplyFailpoint::None,
+            Uuid::new_v4().to_string(),
+        )
     }
 
     fn chatgpt_auth_json_for_switch_tests() -> String {
@@ -4689,26 +5979,256 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn explicit_client_facades_expose_only_the_requested_codex_capabilities() {
-        for (facade, provider_name, exposes_tools) in [
-            (CodexClientFacade::Compatible, "codex-helper", false),
-            (CodexClientFacade::OpenAi, "OpenAI", false),
-            (CodexClientFacade::OpenAiTools, "OpenAI", true),
+    fn unchanged_switch_on_does_not_claim_restore_ownership() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+
+        let first = apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("first switch on");
+        let second = apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("second switch on");
+
+        assert_eq!(first.change, CodexSwitchChange::Applied);
+        assert!(first.restore_lease.is_none());
+        assert_eq!(second.change, CodexSwitchChange::Unchanged);
+        assert!(second.restore_lease.is_none());
+    }
+
+    #[test]
+    fn explicit_same_target_switch_on_invalidates_ephemeral_restore_ownership() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let ephemeral = acquire_test_ephemeral_switch(3211).expect("acquire ephemeral switch");
+        let lease = ephemeral
+            .restore_lease
+            .expect("ephemeral switch owns restore");
+
+        let persistent = apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("explicit persistent switch on");
+
+        assert_eq!(persistent.change, CodexSwitchChange::Unchanged);
+        assert!(persistent.restore_lease.is_none());
+        assert!(
+            restore_if_owned(&lease)
+                .expect("old lease restore check")
+                .is_none()
+        );
+        assert!(inspect().expect("inspect persistent switch").enabled);
+    }
+
+    #[test]
+    fn ephemeral_switch_does_not_claim_an_existing_persistent_generation() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("explicit persistent switch on");
+
+        let ephemeral =
+            acquire_test_ephemeral_switch(3211).expect("observe existing persistent switch");
+
+        assert_eq!(ephemeral.change, CodexSwitchChange::Unchanged);
+        assert!(ephemeral.restore_lease.is_none());
+        assert!(inspect().expect("inspect persistent switch").enabled);
+    }
+
+    #[test]
+    fn failed_ephemeral_apply_compensates_owned_config_and_auth_writes() {
+        for failpoint in [
+            ApplyFailpoint::AfterPrepared,
+            ApplyFailpoint::AfterConfigWrite,
+            ApplyFailpoint::AfterAuthWrite,
+        ] {
+            let env = TestEnvironment::new();
+            let original_config = "# keep config\nmodel_provider = \"openai\"\n";
+            let original_auth = r#"{"OPENAI_API_KEY":"original-secret"}"#;
+            env.write_config(original_config);
+            std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+
+            let error = acquire_ephemeral_with_client_patch_and_failpoint(
+                ValidatedCodexBaseUrl::local(3211),
+                CodexClientPatchConfig {
+                    preset: CodexClientPreset::OfficialImagegen,
+                    ..CodexClientPatchConfig::default()
+                },
+                failpoint,
+                Uuid::new_v4().to_string(),
+            )
+            .expect_err("injected ephemeral apply failure");
+
+            assert!(matches!(error, CodexSwitchError::InjectedFailure(_)));
+            assert_eq!(env.read_config(), original_config);
+            assert_eq!(
+                std::fs::read_to_string(env.auth_path()).expect("read restored auth"),
+                original_auth
+            );
+            assert!(!inspect().expect("inspect compensated switch").enabled);
+        }
+    }
+
+    #[test]
+    fn newer_ephemeral_generation_takes_over_a_released_runtime_switch() {
+        let env = TestEnvironment::new();
+        let original = "# original\nmodel_provider = \"openai\"\n";
+        env.write_config(original);
+        let first = acquire_test_ephemeral_switch(3211).expect("first ephemeral switch");
+        let first_lease = first.restore_lease.expect("first restore lease");
+
+        let second = acquire_test_ephemeral_switch(3211).expect("second ephemeral switch");
+        let second_lease = second.restore_lease.expect("second restore lease");
+
+        assert!(
+            restore_if_owned(&first_lease)
+                .expect("stale restore check")
+                .is_none()
+        );
+        assert!(inspect().expect("inspect active takeover").enabled);
+        assert!(
+            restore_if_owned(&second_lease)
+                .expect("current restore")
+                .is_some()
+        );
+        assert_eq!(env.read_config(), original);
+    }
+
+    #[test]
+    fn owned_restore_retries_transient_operation_lock_contention() {
+        let env = TestEnvironment::new();
+        let original = "model_provider = \"openai\"\n";
+        env.write_config(original);
+        let applied = acquire_test_ephemeral_switch(3211).expect("ephemeral switch");
+        let lease = applied.restore_lease.expect("restore lease");
+        let operation_lock =
+            OperationLock::acquire(env.lock_path().as_path()).expect("hold switch operation lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(35));
+            drop(operation_lock);
+        });
+
+        let restored = restore_if_owned_with_retry(&lease)
+            .expect("retry owned restore")
+            .expect("generation remains owned");
+        release.join().expect("release operation lock");
+
+        assert_eq!(restored.change, CodexSwitchChange::Removed);
+        assert_eq!(env.read_config(), original);
+    }
+
+    #[test]
+    fn owned_restore_skips_a_newer_switch_generation() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let first = acquire_test_ephemeral_switch(3211).expect("first switch on");
+        let lease = first.restore_lease.expect("first switch owns restore");
+
+        apply(CodexSwitchIntent::Off).expect("user switch off");
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("user switch on again");
+        let config_after_user_switch = std::fs::read(env.config_path()).expect("read config");
+        let state_after_user_switch = std::fs::read(env.state_path()).expect("read state");
+
+        assert!(
+            restore_if_owned(&lease)
+                .expect("old lease restore check")
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(env.config_path()).expect("read preserved config"),
+            config_after_user_switch
+        );
+        assert_eq!(
+            std::fs::read(env.state_path()).expect("read preserved state"),
+            state_after_user_switch
+        );
+    }
+
+    #[test]
+    fn owned_restore_removes_its_unchanged_generation() {
+        let env = TestEnvironment::new();
+        let original = "# keep\nmodel_provider = \"openai\"\n";
+        env.write_config(original);
+        let applied = acquire_test_ephemeral_switch(3211).expect("switch on");
+        let lease = applied.restore_lease.expect("switch owns restore");
+
+        let restored = restore_if_owned(&lease)
+            .expect("restore owned switch")
+            .expect("generation still owned");
+
+        assert_eq!(restored.change, CodexSwitchChange::Removed);
+        assert_eq!(env.read_config(), original);
+        assert!(!env.state_path().exists());
+    }
+
+    #[test]
+    fn owned_restore_merges_unmanaged_codex_config_writeback() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let applied = acquire_test_ephemeral_switch(3211).expect("switch on");
+        let lease = applied.restore_lease.expect("switch owns restore");
+        let mut edited = env.read_config();
+        edited.push_str(
+            "\n# written by Codex\n[projects.\"/external\"]\ntrust_level = \"trusted\"\n",
+        );
+        env.write_config(edited.as_str());
+
+        let restored = restore_if_owned(&lease)
+            .expect("restore owned switch")
+            .expect("generation still owned");
+
+        assert_eq!(restored.change, CodexSwitchChange::Removed);
+        let restored = env.read_config();
+        assert!(restored.contains("model_provider = \"openai\""));
+        assert!(restored.contains("# written by Codex"));
+        assert!(restored.contains("[projects.\"/external\"]"));
+        assert!(restored.contains("trust_level = \"trusted\""));
+        assert!(!restored.contains("model_providers.codex_proxy"));
+        assert!(!env.state_path().exists());
+    }
+
+    #[test]
+    fn explicit_client_patches_expose_only_the_requested_codex_capabilities() {
+        for (client_patch, provider_name, exposes_tools) in [
+            (CodexClientPatchConfig::default(), "codex-helper", false),
+            (
+                CodexClientPatchConfig {
+                    preset: CodexClientPreset::OfficialRelay,
+                    ..CodexClientPatchConfig::default()
+                },
+                "OpenAI",
+                false,
+            ),
+            (
+                CodexClientPatchConfig {
+                    preset: CodexClientPreset::OfficialImagegen,
+                    ..CodexClientPatchConfig::default()
+                },
+                "OpenAI",
+                true,
+            ),
         ] {
             let env = TestEnvironment::new();
             let original = "model_provider = \"openai\"\n";
             env.write_config(original);
             std::fs::write(env.auth_path(), b"auth sentinel").expect("write auth sentinel");
 
-            let outcome = apply_with_client_facade(
+            let outcome = apply_with_client_patch(
                 CodexSwitchIntent::On {
                     validated_base_url: ValidatedCodexBaseUrl::local(3211),
                 },
-                facade,
+                client_patch,
             )
-            .expect("switch on with explicit client facade");
+            .expect("switch on with explicit client patch");
 
-            assert_eq!(outcome.status.client_facade, Some(facade));
+            assert_eq!(outcome.status.client_patch, Some(client_patch));
             let applied = env.read_config();
             assert!(applied.contains(format!("name = \"{provider_name}\"").as_str()));
             assert!(applied.contains("[model_providers.codex_proxy.http_headers]"));
@@ -4734,7 +6254,7 @@ trust_level = "trusted"
                 assert_eq!(applied_auth, b"auth sentinel");
             }
 
-            apply(CodexSwitchIntent::Off).expect("switch off facade");
+            apply(CodexSwitchIntent::Off).expect("switch off client patch");
             assert_eq!(env.read_config(), original);
             assert_eq!(
                 std::fs::read(env.auth_path()).expect("read restored auth sentinel"),
@@ -4781,8 +6301,11 @@ unrelated_feature = true
         assert!(applied.contains("unrelated_feature = true"));
         assert!(!applied.contains(CODEX_CLIENT_FACADE_ACTOR_VALUE));
         assert_eq!(
-            std::fs::read(env.auth_path()).expect("read untouched auth"),
-            b"auth sentinel"
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(env.auth_path()).expect("read applied auth facade")
+            )
+            .expect("parse applied auth facade"),
+            serde_json::json!({})
         );
         let journal = std::fs::read_to_string(env.state_path()).expect("read switch journal");
         assert!(journal.contains("official-imagegen"));
@@ -4837,6 +6360,158 @@ unrelated_feature = true
                 original_auth
             );
         }
+    }
+
+    #[test]
+    fn imagegen_facade_preserves_a_formatted_empty_auth_file_as_present() {
+        let env = TestEnvironment::new();
+        let original_config = "model_provider = \"openai\"\n";
+        let original_auth = "{\n}\n";
+        env.write_config(original_config);
+        std::fs::write(env.auth_path(), original_auth).expect("write formatted empty auth");
+
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialImagegen,
+                ..CodexClientPatchConfig::default()
+            },
+        )
+        .expect("apply imagegen facade over formatted empty auth");
+
+        apply(CodexSwitchIntent::Off).expect("restore formatted empty auth");
+        assert_eq!(env.read_config(), original_config);
+        assert!(env.auth_path().exists());
+        assert_eq!(
+            std::fs::read(env.auth_path()).expect("read restored formatted empty auth"),
+            original_auth.as_bytes()
+        );
+    }
+
+    #[test]
+    fn original_projection_reads_through_an_applied_auth_facade_without_writing_files() {
+        let env = TestEnvironment::new();
+        let original_config = r#"model_provider = "relay"
+
+[model_providers.relay]
+name = "Relay"
+base_url = "https://relay.example/v1"
+env_key = "RELAY_API_KEY"
+requires_openai_auth = false
+"#;
+        let original_auth = r#"{"auth_mode":"apikey","RELAY_API_KEY":"private-projection-canary"}"#;
+        env.write_config(original_config);
+        std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialImagegen,
+                ..CodexClientPatchConfig::default()
+            },
+        )
+        .expect("apply auth facade");
+
+        let config_before = std::fs::read(env.config_path()).expect("read applied config");
+        let auth_before = std::fs::read(env.auth_path()).expect("read applied auth");
+        let journal_before = std::fs::read(env.state_path()).expect("read applied journal");
+        let (provider_id, base_url, metadata) = project_original_codex_config(|config, auth| {
+            let value = toml::from_str::<TomlValue>(config.expect("original config projection"))
+                .expect("parse original projection");
+            let provider_id = value["model_provider"]
+                .as_str()
+                .expect("active provider")
+                .to_string();
+            let base_url = value["model_providers"][provider_id.as_str()]["base_url"]
+                .as_str()
+                .expect("active provider base URL")
+                .to_string();
+            (provider_id, base_url, auth)
+        })
+        .expect("project original Codex files");
+
+        assert_eq!(provider_id, "relay");
+        assert_eq!(base_url, "https://relay.example/v1");
+        assert_eq!(metadata.mode, Some(CodexAuthModeMetadata::ApiKey));
+        assert_eq!(metadata.unique_api_key_field(), Some("RELAY_API_KEY"));
+        assert!(!format!("{metadata:?}").contains("private-projection-canary"));
+        assert_eq!(
+            std::fs::read(env.config_path()).expect("reread applied config"),
+            config_before
+        );
+        assert_eq!(
+            std::fs::read(env.auth_path()).expect("reread applied auth"),
+            auth_before
+        );
+        assert_eq!(
+            std::fs::read(env.state_path()).expect("reread applied journal"),
+            journal_before
+        );
+    }
+
+    #[test]
+    fn onboarding_projection_recovers_v0203_state_before_reading_original_files() {
+        let env = TestEnvironment::new();
+        let original_config = r#"# preserve the original relay
+model_provider = "relay"
+
+[model_providers.relay]
+name = "Relay"
+base_url = "https://relay.example/v1"
+env_key = "RELAY_API_KEY"
+requires_openai_auth = false
+"#;
+        let applied_config = format!(
+            "{}\n[model_providers.codex_proxy]\nname = \"codex-helper\"\nbase_url = \"http://127.0.0.1:3211/v1\"\nwire_api = \"responses\"\nrequest_max_retries = 0\n",
+            original_config.replace(
+                "model_provider = \"relay\"",
+                "model_provider = \"codex_proxy\""
+            )
+        );
+        let original_auth = r#"{"auth_mode":"apikey","RELAY_API_KEY":"private-legacy-canary"}"#;
+        env.write_config(&applied_config);
+        std::fs::write(env.auth_path(), original_auth).expect("write original auth");
+        env.write_legacy_state(serde_json::json!({
+            "version": 2,
+            "original_config_absent": false,
+            "original_model_provider": "relay",
+            "original_codex_proxy": null,
+            "had_model_providers": true
+        }));
+
+        let (provider_id, base_url, auth) =
+            project_original_codex_config_for_onboarding(|config, auth| {
+                let value = toml::from_str::<TomlValue>(
+                    config.expect("recovered original config projection"),
+                )
+                .expect("parse recovered original projection");
+                let provider_id = value["model_provider"]
+                    .as_str()
+                    .expect("active provider")
+                    .to_string();
+                let base_url = value["model_providers"][provider_id.as_str()]["base_url"]
+                    .as_str()
+                    .expect("active provider base URL")
+                    .to_string();
+                (provider_id, base_url, auth)
+            })
+            .expect("recover and project v0.20.3 switch state");
+
+        assert_eq!(provider_id, "relay");
+        assert_eq!(base_url, "https://relay.example/v1");
+        assert_eq!(auth.mode, Some(CodexAuthModeMetadata::ApiKey));
+        assert_eq!(auth.unique_api_key_field(), Some("RELAY_API_KEY"));
+        assert!(!format!("{auth:?}").contains("private-legacy-canary"));
+        assert_eq!(env.read_config(), original_config);
+        assert_eq!(
+            std::fs::read_to_string(env.auth_path()).expect("read preserved auth"),
+            original_auth
+        );
+        assert!(!env.legacy_state_path().exists());
+        assert!(!env.state_path().exists());
     }
 
     #[test]
@@ -5129,7 +6804,7 @@ unrelated_feature = true
                 .expect("prepared journal");
             assert_eq!(prepared.phase, JournalPhase::Prepared);
             assert_eq!(prepared.operation, JournalOperation::Off);
-            assert_eq!(prepared.client_patch, Some(facade_patch));
+            assert_eq!(prepared.client_patch, facade_patch);
             assert_eq!(prepared.auth_recovery_patch, None);
             assert!(prepared.auth_patch.is_some());
             assert_eq!(env.auth_backup_path(), retained_backup);
@@ -5140,7 +6815,7 @@ unrelated_feature = true
                 .expect("read applied preserving journal")
                 .expect("applied preserving journal");
             assert_eq!(applied.phase, JournalPhase::Applied);
-            assert_eq!(applied.client_patch, Some(preserving_patch));
+            assert_eq!(applied.client_patch, preserving_patch);
             assert_eq!(applied.auth_recovery_patch, Some(facade_patch));
             assert!(applied.auth_patch.is_some());
             assert_eq!(
@@ -5503,11 +7178,19 @@ unrelated_feature = true
 
     #[cfg(unix)]
     #[test]
-    fn auth_backup_is_stored_with_private_unix_permissions() {
+    fn switch_backups_are_stored_with_private_unix_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let env = TestEnvironment::new();
-        env.write_config("model_provider = \"openai\"\n");
+        env.write_config(
+            r#"model_provider = "openai"
+
+[model_providers.codex_proxy]
+name = "foreign"
+base_url = "https://foreign.example/v1"
+api_key = "private-helper-stanza-secret"
+"#,
+        );
         std::fs::write(env.auth_path(), "private-auth-secret").expect("write original auth");
         apply_with_client_patch(
             CodexSwitchIntent::On {
@@ -5530,6 +7213,14 @@ unrelated_feature = true
             0o600
         );
         assert_eq!(
+            std::fs::metadata(env.helper_stanza_backup_path())
+                .expect("read helper stanza backup metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
             std::fs::metadata(backup.parent().expect("backup parent"))
                 .expect("read state directory metadata")
                 .permissions()
@@ -5539,6 +7230,7 @@ unrelated_feature = true
         );
         let journal = std::fs::read_to_string(env.state_path()).expect("read journal");
         assert!(!journal.contains("private-auth-secret"));
+        assert!(!journal.contains("private-helper-stanza-secret"));
     }
 
     #[cfg(windows)]
@@ -5551,7 +7243,15 @@ unrelated_feature = true
         }
 
         let env = TestEnvironment::new();
-        env.write_config("model_provider = \"openai\"\n");
+        env.write_config(
+            r#"model_provider = "openai"
+
+[model_providers.codex_proxy]
+name = "foreign"
+base_url = "https://foreign.example/v1"
+api_key = "private-helper-stanza-secret"
+"#,
+        );
         std::fs::write(env.auth_path(), "private-auth-secret").expect("write original auth");
         crate::local_operator::secure_private_windows_path(env.config_path().as_path(), false)
             .expect("secure original config");
@@ -5587,6 +7287,9 @@ unrelated_feature = true
         assert!(metadata(env.state_path().as_path()).matches(&private_file_metadata));
         assert!(metadata(env.auth_backup_path().as_path()).matches(&private_file_metadata));
         assert!(
+            metadata(env.helper_stanza_backup_path().as_path()).matches(&private_file_metadata)
+        );
+        assert!(
             metadata(env.state_path().parent().expect("state directory"))
                 .matches(&private_directory_metadata)
         );
@@ -5602,7 +7305,7 @@ unrelated_feature = true
         let original = "model_provider = \"openai\"\n";
         env.write_config(original);
         let patch = crate::config::CodexClientPatchConfig {
-            preset: crate::config::CodexClientPreset::OfficialRelay,
+            preset: crate::config::CodexClientPreset::OfficialImagegen,
             compaction: crate::config::CodexCompactionStrategy::RemoteV2,
             hosted_image_generation: crate::config::CodexHostedImageGenerationMode::Enabled,
             ..crate::config::CodexClientPatchConfig::default()
@@ -5658,25 +7361,28 @@ unrelated_feature = true
     }
 
     #[test]
-    fn changing_client_facade_reapplies_without_losing_the_original_config() {
+    fn changing_client_patch_reapplies_without_losing_the_original_config() {
         let env = TestEnvironment::new();
         let original = "model_provider = \"openai\"\n\n[features]\nimage_generation = false\n";
         env.write_config(original);
         let on = CodexSwitchIntent::On {
             validated_base_url: ValidatedCodexBaseUrl::local(3211),
         };
-        apply_with_client_facade(on.clone(), CodexClientFacade::OpenAi)
-            .expect("switch on OpenAI facade");
-        let outcome = apply_with_client_facade(on, CodexClientFacade::OpenAiTools)
-            .expect("reapply OpenAI tools facade");
+        let relay_patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::OfficialRelay,
+            ..CodexClientPatchConfig::default()
+        };
+        let imagegen_patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::OfficialImagegen,
+            ..CodexClientPatchConfig::default()
+        };
+        apply_with_client_patch(on.clone(), relay_patch).expect("switch on relay patch");
+        let outcome = apply_with_client_patch(on, imagegen_patch).expect("reapply imagegen patch");
 
-        assert_eq!(
-            outcome.status.client_facade,
-            Some(CodexClientFacade::OpenAiTools)
-        );
+        assert_eq!(outcome.status.client_patch, Some(imagegen_patch));
         assert!(env.read_config().contains(CODEX_CLIENT_FACADE_ACTOR_VALUE));
 
-        apply(CodexSwitchIntent::Off).expect("switch off reapplied facade");
+        apply(CodexSwitchIntent::Off).expect("switch off reapplied patch");
         assert_eq!(env.read_config(), original);
     }
 
@@ -5692,64 +7398,62 @@ unrelated_feature = true
             let on = CodexSwitchIntent::On {
                 validated_base_url: ValidatedCodexBaseUrl::local(3211),
             };
-            apply_with_client_facade(on.clone(), CodexClientFacade::OpenAi)
-                .expect("switch on initial facade");
+            let relay_patch = CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialRelay,
+                ..CodexClientPatchConfig::default()
+            };
+            let imagegen_patch = CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialImagegen,
+                ..CodexClientPatchConfig::default()
+            };
+            apply_with_client_patch(on.clone(), relay_patch).expect("switch on initial patch");
 
             assert!(matches!(
-                apply_with_client_facade_and_failpoint(
-                    on.clone(),
-                    CodexClientFacade::OpenAiTools,
-                    failpoint,
-                ),
+                apply_with_client_patch_and_failpoint(on.clone(), imagegen_patch, failpoint),
                 Err(CodexSwitchError::InjectedFailure(_))
             ));
-            let outcome = apply_with_client_facade(on, CodexClientFacade::OpenAiTools)
-                .expect("resume interrupted facade reapply");
+            let outcome = apply_with_client_patch(on, imagegen_patch)
+                .expect("resume interrupted patch reapply");
 
             assert_eq!(outcome.status.phase, CodexSwitchPhase::Applied);
-            assert_eq!(
-                outcome.status.client_facade,
-                Some(CodexClientFacade::OpenAiTools)
-            );
+            assert_eq!(outcome.status.client_patch, Some(imagegen_patch));
             apply(CodexSwitchIntent::Off).expect("restore after resumed reapply");
             assert_eq!(env.read_config(), original);
         }
     }
 
     #[test]
-    fn prepared_switch_recovers_with_its_recorded_client_facade() {
+    fn prepared_switch_recovers_with_its_recorded_client_patch() {
         let env = TestEnvironment::new();
         env.write_config("model_provider = \"openai\"\n");
         let on = CodexSwitchIntent::On {
             validated_base_url: ValidatedCodexBaseUrl::local(3211),
         };
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::OfficialImagegen,
+            ..CodexClientPatchConfig::default()
+        };
 
         assert!(matches!(
-            apply_with_client_facade_and_failpoint(
-                on.clone(),
-                CodexClientFacade::OpenAiTools,
-                ApplyFailpoint::AfterPrepared,
-            ),
+            apply_with_client_patch_and_failpoint(on.clone(), patch, ApplyFailpoint::AfterPrepared),
             Err(CodexSwitchError::InjectedFailure("after_prepared"))
         ));
-        let outcome = apply_with_client_facade(on, CodexClientFacade::OpenAiTools)
-            .expect("resume prepared facade switch");
+        let outcome =
+            apply_with_client_patch(on, patch).expect("resume prepared client patch switch");
 
-        assert_eq!(
-            outcome.status.client_facade,
-            Some(CodexClientFacade::OpenAiTools)
-        );
+        assert_eq!(outcome.status.client_patch, Some(patch));
         assert!(env.read_config().contains(CODEX_CLIENT_FACADE_ACTOR_VALUE));
     }
 
     #[test]
-    fn journals_without_client_facade_default_to_compatible() {
+    fn current_journal_without_complete_client_patch_fails_closed() {
         let env = TestEnvironment::new();
         env.write_config("model_provider = \"openai\"\n");
-        let on = CodexSwitchIntent::On {
+        apply(CodexSwitchIntent::On {
             validated_base_url: ValidatedCodexBaseUrl::local(3211),
-        };
-        apply(on.clone()).expect("switch on compatible facade");
+        })
+        .expect("switch on with complete patch");
+        let config_before = env.read_config();
         let mut state = serde_json::from_slice::<serde_json::Value>(
             &std::fs::read(env.state_path()).expect("read current journal"),
         )
@@ -5757,113 +7461,17 @@ unrelated_feature = true
         state
             .as_object_mut()
             .expect("journal object")
-            .remove("client_facade");
-        std::fs::write(
-            env.state_path(),
-            serde_json::to_vec_pretty(&state).expect("serialize old journal"),
-        )
-        .expect("write old journal shape");
+            .remove("client_patch");
+        let incomplete_state =
+            serde_json::to_vec_pretty(&state).expect("serialize incomplete journal");
+        std::fs::write(env.state_path(), &incomplete_state).expect("write incomplete journal");
 
-        let status = inspect().expect("inspect old journal shape");
-        assert_eq!(status.client_facade, Some(CodexClientFacade::Compatible));
-        assert_eq!(
-            apply(on).expect("reuse old journal shape").change,
-            CodexSwitchChange::Unchanged
-        );
-    }
-
-    #[test]
-    fn facade_only_journals_are_reapplied_as_complete_client_patches() {
-        for facade in [
-            CodexClientFacade::Compatible,
-            CodexClientFacade::OpenAi,
-            CodexClientFacade::OpenAiTools,
-        ] {
-            let env = TestEnvironment::new();
-            let original_config = "model_provider = \"openai\"\n";
-            let original_auth = b"auth sentinel";
-            env.write_config(original_config);
-            std::fs::write(env.auth_path(), original_auth).expect("write original auth");
-            let target = ValidatedCodexBaseUrl::local(3211);
-            let patch = facade.client_patch();
-
-            apply_with_client_patch(
-                CodexSwitchIntent::On {
-                    validated_base_url: target.clone(),
-                },
-                patch,
-            )
-            .expect("apply current complete patch before journal downgrade");
-
-            let mut applied = env.read_config();
-            if matches!(
-                facade,
-                CodexClientFacade::OpenAi | CodexClientFacade::OpenAiTools
-            ) {
-                applied = applied.replace("supports_websockets = false\n", "");
-            }
-            env.write_config(applied.as_str());
-            let mut state = serde_json::from_slice::<serde_json::Value>(
-                &std::fs::read(env.state_path()).expect("read current journal"),
-            )
-            .expect("parse current journal");
-            let object = state.as_object_mut().expect("journal object");
-            object.remove("client_patch");
-            object.insert(
-                "applied_fingerprint".to_string(),
-                serde_json::Value::String(fingerprint(applied.as_bytes())),
-            );
-            if facade == CodexClientFacade::OpenAiTools {
-                object.remove("auth_patch");
-                std::fs::write(env.auth_path(), original_auth).expect("restore legacy auth");
-                for backup in env.auth_backup_files() {
-                    std::fs::remove_file(backup).expect("remove new-only auth backup");
-                }
-            }
-            std::fs::write(
-                env.state_path(),
-                serde_json::to_vec_pretty(&state).expect("serialize facade-only journal"),
-            )
-            .expect("write facade-only journal");
-
-            let legacy_status = inspect().expect("inspect facade-only journal");
-            assert_eq!(legacy_status.client_facade, Some(facade));
-            assert_eq!(legacy_status.client_patch, None);
-
-            let outcome = apply_with_client_patch(
-                CodexSwitchIntent::On {
-                    validated_base_url: target,
-                },
-                patch,
-            )
-            .expect("upgrade facade-only journal");
-
-            assert_eq!(outcome.change, CodexSwitchChange::Applied);
-            assert_eq!(outcome.status.client_patch, Some(patch));
-            let upgraded_state = serde_json::from_slice::<serde_json::Value>(
-                &std::fs::read(env.state_path()).expect("read upgraded journal"),
-            )
-            .expect("parse upgraded journal");
-            assert!(upgraded_state.get("client_patch").is_some());
-            if facade == CodexClientFacade::OpenAi {
-                assert!(env.read_config().contains("supports_websockets = false"));
-            }
-            if facade == CodexClientFacade::OpenAiTools {
-                assert_eq!(
-                    serde_json::from_slice::<serde_json::Value>(
-                        &std::fs::read(env.auth_path()).expect("read upgraded auth facade")
-                    )
-                    .expect("parse upgraded auth facade"),
-                    serde_json::json!({})
-                );
-                assert_eq!(env.auth_backup_files().len(), 1);
-                assert!(upgraded_state.get("auth_patch").is_some());
-            }
-
-            apply(CodexSwitchIntent::Off).expect("restore upgraded switch");
-            assert_eq!(env.read_config(), original_config);
-            assert_eq!(std::fs::read(env.auth_path()).unwrap(), original_auth);
-        }
+        assert!(matches!(
+            inspect(),
+            Err(CodexSwitchError::InvalidState { .. })
+        ));
+        assert_eq!(env.read_config(), config_before);
+        assert_eq!(std::fs::read(env.state_path()).unwrap(), incomplete_state);
     }
 
     #[test]
@@ -6252,6 +7860,20 @@ request_max_retries = 7"#;
     #[test]
     fn managed_switch_artifact_names_require_an_exact_uuid_shape() {
         let uuid = Uuid::new_v4();
+        assert!(managed_auth_backup_name(&format!(
+            "{AUTH_BACKUP_FILE_PREFIX}{uuid}{AUTH_BACKUP_FILE_SUFFIX}"
+        )));
+        assert!(managed_helper_stanza_backup_name(&format!(
+            "{HELPER_STANZA_BACKUP_FILE_PREFIX}{uuid}{HELPER_STANZA_BACKUP_FILE_SUFFIX}"
+        )));
+        for name in [
+            "codex-switch-auth-v1-not-a-uuid.bak",
+            "codex-switch-helper-stanza-v1-not-a-uuid.bak",
+            "codex-switch-helper-stanza-v1-00000000-0000-0000-0000-000000000000.bak.extra",
+        ] {
+            assert!(!managed_auth_backup_name(name));
+            assert!(!managed_helper_stanza_backup_name(name));
+        }
         for name in [
             format!("{SWITCH_TEMP_FILE_PREFIX}{uuid}{SWITCH_TEMP_FILE_SUFFIX}"),
             format!("{LEGACY_SWITCH_TEMP_FILE_PREFIX}{uuid}{SWITCH_TEMP_FILE_SUFFIX}"),
@@ -6346,12 +7968,13 @@ request_max_retries = 7"#;
             ManagedCommitRole::Config,
         )
         .expect("resolve managed capture");
+        let expected = read_config_snapshot(env.config_path().as_path()).expect("capture expected");
         capture_expected_file(
             env.config_path().as_path(),
             capture.as_path(),
             FileCommitExpectation::Journal(ConfigCommitExpectation {
                 journal: &journal,
-                state: ExpectedConfigState::Original,
+                expected: &expected,
             }),
         )
         .expect("simulate crash after detaching the expected config");
@@ -6400,12 +8023,13 @@ request_max_retries = 7"#;
             ManagedCommitRole::Config,
         )
         .expect("resolve managed capture");
+        let expected = read_config_snapshot(env.config_path().as_path()).expect("capture expected");
         capture_expected_file(
             env.config_path().as_path(),
             capture.as_path(),
             FileCommitExpectation::Journal(ConfigCommitExpectation {
                 journal: &journal,
-                state: ExpectedConfigState::Original,
+                expected: &expected,
             }),
         )
         .expect("detach expected config");
@@ -6453,6 +8077,7 @@ request_max_retries = 7"#;
         )
         .expect("resolve managed capture");
         let stage = env.codex_home.join("prepared-config-stage");
+        let expected = ConfigSnapshot::from_text(true, original.to_string());
         env.write_config(external);
         std::fs::write(&stage, b"helper replacement").expect("write staged replacement");
 
@@ -6461,7 +8086,7 @@ request_max_retries = 7"#;
             env.config_path().as_path(),
             FileCommitExpectation::Journal(ConfigCommitExpectation {
                 journal: &journal,
-                state: ExpectedConfigState::Original,
+                expected: &expected,
             }),
         )
         .expect_err("commit-time mismatch must fail closed");
@@ -7064,22 +8689,55 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn foreign_or_orphaned_helper_config_is_never_overwritten() {
+    fn inactive_foreign_helper_stanza_round_trips_but_orphaned_active_config_is_rejected() {
         let env = TestEnvironment::new();
         let foreign = r#"model_provider = "openai"
 
-[model_providers.codex_proxy]
-name = "foreign"
+[model_providers.codex_proxy] # preserve header
+# secret-comment-canary-must-stay-private
+name = 'foreign' # preserve inline comment
 base_url = "https://foreign.example/v1"
+
+[model_providers.codex_proxy.http_headers]
+Authorization = "Bearer authorization-canary-must-stay-private"
+"x-api-key" = "api-key-canary-must-stay-private"
 "#;
         env.write_config(foreign);
-        assert!(matches!(
-            apply(CodexSwitchIntent::On {
-                validated_base_url: ValidatedCodexBaseUrl::local(3211),
-            }),
-            Err(CodexSwitchError::ForeignProviderStanza)
-        ));
+        let expected_backup = helper_stanza_repr_from_document(
+            env.config_path().as_path(),
+            &foreign
+                .parse::<DocumentMut>()
+                .expect("parse foreign config"),
+        )
+        .expect("capture helper stanza representation")
+        .expect("foreign helper stanza");
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("temporarily replace inactive helper stanza");
+        let state = std::fs::read_to_string(env.state_path()).expect("read switch journal");
+        for secret in [
+            "secret-comment-canary-must-stay-private",
+            "authorization-canary-must-stay-private",
+            "api-key-canary-must-stay-private",
+            "Authorization",
+            "x-api-key",
+        ] {
+            assert!(!state.contains(secret), "journal leaked {secret}");
+        }
+        assert!(!state.contains("original_helper_stanza"));
+        assert_eq!(
+            std::fs::read_to_string(env.helper_stanza_backup_path())
+                .expect("read private helper stanza backup"),
+            expected_backup
+        );
+        apply(CodexSwitchIntent::Off).expect("restore inactive helper stanza");
         assert_eq!(env.read_config(), foreign);
+        assert!(env.helper_stanza_backup_files().is_empty());
+        assert_eq!(
+            inspect().expect("inspect inactive foreign stanza").phase,
+            CodexSwitchPhase::Off
+        );
 
         let orphaned = r#"model_provider = "codex_proxy"
 
@@ -7095,6 +8753,314 @@ request_max_retries = 0
             Err(CodexSwitchError::OrphanedActiveProvider)
         ));
         assert_eq!(env.read_config(), orphaned);
+    }
+
+    #[test]
+    fn prepared_switch_repairs_missing_or_tampered_helper_stanza_backup_from_original_config() {
+        for tampered in [false, true] {
+            let env = TestEnvironment::new();
+            let original = r#"model_provider = "openai"
+
+[model_providers.codex_proxy]
+name = "foreign"
+base_url = "https://foreign.example/v1"
+
+[model_providers.codex_proxy.http_headers]
+Authorization = "Bearer prepared-recovery-secret"
+"#;
+            env.write_config(original);
+            let on = CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            };
+            assert!(matches!(
+                apply_with_failpoint(on.clone(), ApplyFailpoint::AfterPrepared),
+                Err(CodexSwitchError::InjectedFailure("after_prepared"))
+            ));
+            let backup = env.helper_stanza_backup_path();
+            if tampered {
+                std::fs::write(&backup, "tampered helper stanza backup")
+                    .expect("tamper helper stanza backup");
+            } else {
+                std::fs::remove_file(&backup).expect("remove helper stanza backup");
+            }
+
+            assert_eq!(
+                inspect().expect("inspect damaged prepared backup").phase,
+                CodexSwitchPhase::RecoveryRequired
+            );
+            assert_eq!(
+                apply(on).expect("repair backup and resume switch").change,
+                CodexSwitchChange::Applied
+            );
+            assert_eq!(
+                apply(CodexSwitchIntent::Off)
+                    .expect("restore original helper stanza")
+                    .change,
+                CodexSwitchChange::Removed
+            );
+            assert_eq!(env.read_config(), original);
+            drop(env);
+        }
+    }
+
+    #[test]
+    fn inline_helper_stanza_journal_migrates_to_private_backup_without_secret_fields() {
+        let env = TestEnvironment::new();
+        let original = r#"model_provider = "openai"
+
+[model_providers.codex_proxy] # migration-secret-comment
+name = "foreign"
+base_url = "https://foreign.example/v1"
+api_key = "migration-secret-api-key"
+"#;
+        env.write_config(original);
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+        assert!(matches!(
+            apply_with_failpoint(on.clone(), ApplyFailpoint::AfterPrepared),
+            Err(CodexSwitchError::InjectedFailure("after_prepared"))
+        ));
+        let original_backup_path = env.helper_stanza_backup_path();
+        let repr = std::fs::read_to_string(&original_backup_path).expect("read stanza backup");
+        let semantic = parse_helper_stanza_repr(original_backup_path.as_path(), repr.as_str())
+            .expect("parse stanza backup");
+        let mut legacy = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(env.state_path()).expect("read switch journal"),
+        )
+        .expect("parse switch journal");
+        let object = legacy.as_object_mut().expect("switch journal object");
+        let operation_id = object
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("operation identifier")
+            .to_string();
+        object.insert(
+            "version".to_string(),
+            serde_json::Value::from(LEGACY_STATE_VERSION),
+        );
+        object.remove("helper_stanza_backup");
+        object.insert(
+            "original_helper_stanza".to_string(),
+            serde_json::to_value(semantic).expect("serialize semantic stanza"),
+        );
+        object.insert(
+            "original_helper_stanza_repr".to_string(),
+            serde_json::Value::String(repr),
+        );
+        std::fs::write(
+            env.state_path(),
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy journal"),
+        )
+        .expect("write legacy journal");
+        std::fs::remove_file(original_backup_path).expect("remove new-format backup");
+
+        assert_eq!(
+            apply(on).expect("migrate inline stanza journal").change,
+            CodexSwitchChange::Applied
+        );
+        let migrated = std::fs::read_to_string(env.state_path()).expect("read migrated journal");
+        let migrated_json =
+            serde_json::from_str::<serde_json::Value>(&migrated).expect("parse migrated journal");
+        let expected_backup_file_name = format!(
+            "{HELPER_STANZA_BACKUP_FILE_PREFIX}{operation_id}{HELPER_STANZA_BACKUP_FILE_SUFFIX}"
+        );
+        assert_eq!(
+            migrated_json
+                .get("version")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(STATE_VERSION))
+        );
+        assert_eq!(
+            migrated_json
+                .pointer("/helper_stanza_backup/backup_file_name")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_backup_file_name.as_str())
+        );
+        assert!(!migrated.contains("original_helper_stanza"));
+        assert!(!migrated.contains("migration-secret-comment"));
+        assert!(!migrated.contains("migration-secret-api-key"));
+        assert_eq!(env.helper_stanza_backup_files().len(), 1);
+        apply(CodexSwitchIntent::Off).expect("restore migrated helper stanza");
+        assert_eq!(env.read_config(), original);
+    }
+
+    #[test]
+    fn inline_helper_stanza_migration_resumes_after_backup_persisted_before_v2_publish() {
+        let env = TestEnvironment::new();
+        let original = r#"model_provider = "openai"
+
+[model_providers.codex_proxy] # interrupted-migration-secret-comment
+name = "foreign"
+base_url = "https://foreign.example/v1"
+api_key = "interrupted-migration-secret-api-key"
+"#;
+        env.write_config(original);
+        let on = CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        };
+        assert!(matches!(
+            apply_with_failpoint(on.clone(), ApplyFailpoint::AfterPrepared),
+            Err(CodexSwitchError::InjectedFailure("after_prepared"))
+        ));
+
+        let initial_backup_path = env.helper_stanza_backup_path();
+        let repr = std::fs::read_to_string(&initial_backup_path).expect("read stanza backup");
+        let semantic = parse_helper_stanza_repr(initial_backup_path.as_path(), repr.as_str())
+            .expect("parse stanza backup");
+        let mut legacy = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(env.state_path()).expect("read switch journal"),
+        )
+        .expect("parse switch journal");
+        let object = legacy.as_object_mut().expect("switch journal object");
+        let operation_id = object
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("operation identifier")
+            .to_string();
+        object.insert(
+            "version".to_string(),
+            serde_json::Value::from(LEGACY_STATE_VERSION),
+        );
+        object.remove("helper_stanza_backup");
+        object.insert(
+            "original_helper_stanza".to_string(),
+            serde_json::to_value(semantic).expect("serialize semantic stanza"),
+        );
+        object.insert(
+            "original_helper_stanza_repr".to_string(),
+            serde_json::Value::String(repr.clone()),
+        );
+        std::fs::write(
+            env.state_path(),
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy journal"),
+        )
+        .expect("write legacy journal");
+        std::fs::remove_file(initial_backup_path).expect("remove new-format backup");
+
+        let interrupted_backup_path = env.resolved_state_dir().join(format!(
+            "{HELPER_STANZA_BACKUP_FILE_PREFIX}{operation_id}{HELPER_STANZA_BACKUP_FILE_SUFFIX}"
+        ));
+        atomic_write_text(
+            interrupted_backup_path.as_path(),
+            repr.as_str(),
+            FilePermissions::Secure,
+            None,
+        )
+        .expect("persist backup before interrupted journal publication");
+
+        assert_eq!(
+            apply(on)
+                .expect("resume interrupted stanza migration")
+                .change,
+            CodexSwitchChange::Applied
+        );
+        let migrated = std::fs::read_to_string(env.state_path()).expect("read migrated journal");
+        let migrated_json =
+            serde_json::from_str::<serde_json::Value>(&migrated).expect("parse migrated journal");
+        assert_eq!(
+            migrated_json
+                .get("version")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(STATE_VERSION))
+        );
+        let backup_files = env.helper_stanza_backup_files();
+        assert_eq!(backup_files.len(), 1);
+        assert_eq!(
+            std::fs::canonicalize(&backup_files[0]).expect("resolve migrated backup"),
+            std::fs::canonicalize(interrupted_backup_path)
+                .expect("resolve interrupted migration backup")
+        );
+        assert!(!migrated.contains("original_helper_stanza"));
+        assert!(!migrated.contains("interrupted-migration-secret-comment"));
+        assert!(!migrated.contains("interrupted-migration-secret-api-key"));
+
+        apply(CodexSwitchIntent::Off).expect("restore after interrupted migration");
+        assert_eq!(env.read_config(), original);
+    }
+
+    #[test]
+    fn unsupported_future_switch_state_is_preserved_without_mutation() {
+        let env = TestEnvironment::new();
+        let original = "model_provider = \"openai\"\n";
+        env.write_config(original);
+        assert!(matches!(
+            apply_with_failpoint(
+                CodexSwitchIntent::On {
+                    validated_base_url: ValidatedCodexBaseUrl::local(3211),
+                },
+                ApplyFailpoint::AfterPrepared,
+            ),
+            Err(CodexSwitchError::InjectedFailure("after_prepared"))
+        ));
+        let mut future = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(env.state_path()).expect("read switch journal"),
+        )
+        .expect("parse switch journal");
+        future
+            .as_object_mut()
+            .expect("switch journal object")
+            .insert(
+                "version".to_string(),
+                serde_json::Value::from(STATE_VERSION + 1),
+            );
+        let future_bytes = serde_json::to_vec_pretty(&future).expect("serialize future journal");
+        std::fs::write(env.state_path(), &future_bytes).expect("write future journal");
+
+        for error in [
+            inspect().expect_err("future state must fail closed during inspection"),
+            apply(CodexSwitchIntent::Off)
+                .expect_err("future state must fail closed during mutation"),
+        ] {
+            assert!(matches!(error, CodexSwitchError::InvalidState { .. }));
+            assert!(error.to_string().contains("unsupported state version"));
+        }
+        assert_eq!(env.read_config(), original);
+        assert_eq!(
+            std::fs::read(env.state_path()).expect("read preserved future journal"),
+            future_bytes
+        );
+    }
+
+    #[test]
+    fn applied_switch_fails_closed_when_helper_stanza_backup_is_missing_or_tampered() {
+        for tampered in [false, true] {
+            let env = TestEnvironment::new();
+            let original = r#"model_provider = "openai"
+
+[model_providers.codex_proxy]
+name = "foreign"
+base_url = "https://foreign.example/v1"
+api_key = "applied-recovery-secret"
+"#;
+            env.write_config(original);
+            apply(CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            })
+            .expect("apply switch");
+            let applied = env.read_config();
+            let backup = env.helper_stanza_backup_path();
+            if tampered {
+                std::fs::write(&backup, "tampered helper stanza backup")
+                    .expect("tamper helper stanza backup");
+            } else {
+                std::fs::remove_file(&backup).expect("remove helper stanza backup");
+            }
+
+            assert_eq!(
+                inspect().expect("inspect damaged applied backup").phase,
+                CodexSwitchPhase::RecoveryRequired
+            );
+            assert!(matches!(
+                apply(CodexSwitchIntent::Off),
+                Err(CodexSwitchError::RecoveryRequired { .. })
+            ));
+            assert_eq!(env.read_config(), applied);
+            assert_ne!(env.read_config(), original);
+            let state = std::fs::read_to_string(env.state_path()).expect("read recovery journal");
+            assert!(!state.contains("applied-recovery-secret"));
+            drop(env);
+        }
     }
 
     #[test]
@@ -7315,29 +9281,82 @@ request_max_retries = 0
     }
 
     #[test]
-    fn external_edit_marks_recovery_and_leaves_config_byte_identical() {
+    fn switch_off_preserves_unmanaged_codex_config_writeback() {
         let env = TestEnvironment::new();
-        env.write_config("model_provider = \"openai\"\n");
-        apply(CodexSwitchIntent::On {
-            validated_base_url: ValidatedCodexBaseUrl::local(3211),
-        })
-        .expect("switch on");
+        env.write_config(
+            r#"# original config
+model_provider = "openai"
+
+[features]
+remote_compaction_v2 = false
+image_generation = true
+unrelated_feature = true
+"#,
+        );
+        let patch = CodexClientPatchConfig {
+            preset: CodexClientPreset::OfficialRelay,
+            compaction: CodexCompactionStrategy::RemoteV2,
+            ..CodexClientPatchConfig::default()
+        };
+        apply_with_client_patch(
+            CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            },
+            patch,
+        )
+        .expect("switch on with one managed feature");
+        let journal = std::fs::read_to_string(env.state_path()).expect("read switch journal");
+        let journal_json =
+            serde_json::from_str::<serde_json::Value>(&journal).expect("parse switch journal");
+        assert_eq!(
+            journal_json
+                .get("version")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(STATE_VERSION))
+        );
+        assert!(!journal.contains("pending_config"));
+
         let mut edited = env.read_config();
-        edited.push_str("\n[projects.\"/external\"]\ntrust_level = \"trusted\"\n");
+        edited = edited.replace("unrelated_feature = true", "unrelated_feature = false");
+        edited = edited.replace("image_generation = true", "image_generation = false");
+        edited.push_str(
+            r#"
+# written by Codex
+[projects."/external"]
+trust_level = "trusted"
+
+[notice]
+hide_full_access_warning = true
+
+[mcp_servers.docs]
+command = "docs"
+"#,
+        );
         env.write_config(edited.as_str());
 
-        assert!(matches!(
-            apply(CodexSwitchIntent::Off),
-            Err(CodexSwitchError::RecoveryRequired { .. })
-        ));
-        assert_eq!(env.read_config(), edited);
-        let status = inspect().expect("inspect recovery state");
-        assert_eq!(status.phase, CodexSwitchPhase::RecoveryRequired);
-        assert!(env.state_path().exists());
+        assert_eq!(
+            inspect().expect("inspect unmanaged writeback").phase,
+            CodexSwitchPhase::Applied
+        );
+        let outcome = apply(CodexSwitchIntent::Off).expect("merge switch-off restoration");
+
+        assert_eq!(outcome.change, CodexSwitchChange::Removed);
+        let restored = env.read_config();
+        assert!(restored.contains("# original config"));
+        assert!(restored.contains("# written by Codex"));
+        assert!(restored.contains("model_provider = \"openai\""));
+        assert!(restored.contains("remote_compaction_v2 = false"));
+        assert!(restored.contains("image_generation = false"));
+        assert!(restored.contains("unrelated_feature = false"));
+        assert!(restored.contains("[projects.\"/external\"]"));
+        assert!(restored.contains("[notice]"));
+        assert!(restored.contains("[mcp_servers.docs]"));
+        assert!(!restored.contains("model_providers.codex_proxy"));
+        assert!(!env.state_path().exists());
     }
 
     #[test]
-    fn external_edits_after_prepare_are_never_overwritten() {
+    fn prepared_on_rejects_writeback_but_prepared_off_merges_it() {
         {
             let env = TestEnvironment::new();
             env.write_config("model_provider = \"openai\"\n");
@@ -7377,6 +9396,93 @@ request_max_retries = 0
             edited.push_str("\n# external edit\n");
             env.write_config(edited.as_str());
 
+            let outcome =
+                apply(CodexSwitchIntent::Off).expect("merge edit into prepared switch-off");
+            assert_eq!(outcome.change, CodexSwitchChange::Removed);
+            let restored = env.read_config();
+            assert!(restored.contains("model_provider = \"openai\""));
+            assert!(restored.contains("# external edit"));
+            assert!(!restored.contains("model_providers.codex_proxy"));
+        }
+    }
+
+    #[test]
+    fn switch_off_rejects_helper_owned_projection_conflicts() {
+        {
+            let env = TestEnvironment::new();
+            env.write_config("model_provider = \"openai\"\n");
+            apply(CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            })
+            .expect("switch on");
+            let edited = env.read_config().replace(
+                "model_provider = \"codex_proxy\"",
+                "model_provider = \"external\"",
+            );
+            env.write_config(edited.as_str());
+
+            assert_eq!(
+                inspect().expect("inspect selector conflict").phase,
+                CodexSwitchPhase::RecoveryRequired
+            );
+            assert!(matches!(
+                apply(CodexSwitchIntent::Off),
+                Err(CodexSwitchError::RecoveryRequired { .. })
+            ));
+            assert_eq!(env.read_config(), edited);
+        }
+
+        {
+            let env = TestEnvironment::new();
+            env.write_config("model_provider = \"openai\"\n");
+            apply(CodexSwitchIntent::On {
+                validated_base_url: ValidatedCodexBaseUrl::local(3211),
+            })
+            .expect("switch on");
+            let edited = env.read_config().replace(
+                "base_url = \"http://127.0.0.1:3211\"",
+                "base_url = \"https://external.example/v1\"",
+            );
+            env.write_config(edited.as_str());
+
+            assert_eq!(
+                inspect().expect("inspect stanza conflict").phase,
+                CodexSwitchPhase::RecoveryRequired
+            );
+            assert!(matches!(
+                apply(CodexSwitchIntent::Off),
+                Err(CodexSwitchError::RecoveryRequired { .. })
+            ));
+            assert_eq!(env.read_config(), edited);
+        }
+
+        {
+            let env = TestEnvironment::new();
+            env.write_config(
+                "model_provider = \"openai\"\n\n[features]\nremote_compaction_v2 = false\n",
+            );
+            let patch = CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialRelay,
+                compaction: CodexCompactionStrategy::RemoteV2,
+                ..CodexClientPatchConfig::default()
+            };
+            apply_with_client_patch(
+                CodexSwitchIntent::On {
+                    validated_base_url: ValidatedCodexBaseUrl::local(3211),
+                },
+                patch,
+            )
+            .expect("switch on with managed feature");
+            let edited = env.read_config().replace(
+                "remote_compaction_v2 = true",
+                "remote_compaction_v2 = false",
+            );
+            env.write_config(edited.as_str());
+
+            assert_eq!(
+                inspect().expect("inspect managed feature conflict").phase,
+                CodexSwitchPhase::RecoveryRequired
+            );
             assert!(matches!(
                 apply(CodexSwitchIntent::Off),
                 Err(CodexSwitchError::RecoveryRequired { .. })
@@ -7386,44 +9492,212 @@ request_max_retries = 0
     }
 
     #[test]
-    fn journal_is_bound_to_the_resolved_codex_config_path() {
+    fn switch_off_keeps_comment_only_writeback_when_original_config_was_absent() {
+        let env = TestEnvironment::new();
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("switch on without an original config");
+        let mut edited = env.read_config();
+        edited.push_str("\n# written by Codex while switched\n");
+        env.write_config(edited.as_str());
+
+        apply(CodexSwitchIntent::Off).expect("restore while preserving comment-only writeback");
+
+        let restored = env.read_config();
+        assert!(restored.contains("# written by Codex while switched"));
+        let parsed =
+            toml::from_str::<TomlValue>(restored.as_str()).expect("parse comment-only config");
+        assert!(parsed.as_table().is_some_and(|table| table.is_empty()));
+        assert!(!env.state_path().exists());
+    }
+
+    #[test]
+    fn different_codex_homes_have_independent_switch_journals() {
+        let env = TestEnvironment::new();
+        let first_original = "model_provider = \"openai\"\n";
+        env.write_config(first_original);
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("switch on first Codex home");
+        let first_applied = env.read_config();
+        let first_state_path = env.state_path();
+        let first_state = std::fs::read(&first_state_path).expect("read first state");
+
+        let other_codex_home = env.root.join("other-codex");
+        std::fs::create_dir_all(&other_codex_home).expect("create other Codex home");
+        let other_config = other_codex_home.join("config.toml");
+        let second_original = "model_provider = \"custom\"\n";
+        std::fs::write(&other_config, second_original).expect("write other config");
+        let second_state_path = env.state_path_for_home(other_codex_home.as_path());
+        assert_ne!(first_state_path, second_state_path);
+        unsafe {
+            std::env::set_var("CODEX_HOME", &other_codex_home);
+        }
+
+        let second_before = inspect().expect("inspect second Codex home");
+        assert_eq!(second_before.phase, CodexSwitchPhase::Off);
+        assert_eq!(second_before.state_path, second_state_path);
+        assert_eq!(env.read_config(), first_applied);
+        assert_eq!(
+            std::fs::read(&first_state_path).expect("re-read first state"),
+            first_state
+        );
+
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(4321),
+        })
+        .expect("switch on second Codex home");
+        assert!(first_state_path.exists());
+        assert!(second_state_path.exists());
+        assert!(
+            std::fs::read_to_string(&other_config)
+                .expect("read applied second config")
+                .contains("http://127.0.0.1:4321")
+        );
+
+        assert_eq!(
+            apply(CodexSwitchIntent::Off)
+                .expect("switch off second Codex home")
+                .change,
+            CodexSwitchChange::Removed
+        );
+        assert_eq!(
+            std::fs::read_to_string(&other_config).unwrap(),
+            second_original
+        );
+        assert!(!second_state_path.exists());
+        assert_eq!(env.read_config(), first_applied);
+        assert_eq!(std::fs::read(&first_state_path).unwrap(), first_state);
+
+        unsafe {
+            std::env::set_var("CODEX_HOME", &env.codex_home);
+        }
+        assert_eq!(
+            inspect().expect("inspect first Codex home").phase,
+            CodexSwitchPhase::Applied
+        );
+        apply(CodexSwitchIntent::Off).expect("switch off first Codex home");
+        assert_eq!(env.read_config(), first_original);
+    }
+
+    #[test]
+    fn matching_unscoped_journal_is_adopted_and_migrated_without_rewriting() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let target = ValidatedCodexBaseUrl::local(3211);
+        apply(CodexSwitchIntent::On {
+            validated_base_url: target.clone(),
+        })
+        .expect("create scoped state");
+        let scoped_state = env.state_path();
+        let unscoped_state = env.unscoped_state_path();
+        let state_bytes = std::fs::read(&scoped_state).expect("read scoped state");
+        std::fs::rename(&scoped_state, &unscoped_state).expect("downgrade to unscoped state");
+
+        let adopted = inspect().expect("inspect matching unscoped state");
+        assert_eq!(adopted.phase, CodexSwitchPhase::Applied);
+        assert_eq!(adopted.state_path, unscoped_state);
+        assert!(!scoped_state.exists());
+
+        let outcome = apply(CodexSwitchIntent::On {
+            validated_base_url: target,
+        })
+        .expect("migrate matching unscoped state");
+        assert_eq!(outcome.change, CodexSwitchChange::Unchanged);
+        assert_eq!(outcome.status.state_path, scoped_state);
+        assert!(!unscoped_state.exists());
+        assert_eq!(std::fs::read(&scoped_state).unwrap(), state_bytes);
+    }
+
+    #[test]
+    fn mismatched_unscoped_journal_does_not_block_another_codex_home() {
         let env = TestEnvironment::new();
         env.write_config("model_provider = \"openai\"\n");
         apply(CodexSwitchIntent::On {
             validated_base_url: ValidatedCodexBaseUrl::local(3211),
         })
-        .expect("switch on");
-        let applied = env.read_config();
-        let state_before = std::fs::read_to_string(env.state_path()).expect("read state");
+        .expect("switch on first Codex home");
+        let first_applied = env.read_config();
+        let first_scoped_state = env.state_path();
+        let unscoped_state = env.unscoped_state_path();
+        std::fs::rename(&first_scoped_state, &unscoped_state)
+            .expect("downgrade first state to unscoped path");
+        let unscoped_bytes = std::fs::read(&unscoped_state).expect("read unscoped state");
 
         let other_codex_home = env.root.join("other-codex");
         std::fs::create_dir_all(&other_codex_home).expect("create other Codex home");
         let other_config = other_codex_home.join("config.toml");
-        std::fs::write(&other_config, &applied).expect("write matching other config");
+        let other_original = "model_provider = \"custom\"\n";
+        std::fs::write(&other_config, other_original).expect("write other config");
+        let other_state = env.state_path_for_home(other_codex_home.as_path());
         unsafe {
             std::env::set_var("CODEX_HOME", &other_codex_home);
         }
 
-        assert!(matches!(
-            apply(CodexSwitchIntent::Off),
-            Err(CodexSwitchError::RecoveryRequired { .. })
-        ));
         assert_eq!(
-            std::fs::read_to_string(&other_config).expect("read other config"),
-            applied
+            inspect().expect("inspect other home").phase,
+            CodexSwitchPhase::Off
         );
         assert_eq!(
-            std::fs::read_to_string(env.state_path()).expect("re-read state"),
-            state_before
+            apply(CodexSwitchIntent::Off)
+                .expect("no-op switch off in other home")
+                .change,
+            CodexSwitchChange::Unchanged
         );
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(4321),
+        })
+        .expect("switch on other home despite mismatched unscoped state");
+        assert!(other_state.exists());
+        assert_eq!(std::fs::read(&unscoped_state).unwrap(), unscoped_bytes);
+        assert_eq!(env.read_config(), first_applied);
+
+        apply(CodexSwitchIntent::Off).expect("switch off other home");
         assert_eq!(
-            inspect().expect("inspect mismatched path").phase,
-            CodexSwitchPhase::RecoveryRequired
+            std::fs::read_to_string(&other_config).unwrap(),
+            other_original
         );
+        assert_eq!(std::fs::read(&unscoped_state).unwrap(), unscoped_bytes);
 
         unsafe {
             std::env::set_var("CODEX_HOME", &env.codex_home);
         }
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("migrate first home state after returning");
+        assert!(first_scoped_state.exists());
+        assert!(!unscoped_state.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_home_symlink_aliases_share_the_resolved_switch_scope() {
+        use std::os::unix::fs::symlink;
+
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let codex_home_alias = env.root.join("codex-home-alias");
+        symlink(&env.codex_home, &codex_home_alias).expect("link Codex home alias");
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home_alias);
+        }
+
+        let applied = apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("switch on through alias");
+        assert_eq!(applied.status.state_path, env.state_path());
+
+        unsafe {
+            std::env::set_var("CODEX_HOME", &env.codex_home);
+        }
+        let direct = inspect().expect("inspect through real Codex home");
+        assert_eq!(direct.phase, CodexSwitchPhase::Applied);
+        assert_eq!(direct.state_path, env.state_path());
+        apply(CodexSwitchIntent::Off).expect("switch off through real Codex home");
     }
 
     #[cfg(unix)]
@@ -7443,6 +9717,7 @@ request_max_retries = 0
         })
         .expect("switch on through linked home");
         let applied = env.read_config();
+        let original_state = std::fs::read(env.state_path()).expect("read original state");
 
         let other_codex_home = env.root.join("retargeted-codex");
         std::fs::create_dir_all(&other_codex_home).expect("create retargeted Codex home");
@@ -7453,16 +9728,168 @@ request_max_retries = 0
 
         assert!(matches!(
             apply(CodexSwitchIntent::Off),
-            Err(CodexSwitchError::RecoveryRequired { .. })
+            Err(CodexSwitchError::OrphanedActiveProvider)
         ));
         assert_eq!(
             std::fs::read_to_string(other_config).expect("read retargeted config"),
             applied
         );
+        assert_eq!(env.read_config(), applied);
+        assert_eq!(std::fs::read(env.state_path()).unwrap(), original_state);
 
         unsafe {
             std::env::set_var("CODEX_HOME", &env.codex_home);
         }
+    }
+
+    #[test]
+    fn service_restore_uses_explicit_client_home_and_exact_applied_target() {
+        let env = TestEnvironment::new();
+        let original = "model_provider = \"openai\"\n";
+        env.write_config(original);
+        let target = ValidatedCodexBaseUrl::local(3211);
+        apply(CodexSwitchIntent::On {
+            validated_base_url: target.clone(),
+        })
+        .expect("switch on service target");
+
+        let other_codex_home = env.root.join("other-codex");
+        std::fs::create_dir_all(&other_codex_home).expect("create other Codex home");
+        unsafe {
+            std::env::set_var("CODEX_HOME", &other_codex_home);
+        }
+        let outcome = restore_managed_applied_for_target(env.codex_home.as_path(), &target)
+            .expect("restore explicit service client home");
+
+        assert!(matches!(
+            outcome,
+            CodexSwitchTargetRestoreOutcome::Restored(CodexSwitchOutcome {
+                change: CodexSwitchChange::Removed,
+                ..
+            })
+        ));
+        assert_eq!(env.read_config(), original);
+        assert!(!env.state_path().exists());
+    }
+
+    #[test]
+    fn service_restore_recovers_a_matching_v0203_switch_target() {
+        let env = TestEnvironment::new();
+        let target = ValidatedCodexBaseUrl::local(3211);
+        env.write_config(&legacy_applied_config(target.as_str()));
+        env.write_legacy_state(legacy_state(2));
+
+        let outcome = restore_managed_applied_for_target(env.codex_home.as_path(), &target)
+            .expect("restore matching v0.20.3 service target");
+
+        assert!(matches!(
+            outcome,
+            CodexSwitchTargetRestoreOutcome::Restored(CodexSwitchOutcome {
+                change: CodexSwitchChange::Recovered,
+                ..
+            })
+        ));
+        assert_eq!(env.read_config(), "model_provider = \"openai\"\n");
+        assert!(!env.legacy_state_path().exists());
+        assert!(!env.state_path().exists());
+    }
+
+    #[test]
+    fn service_restore_preserves_a_different_v0203_switch_target() {
+        let env = TestEnvironment::new();
+        let configured_target = ValidatedCodexBaseUrl::local(4321);
+        let expected_target = ValidatedCodexBaseUrl::local(3211);
+        env.write_config(&legacy_applied_config(configured_target.as_str()));
+        env.write_legacy_state(legacy_state(2));
+        let config_before = env.read_config();
+        let state_before =
+            std::fs::read(env.legacy_state_path()).expect("read legacy switch state");
+
+        let outcome =
+            restore_managed_applied_for_target(env.codex_home.as_path(), &expected_target)
+                .expect("inspect a different v0.20.3 service target");
+
+        assert!(matches!(
+            outcome,
+            CodexSwitchTargetRestoreOutcome::Unchanged(CodexSwitchStatus {
+                phase: CodexSwitchPhase::RecoveryRequired,
+                enabled: true,
+                managed: false,
+                ..
+            })
+        ));
+        assert_eq!(env.read_config(), config_before);
+        assert_eq!(
+            std::fs::read(env.legacy_state_path()).expect("reread legacy switch state"),
+            state_before
+        );
+    }
+
+    #[test]
+    fn service_restore_does_not_modify_a_different_local_or_remote_target() {
+        for configured_target in [
+            ValidatedCodexBaseUrl::local(4321),
+            ValidatedCodexBaseUrl::parse("https://relay.example/v1").expect("remote target"),
+        ] {
+            let env = TestEnvironment::new();
+            env.write_config("model_provider = \"openai\"\n");
+            apply(CodexSwitchIntent::On {
+                validated_base_url: configured_target.clone(),
+            })
+            .expect("switch on different target");
+            let config_before = env.read_config();
+            let state_before = std::fs::read(env.state_path()).expect("read switch state");
+
+            let outcome = restore_managed_applied_for_target(
+                env.codex_home.as_path(),
+                &ValidatedCodexBaseUrl::local(3211),
+            )
+            .expect("inspect different target without restoring it");
+
+            assert!(matches!(
+                outcome,
+                CodexSwitchTargetRestoreOutcome::Unchanged(CodexSwitchStatus {
+                    phase: CodexSwitchPhase::Applied,
+                    enabled: true,
+                    managed: true,
+                    ..
+                })
+            ));
+            assert_eq!(env.read_config(), config_before);
+            assert_eq!(
+                std::fs::read(env.state_path()).expect("re-read switch state"),
+                state_before
+            );
+        }
+    }
+
+    #[test]
+    fn service_restore_merges_unmanaged_codex_config_writeback() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"openai\"\n");
+        let target = ValidatedCodexBaseUrl::local(3211);
+        apply(CodexSwitchIntent::On {
+            validated_base_url: target.clone(),
+        })
+        .expect("switch on service target");
+        let edited = format!("{}\n# external edit\n", env.read_config());
+        env.write_config(&edited);
+
+        let outcome = restore_managed_applied_for_target(env.codex_home.as_path(), &target)
+            .expect("restore externally edited target");
+
+        assert!(matches!(
+            outcome,
+            CodexSwitchTargetRestoreOutcome::Restored(CodexSwitchOutcome {
+                change: CodexSwitchChange::Removed,
+                ..
+            })
+        ));
+        let restored = env.read_config();
+        assert!(restored.contains("model_provider = \"openai\""));
+        assert!(restored.contains("# external edit"));
+        assert!(!restored.contains("model_providers.codex_proxy"));
+        assert!(!env.state_path().exists());
     }
 
     #[test]
@@ -7671,6 +10098,55 @@ request_max_retries = 0
                 .change,
             CodexSwitchChange::Recovered
         );
+        assert_eq!(env.read_config(), original);
+    }
+
+    #[test]
+    fn restored_journal_recovers_after_helper_stanza_backup_cleanup_interruption() {
+        let env = TestEnvironment::new();
+        let original = r#"model_provider = "openai"
+
+[model_providers.codex_proxy] # preserved comment
+name = "foreign"
+base_url = "https://foreign.example/v1"
+api_key = "cleanup-interruption-secret"
+"#;
+        env.write_config(original);
+        apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("switch on");
+
+        assert!(matches!(
+            apply_with_failpoint(
+                CodexSwitchIntent::Off,
+                ApplyFailpoint::AfterHelperStanzaBackupRemoval
+            ),
+            Err(CodexSwitchError::InjectedFailure(
+                "after_helper_stanza_backup_removal"
+            ))
+        ));
+        assert_eq!(env.read_config(), original);
+        assert!(env.state_path().exists());
+        assert!(env.helper_stanza_backup_files().is_empty());
+        assert_eq!(
+            inspect().expect("inspect interrupted cleanup").phase,
+            CodexSwitchPhase::Off
+        );
+        assert_eq!(
+            project_original_codex_config(|config, _| config.map(str::to_string))
+                .expect("project original config"),
+            Some(original.to_string())
+        );
+
+        assert_eq!(
+            apply(CodexSwitchIntent::Off)
+                .expect("finish interrupted cleanup")
+                .change,
+            CodexSwitchChange::Recovered
+        );
+        assert!(!env.state_path().exists());
+        assert!(env.helper_stanza_backup_files().is_empty());
         assert_eq!(env.read_config(), original);
     }
 

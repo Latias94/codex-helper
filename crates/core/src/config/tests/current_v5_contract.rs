@@ -126,6 +126,37 @@ fn assert_retired_config_auto_migrated(
     );
 }
 
+fn assert_relay_target_client_patch_migrated(
+    migrated: &str,
+    expected_preset: Option<&str>,
+    expected_responses_websocket: Option<bool>,
+) {
+    let raw = toml::from_str::<toml::Value>(migrated).expect("parse migrated relay target TOML");
+    let target = raw
+        .get("relay_targets")
+        .and_then(toml::Value::as_table)
+        .and_then(|targets| targets.get("nas"))
+        .and_then(toml::Value::as_table)
+        .expect("migrated nas relay target");
+    assert!(!target.contains_key("client_preset"));
+    assert!(!target.contains_key("responses_websocket"));
+
+    let patch = target
+        .get("client_patch")
+        .and_then(toml::Value::as_table)
+        .expect("migrated relay target client patch");
+    assert_eq!(
+        patch.get("preset").and_then(toml::Value::as_str),
+        expected_preset
+    );
+    assert_eq!(
+        patch
+            .get("responses_websocket")
+            .and_then(toml::Value::as_bool),
+        expected_responses_websocket
+    );
+}
+
 #[test]
 fn current_config_path_is_fixed_to_helper_home_config_toml() {
     let _env = setup_temp_codex_home();
@@ -308,6 +339,10 @@ fn v0_20_3_supported_version_5_fixture_migrates_with_exact_backup() {
         codex_routing.affinity_policy,
         RouteAffinityPolicy::FallbackSticky
     );
+    assert_eq!(
+        codex_routing.scheduling_preset,
+        SchedulingPreset::ThroughputFirst
+    );
     assert_eq!(codex_routing.fallback_ttl_ms, Some(90_000));
     assert_eq!(codex_routing.reprobe_preferred_after_ms, Some(30_000));
     assert_eq!(
@@ -336,6 +371,10 @@ fn v0_20_3_supported_version_5_fixture_migrates_with_exact_backup() {
         Some("CLAUDE_RELAY_API_KEY")
     );
     let claude_routing = config.claude.routing.as_ref().expect("Claude routing");
+    assert_eq!(
+        claude_routing.scheduling_preset,
+        SchedulingPreset::ThroughputFirst
+    );
     assert_eq!(
         claude_routing.routes["main"].strategy,
         RouteStrategy::ManualSticky
@@ -432,16 +471,6 @@ fn v0_20_3_supported_version_5_fixture_migrates_with_exact_backup() {
     );
     assert_eq!(service_status.probes[0].models, vec!["gpt-5.4"]);
 
-    // This field did not exist in v0.20.3; the compatibility guide documents the new default.
-    assert_eq!(
-        config
-            .codex
-            .routing
-            .as_ref()
-            .map(|routing| routing.scheduling_preset),
-        Some(SchedulingPreset::Balanced)
-    );
-
     let route = crate::routing_ir::compile_route_handshake_plan("codex", &config.codex)
         .expect("compile v0.20.3 route graph");
     assert_eq!(
@@ -456,6 +485,19 @@ fn v0_20_3_supported_version_5_fixture_migrates_with_exact_backup() {
         vec![("primary", "default"), ("regional", "fast")]
     );
     let migrated = std::fs::read_to_string(&path).expect("read migrated fixture");
+    let migrated_raw =
+        toml::from_str::<toml::Value>(&migrated).expect("parse migrated v0.20.3 fixture");
+    for service_name in ["codex", "claude"] {
+        assert_eq!(
+            migrated_raw
+                .get(service_name)
+                .and_then(|service| service.get("routing"))
+                .and_then(|routing| routing.get("scheduling_preset"))
+                .and_then(toml::Value::as_str),
+            Some("throughput-first"),
+            "{service_name} migration must persist the v0.20.3 saturation behavior"
+        );
+    }
     assert!(migrated.contains("version = 6"));
     assert!(migrated.contains("[codex.client_patch]"));
     assert!(migrated.contains("preset = \"official-imagegen\""));
@@ -464,6 +506,79 @@ fn v0_20_3_supported_version_5_fixture_migrates_with_exact_backup() {
         std::fs::read(path.with_file_name("config.toml.bak")).expect("read exact v0.20.3 backup"),
         original
     );
+}
+
+#[test]
+fn version_5_implicit_routing_preserves_immediate_saturation_behavior() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let source = r#"version = 5
+
+[codex.providers.primary]
+base_url = "https://primary.example.com/v1"
+
+[codex.providers.primary.limits]
+max_concurrent_requests = 1
+
+[codex.providers.backup]
+base_url = "https://backup.example.com/v1"
+"#;
+    write_file(&path, source);
+
+    let config = test_runtime()
+        .block_on(load_config())
+        .expect("migrate version 5 implicit routing");
+    let routing = config
+        .codex
+        .routing
+        .as_ref()
+        .expect("migration should materialize scheduling for implicit routing");
+    assert_eq!(routing.scheduling_preset, SchedulingPreset::ThroughputFirst);
+    assert!(routing.routes.is_empty());
+
+    let migrated = std::fs::read_to_string(&path).expect("read migrated implicit routing");
+    assert!(migrated.contains("scheduling_preset = \"throughput-first\""));
+    assert_eq!(
+        std::fs::read_to_string(path.with_file_name("config.toml.bak"))
+            .expect("read exact implicit-routing backup"),
+        source
+    );
+}
+
+#[test]
+fn version_6_missing_scheduling_preset_keeps_balanced_default_without_rewrite() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let source = r#"version = 6
+
+[codex.providers.primary]
+base_url = "https://primary.example.com/v1"
+
+[codex.routing]
+entry = "main"
+
+[codex.routing.routes.main]
+strategy = "ordered-failover"
+children = ["primary"]
+"#;
+    write_file(&path, source);
+
+    let config = test_runtime()
+        .block_on(load_config())
+        .expect("load current version 6 routing default");
+    assert_eq!(
+        config
+            .codex
+            .routing
+            .as_ref()
+            .map(|routing| routing.scheduling_preset),
+        Some(SchedulingPreset::Balanced)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read unchanged version 6 config"),
+        source
+    );
+    assert!(!path.with_file_name("config.toml.bak").exists());
 }
 
 #[test]
@@ -547,7 +662,7 @@ fn config_init_force_backs_up_retired_v5_before_replacement() {
 }
 
 #[test]
-fn removed_codex_compaction_config_is_auto_migrated_with_backup() {
+fn codex_compaction_config_is_preserved_during_v5_migration_with_exact_backup() {
     let _env = setup_temp_codex_home();
     let path = current_config_path();
     let runtime = test_runtime();
@@ -555,31 +670,87 @@ fn removed_codex_compaction_config_is_auto_migrated_with_backup() {
         (
             "remote_v2_downgrade true",
             "version = 5\n[codex.compaction]\nremote_v2_downgrade = true\n",
+            true,
         ),
         (
             "remote_v2_downgrade false",
             "version = 5\n[codex.compaction]\nremote_v2_downgrade = false\n",
+            false,
         ),
         (
             "empty compaction table",
             "version = 5\n[codex.compaction]\n",
-        ),
-        (
-            "non-table compaction value",
-            "version = 5\n[codex]\ncompaction = \"retired\"\n",
+            true,
         ),
     ];
 
-    for (label, text) in cases {
+    for (label, text, expected) in cases {
         write_file(&path, text);
-        assert_retired_config_auto_migrated(&runtime, &path, "compaction", text);
+        let config = runtime
+            .block_on(load_config())
+            .unwrap_or_else(|error| panic!("migrate {label}: {error:#}"));
+        assert_eq!(
+            config.codex.remote_v2_downgrade_enabled(),
+            expected,
+            "{label} changed the runtime fallback policy"
+        );
         assert!(
-            std::fs::read_to_string(&path)
-                .expect("read cleaned config")
-                .contains("version = 6"),
-            "{label} cleanup did not retain the current version"
+            config.codex.compaction.is_some(),
+            "{label} lost the explicit canonical compaction table"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.with_file_name("config.toml.bak"))
+                .expect("read exact compaction migration backup"),
+            text,
+            "{label} did not preserve the exact source backup"
+        );
+        let migrated = std::fs::read_to_string(&path).expect("read migrated config");
+        assert!(
+            migrated.contains("version = 6") && migrated.contains("[codex.compaction]"),
+            "{label} migration did not retain the canonical compaction contract: {migrated}"
         );
     }
+}
+
+#[test]
+fn current_codex_compaction_false_is_loaded_without_rewrite() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let source = "version = 6\n[codex.compaction]\nremote_v2_downgrade = false\n";
+    write_file(&path, source);
+
+    let config = test_runtime()
+        .block_on(load_config())
+        .expect("load current compaction policy");
+
+    assert!(!config.codex.remote_v2_downgrade_enabled());
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read unchanged current config"),
+        source
+    );
+    assert!(!path.with_file_name("config.toml.bak").exists());
+}
+
+#[test]
+fn malformed_codex_compaction_policy_fails_closed_without_rewrite() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let source = "version = 5\n[codex]\ncompaction = \"invalid\"\n";
+    write_file(&path, source);
+
+    let error = test_runtime()
+        .block_on(load_config())
+        .expect_err("non-table compaction policy must fail closed");
+
+    assert!(
+        format!("{error:#}").contains("compaction"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read rejected source"),
+        source
+    );
+    assert!(!path.with_file_name("config.toml.bak").exists());
 }
 
 #[test]
@@ -618,16 +789,6 @@ fn retired_version_5_inputs_are_auto_migrated_before_typed_load() {
             "station =",
             "version = 5\n[claude.profiles.deep]\nstation = \"backup\"\n",
         ),
-        (
-            "relay_targets.nas.client_preset",
-            "client_preset",
-            "version = 5\n[relay_targets.nas]\nproxy_url = \"http://nas.local:3211\"\nclient_preset = \"default\"\n",
-        ),
-        (
-            "relay_targets.nas.responses_websocket",
-            "responses_websocket",
-            "version = 5\n[relay_targets.nas]\nproxy_url = \"http://nas.local:3211\"\nresponses_websocket = true\n",
-        ),
     ];
 
     for (retired_path, marker, text) in cases {
@@ -639,6 +800,66 @@ fn retired_version_5_inputs_are_auto_migrated_before_typed_load() {
             "cleanup for {retired_path} did not produce a current config"
         );
     }
+}
+
+#[test]
+fn legacy_relay_target_client_fields_migrate_to_nested_patch() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let text = "version = 5\n[relay_targets.nas]\nproxy_url = \"http://nas.local:3211\"\nclient_preset = \"official-relay\"\nresponses_websocket = true\n";
+    write_file(&path, text);
+
+    let config = test_runtime()
+        .block_on(load_config())
+        .expect("legacy relay target client settings should migrate");
+    let target = config.relay_targets.get("nas").expect("nas relay target");
+    let patch = target.client_patch.expect("migrated target client patch");
+    assert_eq!(patch.preset, Some(CodexClientPreset::OfficialRelay));
+    assert_eq!(patch.responses_websocket, Some(true));
+
+    let migrated = std::fs::read_to_string(&path).expect("read migrated relay target");
+    assert_relay_target_client_patch_migrated(&migrated, Some("official-relay"), Some(true));
+    assert_eq!(
+        std::fs::read_to_string(path.with_file_name("config.toml.bak"))
+            .expect("read exact relay target migration backup"),
+        text
+    );
+}
+
+#[test]
+fn legacy_local_relay_client_patch_remains_effective_after_migration() {
+    let _env = setup_temp_codex_home();
+    let path = current_config_path();
+    let text = "version = 5\n[relay_targets.local]\nclient_preset = \"official-relay\"\nresponses_websocket = true\n";
+    write_file(&path, text);
+
+    let config = test_runtime()
+        .block_on(load_config())
+        .expect("legacy local relay target client settings should migrate");
+    let target = crate::relay_target::resolve_relay_target(&config, "local")
+        .expect("resolve migrated built-in local target");
+    let patch = target.client_patch.expect("local target client patch");
+
+    assert_eq!(patch.preset, Some(CodexClientPreset::OfficialRelay));
+    assert_eq!(patch.responses_websocket, Some(true));
+    let migrated = std::fs::read_to_string(&path).expect("read migrated local relay target");
+    let raw = toml::from_str::<toml::Value>(&migrated).expect("parse migrated local target");
+    let local = raw
+        .get("relay_targets")
+        .and_then(toml::Value::as_table)
+        .and_then(|targets| targets.get("local"))
+        .and_then(toml::Value::as_table)
+        .expect("migrated local relay target table");
+    assert!(!local.contains_key("client_preset"));
+    assert!(!local.contains_key("responses_websocket"));
+    assert_eq!(
+        local
+            .get("client_patch")
+            .and_then(toml::Value::as_table)
+            .and_then(|patch| patch.get("preset"))
+            .and_then(toml::Value::as_str),
+        Some("official-relay")
+    );
 }
 
 #[test]
@@ -892,9 +1113,10 @@ client_preset = "default"
         .expect("all retired settings should be cleaned in one migration");
     let migrated = std::fs::read_to_string(&path).expect("read cleaned config");
     assert!(migrated.contains("[codex.client_patch]"));
-    for marker in ["client_preset", "responses_websocket", "usage_forecast"] {
+    for marker in ["client_preset", "usage_forecast"] {
         assert!(!migrated.contains(marker), "cleanup retained {marker}");
     }
+    assert_relay_target_client_patch_migrated(&migrated, Some("default"), Some(false));
     assert_eq!(
         std::fs::read_to_string(path.with_file_name("config.toml.bak"))
             .expect("read exact current-v5 backup"),

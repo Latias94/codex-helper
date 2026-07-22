@@ -11,6 +11,49 @@ pub(super) fn kv_line<'a>(p: Palette, k: &'a str, v: String, v_style: Style) -> 
     ])
 }
 
+pub(super) fn max_wrapped_vertical_scroll(
+    lines: &[Line<'_>],
+    text_width: u16,
+    viewport_height: u16,
+) -> u16 {
+    if text_width == 0 || viewport_height == 0 {
+        return 0;
+    }
+
+    wrapped_visual_line_count(lines, usize::from(text_width))
+        .saturating_sub(usize::from(viewport_height))
+        .min(usize::from(u16::MAX)) as u16
+}
+
+pub(super) fn master_detail_fits(
+    area: Rect,
+    master_percent: u16,
+    master_min_width: u16,
+    detail_min_width: u16,
+) -> bool {
+    let master_width = area.width.saturating_mul(master_percent) / 100;
+    let detail_width = area.width.saturating_sub(master_width);
+    master_width >= master_min_width && detail_width >= detail_min_width
+}
+
+fn wrapped_visual_line_count(lines: &[Line<'_>], text_width: usize) -> usize {
+    if text_width == 0 {
+        return 0;
+    }
+
+    lines
+        .iter()
+        .map(|line| {
+            let width = line.width();
+            if width == 0 {
+                1
+            } else {
+                width.div_ceil(text_width)
+            }
+        })
+        .sum()
+}
+
 pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -54,9 +97,9 @@ impl Widget for BackgroundWidget {
 #[cfg(test)]
 mod tests {
     use ratatui::layout::Rect;
-    use ratatui::prelude::Buffer;
+    use ratatui::prelude::{Buffer, Line};
 
-    use super::render_background;
+    use super::{max_wrapped_vertical_scroll, render_background};
     use crate::tui::model::Palette;
 
     #[test]
@@ -77,5 +120,12 @@ mod tests {
                 assert_eq!(buf[(x, y)].symbol(), " ");
             }
         }
+    }
+
+    #[test]
+    fn wrapped_scroll_limit_counts_visual_lines() {
+        let lines = vec![Line::from("12345678901234567890")];
+
+        assert_eq!(max_wrapped_vertical_scroll(&lines, 5, 3), 1);
     }
 }

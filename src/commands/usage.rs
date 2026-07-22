@@ -4,11 +4,13 @@ use crate::dashboard_core::{
     OperatorReadData, OperatorReadModel, OperatorReadStatus, OperatorRequestSummary,
 };
 use crate::relay_target::resolve_relay_target;
-use crate::request_chain::RequestChainSelector;
+use crate::request_chain::{RequestChainExport, RequestChainSelector};
 use crate::request_ledger::{
-    RequestUsageSummary, RequestUsageSummaryGroup, RequestUsageSummaryRow,
+    RequestLedger, RequestLogFilters, RequestUsageSummary, RequestUsageSummaryGroup,
+    RequestUsageSummaryRow,
 };
-use crate::{CliError, CliResult, UsageCommand, UsageSummaryBy};
+use crate::runtime_store::{RuntimeStoreError, RuntimeStoreReader};
+use crate::{CliError, CliResult, UsageCommand, UsageSource, UsageSummaryBy};
 use codex_helper_core::runtime_identity::ProviderEndpointKey;
 use codex_helper_core::{quota_analytics as analytics, quota_pool as pool};
 use owo_colors::OwoColorize;
@@ -16,8 +18,10 @@ use std::io::Write;
 
 pub async fn handle_usage_cmd(
     cmd: UsageCommand,
+    source: UsageSource,
+    service_name: &str,
     client: &ControlPlaneClient,
-    model: OperatorReadModel,
+    model: Option<OperatorReadModel>,
 ) -> CliResult<()> {
     let cmd = match extract_quota_command(cmd) {
         Ok((target, json)) => {
@@ -26,11 +30,89 @@ pub async fn handle_usage_cmd(
         }
         Err(cmd) => *cmd,
     };
-    let machine_readable = usage_command_is_machine_readable(&cmd);
-    let Some(data) = model.data.as_ref() else {
-        print_operator_state(&model, machine_readable)?;
-        return Ok(());
+
+    match select_usage_source(source, service_name, model)? {
+        SelectedUsageSource::Runtime(model) => handle_runtime_usage_cmd(cmd, client, *model).await,
+        SelectedUsageSource::Store(reader) => handle_store_usage_cmd(cmd, service_name, &reader),
+        SelectedUsageSource::Empty => Ok(()),
+    }
+}
+
+enum SelectedUsageSource {
+    Runtime(Box<OperatorReadModel>),
+    Store(RuntimeStoreReader),
+    Empty,
+}
+
+fn select_usage_source(
+    source: UsageSource,
+    service_name: &str,
+    model: Option<OperatorReadModel>,
+) -> CliResult<SelectedUsageSource> {
+    let store = RuntimeStoreReader::open_default();
+    let runtime_disconnected = model.as_ref().is_some_and(|model| {
+        model.service_name == service_name && model.status == OperatorReadStatus::Disconnected
+    });
+    let runtime = model.filter(|model| {
+        model.service_name == service_name
+            && matches!(
+                model.status,
+                OperatorReadStatus::Ready | OperatorReadStatus::Stale
+            )
+            && model.data.is_some()
+    });
+
+    match source {
+        UsageSource::Store => store
+            .map(SelectedUsageSource::Store)
+            .map_err(|error| CliError::Usage(format!("无法打开 canonical runtime store: {error}"))),
+        UsageSource::Runtime => runtime
+            .map(Box::new)
+            .map(SelectedUsageSource::Runtime)
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "runtime usage authority for {service_name} is unavailable"
+                ))
+            }),
+        UsageSource::Auto => match (store, runtime) {
+            (Ok(reader), Some(model)) if runtime_store_matches_model(&reader, &model) => {
+                Ok(SelectedUsageSource::Store(reader))
+            }
+            (Ok(_), Some(model)) => {
+                eprintln!(
+                    "Canonical runtime store belongs to a different ledger authority; using the {service_name} runtime snapshot."
+                );
+                Ok(SelectedUsageSource::Runtime(Box::new(model)))
+            }
+            (Ok(reader), None) => Ok(SelectedUsageSource::Store(reader)),
+            (Err(_), Some(model)) => Ok(SelectedUsageSource::Runtime(Box::new(model))),
+            (Err(RuntimeStoreError::DatabaseMissing { .. }), None) if runtime_disconnected => {
+                Ok(SelectedUsageSource::Empty)
+            }
+            (Err(error), None) => Err(CliError::Usage(format!(
+                "no usage authority is available for {service_name}: {error}"
+            ))),
+        },
+    }
+}
+
+fn runtime_store_matches_model(reader: &RuntimeStoreReader, model: &OperatorReadModel) -> bool {
+    let Some(revisions) = model.revisions.as_ref() else {
+        return false;
     };
+    let expected_prefix = format!("operator-ledger-v1:{}:", reader.identity().store_id());
+    revisions.ledger_revision.starts_with(&expected_prefix)
+}
+
+async fn handle_runtime_usage_cmd(
+    cmd: UsageCommand,
+    client: &ControlPlaneClient,
+    model: OperatorReadModel,
+) -> CliResult<()> {
+    let data = model
+        .data
+        .as_ref()
+        .expect("selected runtime usage source has operator data");
     if model.status == OperatorReadStatus::Stale {
         eprintln!(
             "Operator read model for {} is stale (captured_at_ms={}).",
@@ -164,52 +246,7 @@ pub async fn handle_usage_cmd(
                 .map_err(|error| {
                     CliError::Usage(format!("无法从 runtime control plane 读取请求链: {error}"))
                 })?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&export)
-                        .map_err(|error| CliError::Usage(format!("无法序列化请求链: {error}")))?
-                );
-                return Ok(());
-            }
-
-            println!(
-                "{}",
-                format!(
-                    "Request chain export: {} request(s), truncated={} (runtime control plane)",
-                    export.requests.len(),
-                    export.truncated,
-                )
-                .bold()
-            );
-            for request in &export.requests {
-                println!(
-                    "[{}] request={} trace={} session={} status={} provider={} model={} attempts={} events={}",
-                    request.ended_at_ms,
-                    request.request_id,
-                    request.trace_id.as_deref().unwrap_or("-"),
-                    request.session_id.as_deref().unwrap_or("-"),
-                    request.status_code,
-                    request.provider_id.as_deref().unwrap_or("-"),
-                    request.model.as_deref().unwrap_or("-"),
-                    request.route_attempts.len(),
-                    request.timeline.len(),
-                );
-                for attempt in &request.route_attempts {
-                    println!(
-                        "    attempt#{} code={} decision={} status={} endpoint={} model={}",
-                        attempt.attempt_index,
-                        attempt.code,
-                        attempt.decision,
-                        attempt
-                            .status_code
-                            .map(|status| status.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        attempt.provider_endpoint_key.as_deref().unwrap_or("-"),
-                        attempt.model.as_deref().unwrap_or("-"),
-                    );
-                }
-            }
+            print_request_chain_export(&export, json, "runtime control plane")?;
         }
         UsageCommand::Quota { target, .. } => {
             return Err(quota_error(&target, "internal_dispatch_error"));
@@ -219,40 +256,218 @@ pub async fn handle_usage_cmd(
     Ok(())
 }
 
-fn usage_command_is_machine_readable(cmd: &UsageCommand) -> bool {
-    matches!(
-        cmd,
-        UsageCommand::Tail { raw: true, .. }
-            | UsageCommand::Find { raw: true, .. }
-            | UsageCommand::Chain { json: true, .. }
-    )
+fn handle_store_usage_cmd(
+    cmd: UsageCommand,
+    service_name: &str,
+    reader: &RuntimeStoreReader,
+) -> CliResult<()> {
+    let ledger = RequestLedger::new(reader);
+    match cmd {
+        UsageCommand::Tail { limit, raw } => {
+            let requests = ledger
+                .find_finished_requests(
+                    &RequestLogFilters {
+                        service: Some(service_name.to_string()),
+                        ..RequestLogFilters::default()
+                    },
+                    limit,
+                )
+                .map_err(|error| store_usage_error(reader, error))?;
+            print_store_requests(requests, raw)?;
+        }
+        UsageCommand::Summary { limit, by } => {
+            let group = RequestUsageSummaryGroup::from(by);
+            let mut rows = ledger
+                .summarize(
+                    group,
+                    &RequestLogFilters {
+                        service: Some(service_name.to_string()),
+                        ..RequestLogFilters::default()
+                    },
+                    limit,
+                )
+                .map_err(|error| store_usage_error(reader, error))?;
+            if by == UsageSummaryBy::Session {
+                for row in &mut rows {
+                    if row.group_value != "-" {
+                        row.group_value =
+                            crate::dashboard_core::operator_session_key(&row.group_value);
+                    }
+                }
+            }
+
+            println!(
+                "{}",
+                format!(
+                    "Usage summary by {} (canonical store {:?})",
+                    group.column_name(),
+                    reader.path()
+                )
+                .bold()
+            );
+            println!(
+                "{}",
+                format!(
+                    "{} | requests | input | output | cache_read | cache_create | reasoning | total | avg_duration_ms",
+                    group.column_name()
+                )
+                .bold()
+            );
+            for row in rows {
+                println!("{}", row.aggregate.summary_line(&row.group_value));
+            }
+        }
+        UsageCommand::Find {
+            limit,
+            session,
+            model,
+            provider_endpoint,
+            provider,
+            path,
+            status_min,
+            status_max,
+            errors,
+            fast,
+            retried,
+            raw,
+        } => {
+            let filters = RequestLogFilters {
+                service: Some(service_name.to_string()),
+                session,
+                model,
+                provider_endpoint: provider_endpoint.map(|endpoint| endpoint.into_key()),
+                provider,
+                path,
+                status_min: status_min.or(errors.then_some(400)),
+                status_max,
+                fast,
+                retried,
+                ..RequestLogFilters::default()
+            };
+            let requests = ledger
+                .find_finished_requests(&filters, limit)
+                .map_err(|error| store_usage_error(reader, error))?;
+            let empty = requests.is_empty();
+            print_store_requests(requests, raw)?;
+            if empty && !raw {
+                println!(
+                    "No request records matched the filters in canonical store {:?}.",
+                    reader.path()
+                );
+            }
+        }
+        UsageCommand::Chain {
+            limit,
+            trace_id,
+            request_id,
+            session,
+            json,
+        } => {
+            let selector = RequestChainSelector {
+                trace_id,
+                request_id,
+                session_id: session,
+            }
+            .normalized();
+            if !selector.has_identity() {
+                return Err(CliError::Usage(
+                    "usage chain requires --trace-id, --request-id, or --session".to_string(),
+                ));
+            }
+            let export = ledger
+                .export_request_chain(service_name, selector, limit)
+                .map_err(|error| store_usage_error(reader, error))?;
+            print_request_chain_export(
+                &export,
+                json,
+                &format!("canonical store {:?}", reader.path()),
+            )?;
+        }
+        UsageCommand::Quota { target, .. } => {
+            return Err(quota_error(&target, "internal_dispatch_error"));
+        }
+    }
+    Ok(())
 }
 
-fn print_operator_state(model: &OperatorReadModel, machine_readable: bool) -> CliResult<()> {
-    if machine_readable {
+fn print_store_requests(requests: Vec<crate::state::FinishedRequest>, raw: bool) -> CliResult<()> {
+    for request in requests {
+        let request = OperatorRequestSummary::from_finished_request(&request);
+        if raw {
+            println!(
+                "{}",
+                serde_json::to_string(&request).map_err(|error| {
+                    CliError::Usage(format!("无法序列化 operator 请求: {error}"))
+                })?
+            );
+        } else {
+            println!("{}", format_operator_request(&request));
+        }
+    }
+    Ok(())
+}
+
+fn store_usage_error(
+    reader: &RuntimeStoreReader,
+    error: crate::runtime_store::RuntimeStoreError,
+) -> CliError {
+    CliError::Usage(format!(
+        "无法读取 canonical runtime store {:?}: {error}",
+        reader.path()
+    ))
+}
+
+fn print_request_chain_export(
+    export: &RequestChainExport,
+    json: bool,
+    source: &str,
+) -> CliResult<()> {
+    if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(model)
-                .map_err(|error| CliError::Usage(format!("无法序列化 operator 状态: {error}")))?
+            serde_json::to_string_pretty(export)
+                .map_err(|error| CliError::Usage(format!("无法序列化请求链: {error}")))?
         );
         return Ok(());
     }
 
-    let status = match model.status {
-        OperatorReadStatus::Ready => "ready",
-        OperatorReadStatus::Stale => "stale",
-        OperatorReadStatus::Disconnected => "disconnected",
-        OperatorReadStatus::AuthRequired => "auth_required",
-    };
     println!(
-        "Runtime operator state: service={} status={} issue={}",
-        model.service_name,
-        status,
-        model
-            .issue
-            .map(|issue| format!("{issue:?}"))
-            .unwrap_or_else(|| "-".to_string())
+        "{}",
+        format!(
+            "Request chain export: {} request(s), truncated={} ({source})",
+            export.requests.len(),
+            export.truncated,
+        )
+        .bold()
     );
+    for request in &export.requests {
+        println!(
+            "[{}] request={} trace={} session={} status={} provider={} model={} attempts={} events={}",
+            request.ended_at_ms,
+            request.request_id,
+            request.trace_id.as_deref().unwrap_or("-"),
+            request.session_id.as_deref().unwrap_or("-"),
+            request.status_code,
+            request.provider_id.as_deref().unwrap_or("-"),
+            request.model.as_deref().unwrap_or("-"),
+            request.route_attempts.len(),
+            request.timeline.len(),
+        );
+        for attempt in &request.route_attempts {
+            println!(
+                "    attempt#{} code={} decision={} status={} endpoint={} model={}",
+                attempt.attempt_index,
+                attempt.code,
+                attempt.decision,
+                attempt
+                    .status_code
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                attempt.provider_endpoint_key.as_deref().unwrap_or("-"),
+                attempt.model.as_deref().unwrap_or("-"),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -696,11 +911,13 @@ mod tests {
         IdentityConfidence, PoolIdentity, QuotaQuantity, QuotaResetKind, QuotaScope, QuotaUnit,
         QuotaWindowKind, QuotaWindowSemantics,
     };
+    use codex_helper_core::runtime_store::RuntimeStore;
     use std::sync::{Arc, Mutex};
 
     fn operator_request() -> OperatorRequestSummary {
         OperatorRequestSummary {
             id: 7,
+            trace_key: None,
             session_key: Some("session:sha256:abc".to_string()),
             model: Some("gpt-5.6".to_string()),
             reasoning_effort: Some("high".to_string()),
@@ -719,6 +936,8 @@ mod tests {
                 cache_creation_input_tokens: 10,
                 ..UsageMetrics::default()
             }),
+            cache_accounting_convention:
+                codex_helper_core::usage::CacheAccountingConvention::INCLUDED_IN_INPUT,
             cost: CostBreakdown::default(),
             retry: None,
             provider_signal_codes: Vec::new(),
@@ -770,6 +989,165 @@ mod tests {
             }
             .matches(&request)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_usage_source_prefers_the_matching_canonical_store() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-usage-auto-store");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+        }
+        let store = RuntimeStore::open_in_home(helper_home.path()).expect("create runtime store");
+        let store_id = store.identity().store_id();
+        drop(store);
+
+        let mut model = operator_read_model(QuotaAnalyticsView::default());
+        model
+            .revisions
+            .as_mut()
+            .expect("runtime revisions")
+            .ledger_revision = format!("operator-ledger-v1:{store_id}:0");
+
+        match select_usage_source(UsageSource::Auto, "codex", Some(model))
+            .expect("select matching store")
+        {
+            SelectedUsageSource::Store(reader) => {
+                assert_eq!(reader.identity().store_id(), store_id)
+            }
+            SelectedUsageSource::Runtime(_) | SelectedUsageSource::Empty => {
+                panic!("matching store should be authoritative")
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_usage_source_treats_a_missing_store_as_empty_when_runtime_is_unavailable() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-usage-no-authority");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+        }
+
+        let selected = select_usage_source(
+            UsageSource::Auto,
+            "codex",
+            Some(OperatorReadModel::disconnected("codex")),
+        )
+        .expect("a pristine installation has an empty usage history");
+
+        assert!(matches!(selected, SelectedUsageSource::Empty));
+
+        let endpoint = ControlPlaneEndpoint::new("http://127.0.0.1:9", None::<String>)
+            .expect("loopback control plane endpoint");
+        let client = ControlPlaneClient::new(endpoint).expect("control plane client");
+        handle_usage_cmd(
+            UsageCommand::Tail {
+                limit: 20,
+                raw: true,
+            },
+            UsageSource::Auto,
+            "codex",
+            &client,
+            Some(OperatorReadModel::disconnected("codex")),
+        )
+        .await
+        .expect("empty automatic usage history must exit successfully");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_usage_sources_remain_strict_when_their_authority_is_unavailable() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-usage-explicit-authority");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+        }
+
+        let store_error = match select_usage_source(UsageSource::Store, "codex", None) {
+            Ok(_) => panic!("an explicit missing store must fail"),
+            Err(error) => error,
+        };
+        assert!(store_error.to_string().contains("does not exist"));
+
+        let runtime_error = match select_usage_source(
+            UsageSource::Runtime,
+            "codex",
+            Some(OperatorReadModel::disconnected("codex")),
+        ) {
+            Ok(_) => panic!("an explicit disconnected runtime must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            runtime_error
+                .to_string()
+                .contains("runtime usage authority")
+        );
+
+        let auth_error = match select_usage_source(
+            UsageSource::Auto,
+            "codex",
+            Some(OperatorReadModel::auth_required("codex")),
+        ) {
+            Ok(_) => panic!("an authentication failure must not look like an empty history"),
+            Err(error) => error,
+        };
+        assert!(auth_error.to_string().contains("no usage authority"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_usage_source_preserves_non_missing_store_failures() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-usage-unsafe-store");
+        std::fs::create_dir_all(helper_home.path().join("state").join("state.sqlite"))
+            .expect("create an unsafe directory at the database path");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+        }
+
+        let error = match select_usage_source(
+            UsageSource::Auto,
+            "codex",
+            Some(OperatorReadModel::disconnected("codex")),
+        ) {
+            Ok(_) => panic!("an unsafe store path must not look like an empty history"),
+            Err(error) => error,
+        };
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("no usage authority"));
+        assert!(rendered.contains("unsafe"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_store_usage_does_not_require_a_running_control_plane() {
+        let _env_lock = env_lock().await;
+        let helper_home = TempTestDir::new("codex-helper-cli-test-usage-offline-store");
+        let mut scoped_env = ScopedEnv::default();
+        unsafe {
+            scoped_env.set_path("CODEX_HELPER_HOME", helper_home.path());
+        }
+        let store = RuntimeStore::open_in_home(helper_home.path()).expect("create runtime store");
+        drop(store);
+        let endpoint = ControlPlaneEndpoint::new("http://127.0.0.1:9", None::<String>)
+            .expect("loopback control plane endpoint");
+        let client = ControlPlaneClient::new(endpoint).expect("control plane client");
+
+        handle_usage_cmd(
+            UsageCommand::Tail {
+                limit: 20,
+                raw: true,
+            },
+            UsageSource::Store,
+            "codex",
+            &client,
+            None,
+        )
+        .await
+        .expect("read an empty store while the control plane is offline");
     }
 
     #[test]
@@ -1025,6 +1403,7 @@ mod tests {
                 proxy_url: format!("http://{address}"),
                 admin_url: Some(format!("http://{address}")),
                 admin_token_env: Some(token_env.to_string()),
+                ..RelayTargetConfig::default()
             },
         );
         save_helper_config(&config)

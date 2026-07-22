@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use crate::dashboard_core::{
-    OperatorReadData, OperatorReadModel, OperatorReadStatus, OperatorSessionSummary,
+    OperatorLocalSessionMetadata, OperatorReadData, OperatorReadModel, OperatorReadStatus,
+    OperatorSessionSummary,
 };
 
 use super::model::{
@@ -106,6 +109,29 @@ pub fn build_fleet_snapshot_from_operator_read_model(
         service_name: model.service_name.clone(),
         refreshed_at_ms,
         nodes: vec![node],
+    }
+}
+
+pub fn enrich_local_fleet_snapshot_session_metadata(
+    snapshot: &mut FleetSnapshot,
+    local_sessions: &HashMap<String, OperatorLocalSessionMetadata>,
+) {
+    for node in snapshot
+        .nodes
+        .iter_mut()
+        .filter(|node| node.kind == FleetNodeKind::Local)
+    {
+        for unit in &mut node.work_units {
+            let Some(local) = local_sessions.get(&unit.id) else {
+                continue;
+            };
+            if local.raw_session_id.trim().is_empty() {
+                continue;
+            }
+            unit.session_id = Some(local.raw_session_id.clone());
+            unit.local_thread_id = Some(local.raw_session_id.clone());
+            unit.cwd = local.cwd.clone();
+        }
     }
 }
 
@@ -231,9 +257,11 @@ fn work_unit_from_operator_session(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use crate::dashboard_core::{
-        ApiV1OperatorSummary, OperatorReadData, OperatorReadModel, OperatorRevisionBundle,
-        OperatorSessionSummary,
+        ApiV1OperatorSummary, OperatorLocalSessionMetadata, OperatorReadData, OperatorReadModel,
+        OperatorRevisionBundle, OperatorSessionSummary,
     };
     use crate::state::SessionIdentityCard;
     use crate::usage::UsageMetrics;
@@ -349,5 +377,62 @@ mod tests {
             assert_eq!(snapshot.nodes[0].health, expected_health);
             assert!(snapshot.nodes[0].work_units.is_empty());
         }
+    }
+
+    #[test]
+    fn local_session_metadata_enriches_only_local_fleet_nodes() {
+        let model = ready_operator_model();
+        let session_key = model
+            .data
+            .as_ref()
+            .and_then(|data| data.summary.sessions.first())
+            .map(|session| session.session_key.clone())
+            .expect("operator session key");
+        let local_sessions = HashMap::from([(
+            session_key.clone(),
+            OperatorLocalSessionMetadata {
+                raw_session_id: "019f-local-session".to_string(),
+                cwd: Some("/workspace/codex-helper".to_string()),
+                last_client_name: Some("codex-cli".to_string()),
+                last_client_addr: Some("127.0.0.1:3211".to_string()),
+                host_local_transcript_path: Some("/home/user/.codex/session.jsonl".to_string()),
+            },
+        )]);
+
+        let mut local = build_fleet_snapshot_from_operator_read_model(
+            &model,
+            "local",
+            "Local",
+            FleetNodeKind::Local,
+            None,
+        );
+        enrich_local_fleet_snapshot_session_metadata(&mut local, &local_sessions);
+        let local_unit = &local.nodes[0].work_units[0];
+        assert_eq!(local_unit.id, session_key);
+        assert_eq!(local_unit.session_id.as_deref(), Some("019f-local-session"));
+        assert_eq!(
+            local_unit.local_thread_id.as_deref(),
+            Some("019f-local-session")
+        );
+        assert_eq!(local_unit.cwd.as_deref(), Some("/workspace/codex-helper"));
+
+        let mut remote = build_fleet_snapshot_from_operator_read_model(
+            &model,
+            "remote-a",
+            "Remote A",
+            FleetNodeKind::Remote,
+            Some("https://admin.example".to_string()),
+        );
+        enrich_local_fleet_snapshot_session_metadata(&mut remote, &local_sessions);
+        let remote_unit = &remote.nodes[0].work_units[0];
+        assert_eq!(
+            remote_unit.session_id.as_deref(),
+            Some(session_key.as_str())
+        );
+        assert_eq!(
+            remote_unit.local_thread_id.as_deref(),
+            Some(session_key.as_str())
+        );
+        assert!(remote_unit.cwd.is_none());
     }
 }

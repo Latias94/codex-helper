@@ -19,6 +19,10 @@ const checks = [
     version: packageVersionFromCargoToml(path.join(repoRoot, "crates", "tui", "Cargo.toml")),
   },
   {
+    label: "server crate",
+    version: packageVersionFromCargoToml(path.join(repoRoot, "crates", "server", "Cargo.toml")),
+  },
+  {
     label: "desktop crate",
     version: packageVersionFromCargoToml(path.join(desktopRoot, "src-tauri", "Cargo.toml")),
   },
@@ -29,6 +33,56 @@ const checks = [
   {
     label: "tauri.conf.json",
     version: JSON.parse(fs.readFileSync(path.join(desktopRoot, "src-tauri", "tauri.conf.json"), "utf8")).version,
+  },
+  {
+    label: "root core dependency",
+    version: dependencyVersionFromCargoToml(path.join(repoRoot, "Cargo.toml"), "codex-helper-core"),
+  },
+  {
+    label: "root tui dependency",
+    version: dependencyVersionFromCargoToml(path.join(repoRoot, "Cargo.toml"), "codex-helper-tui"),
+  },
+  {
+    label: "tui core dependency",
+    version: dependencyVersionFromCargoToml(
+      path.join(repoRoot, "crates", "tui", "Cargo.toml"),
+      "codex-helper-core",
+    ),
+  },
+  {
+    label: "server core dependency",
+    version: dependencyVersionFromCargoToml(
+      path.join(repoRoot, "crates", "server", "Cargo.toml"),
+      "codex-helper-core",
+    ),
+  },
+  {
+    label: "desktop core dependency",
+    version: dependencyVersionFromCargoToml(
+      path.join(desktopRoot, "src-tauri", "Cargo.toml"),
+      "codex-helper-core",
+    ),
+  },
+  {
+    label: "desktop contract schema tool",
+    version: packageVersionFromCargoToml(
+      path.join(repoRoot, "tools", "desktop-contract-schema", "Cargo.toml"),
+    ),
+  },
+  {
+    label: "README current release",
+    version: releaseVersionFromReadme(path.join(repoRoot, "README.md"), /当前发布版本：`v(?<version>[^`]+)`/),
+  },
+  {
+    label: "README_EN current release",
+    version: releaseVersionFromReadme(
+      path.join(repoRoot, "README_EN.md"),
+      /Current release: `v(?<version>[^`]+)`/,
+    ),
+  },
+  {
+    label: "CHANGELOG latest release",
+    version: releaseVersionFromChangelog(path.join(repoRoot, "CHANGELOG.md")),
   },
 ];
 
@@ -62,4 +116,36 @@ function packageVersionFromCargoToml(file) {
     }
   }
   throw new Error(`${file}: missing [package].version`);
+}
+
+function dependencyVersionFromCargoToml(file, dependency) {
+  const text = fs.readFileSync(file, "utf8");
+  const escapedDependency = dependency.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    `^\\s*${escapedDependency}\\s*=\\s*\\{[^\\n]*\\bversion\\s*=\\s*"(?<version>[^"]+)"`,
+    "m",
+  );
+  const match = text.match(pattern);
+  if (match?.groups?.version) {
+    return match.groups.version;
+  }
+  throw new Error(`${file}: missing explicit version for dependency ${dependency}`);
+}
+
+function releaseVersionFromReadme(file, pattern) {
+  const text = fs.readFileSync(file, "utf8");
+  const match = text.match(pattern);
+  if (match?.groups?.version) {
+    return match.groups.version;
+  }
+  throw new Error(`${file}: missing current release version`);
+}
+
+function releaseVersionFromChangelog(file) {
+  const text = fs.readFileSync(file, "utf8");
+  const match = text.match(/^## \[(?<version>\d+\.\d+\.\d+)\] - \d{4}-\d{2}-\d{2}$/m);
+  if (match?.groups?.version) {
+    return match.groups.version;
+  }
+  throw new Error(`${file}: missing latest released version`);
 }

@@ -4,7 +4,10 @@ use codex_helper_core::codex_switch::{self, CodexSwitchIntent, ValidatedCodexBas
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::{CodexClientPatchConfig, CodexClientPreset, load_config, proxy_home_dir};
-use crate::proxy::{OperatorRoutingCommand, OperatorRoutingMutationRequest};
+use crate::proxy::{
+    OperatorRoutingCommand, OperatorRoutingMutationRequest, OperatorSessionBindingCommand,
+    OperatorSessionBindingMutationRequest,
+};
 use crate::sessions::find_codex_session_file_by_id;
 use crate::tui::Language;
 use crate::tui::i18n::{self, msg};
@@ -14,19 +17,28 @@ use crate::tui::model::{
 };
 use crate::tui::report::build_stats_report;
 use crate::tui::state::{
-    CodexHistoryExternalFocusOrigin, FleetViewMode, UiState, adjust_table_selection,
+    CodexHistoryExternalFocusOrigin, FleetViewMode, SessionBindingEditContext, UiState,
+    adjust_table_selection,
 };
-use crate::tui::types::{Focus, Overlay, Page};
+use crate::tui::types::{
+    Focus, Overlay, Page, SessionBindingInputKind, SessionEffortChoice, SessionServiceTierChoice,
+};
 
 use super::KeyEventContext;
 use super::history_bridge::{
-    host_transcript_path_from_row, local_session_id_for_opaque_key,
+    host_transcript_path_from_row, local_session_context_for_opaque_key,
     prepare_select_history_from_external, recent_history_summary_from_row,
     request_history_summary_from_request, selected_dashboard_request, selected_recent_row,
     selected_request_page_request, session_history_summary_from_row,
 };
 use super::transcript::open_session_transcript_from_path;
-use crate::tui::operator_actions::{notify_read_only_operator_action, queue_balance_refresh};
+use crate::tui::operator_actions::{
+    notify_read_only_operator_action, queue_balance_refresh, queue_relay_capabilities,
+    queue_relay_live_smoke, queue_runtime_reload, queue_session_binding_mutation,
+};
+use crate::tui::settings_relay::{
+    CodexRelayLiveSmokeDecision, CodexRelayLiveSmokeMode, infer_codex_relay_model,
+};
 
 pub(in crate::tui) fn codex_switch_intent_for_key(
     code: KeyCode,
@@ -136,6 +148,9 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
     };
     if let Some(p) = page {
         ui.page = p;
+        if previous_page != p {
+            ui.help_scroll = 0;
+        }
         if previous_page == Page::Stats || ui.page == Page::Stats || ui.page == Page::ServiceStatus
         {
             ui.needs_snapshot_refresh = true;
@@ -143,10 +158,14 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         if ui.page == Page::Routing {
             ui.focus = Focus::Providers;
             if previous_page != Page::Routing {
+                ui.routing_detail_focused = false;
+                ui.routing_detail_scroll = 0;
                 let _ = queue_balance_refresh(ui, false, false);
             }
         } else if ui.page == Page::Requests {
             ui.focus = Focus::Requests;
+        } else if ui.page == Page::Dashboard && previous_page != Page::Dashboard {
+            ui.dashboard_details_scroll = 0;
         } else if ui.page == Page::Sessions
             || ui.page == Page::History
             || ui.page == Page::Recent
@@ -156,15 +175,16 @@ pub(super) fn apply_page_shortcuts(ui: &mut UiState, code: KeyCode) -> bool {
         }
         if ui.page == Page::History {
             ui.needs_codex_history_refresh = true;
+            ui.codex_history_details_scroll = 0;
             ui.sync_codex_history_selection();
         }
         if ui.page == Page::Recent {
             ui.needs_codex_recent_refresh = true;
-            ui.codex_recent_selected_idx = 0;
-            ui.codex_recent_selected_id = None;
-            ui.codex_recent_table.select(None);
+            ui.codex_recent_details_scroll = 0;
+            ui.sync_codex_recent_selection(now_ms());
         }
         if ui.page == Page::Fleet {
+            ui.focus = Focus::Providers;
             ui.needs_fleet_refresh = true;
             ui.sync_fleet_selection();
         }
@@ -263,7 +283,7 @@ pub(in crate::tui) fn handle_session_affinity_operator_key(
     snapshot: &Snapshot,
     code: KeyCode,
 ) -> bool {
-    if ui.page != Page::Sessions || code != KeyCode::Enter {
+    if ui.page != Page::Sessions || code != KeyCode::Char('A') {
         return false;
     }
     if !ui.can_mutate_session_affinity() {
@@ -347,6 +367,176 @@ pub(in crate::tui) fn handle_session_affinity_operator_key(
     true
 }
 
+fn prepare_session_binding_edit(ui: &mut UiState, snapshot: &Snapshot) -> Option<usize> {
+    if !ui.can_mutate_session_binding() {
+        notify_read_only_operator_action(ui);
+        return None;
+    }
+    let Some((index, row)) = snapshot
+        .rows
+        .get(ui.selected_session_idx)
+        .map(|row| (ui.selected_session_idx, row))
+    else {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "没有选中的会话".to_string(),
+                Language::En => "no session is selected".to_string(),
+            },
+            Instant::now(),
+        ));
+        return None;
+    };
+    let Some(session_key) = row.session_id.as_deref() else {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "选中行没有可控制的会话标识".to_string(),
+                Language::En => "the selected row has no controllable session identity".to_string(),
+            },
+            Instant::now(),
+        ));
+        return None;
+    };
+    if row.binding.revision.trim().is_empty() {
+        ui.toast = Some((
+            match ui.language {
+                Language::Zh => "daemon 未提供会话绑定控制元数据；已降级为只读".to_string(),
+                Language::En => {
+                    "the daemon did not provide session binding control metadata; read-only mode"
+                        .to_string()
+                }
+            },
+            Instant::now(),
+        ));
+        return None;
+    }
+    ui.session_binding_edit = Some(SessionBindingEditContext {
+        session_key: session_key.to_string(),
+        expected_revision: row.binding.revision.clone(),
+    });
+    Some(index)
+}
+
+fn selected_session_binding_request(
+    ui: &mut UiState,
+    snapshot: &Snapshot,
+    command: OperatorSessionBindingCommand,
+) -> Option<OperatorSessionBindingMutationRequest> {
+    prepare_session_binding_edit(ui, snapshot)?;
+    let edit = ui.session_binding_edit.take()?;
+    Some(OperatorSessionBindingMutationRequest {
+        session_key: edit.session_key,
+        expected_binding_revision: edit.expected_revision,
+        command,
+    })
+}
+
+fn session_binding_shortcuts_active(ui: &UiState) -> bool {
+    ui.focus == Focus::Sessions && matches!(ui.page, Page::Dashboard | Page::Sessions)
+}
+
+fn open_session_profile_menu(ui: &mut UiState, snapshot: &Snapshot) -> bool {
+    let Some(index) = prepare_session_binding_edit(ui, snapshot) else {
+        return true;
+    };
+    let selected = snapshot.rows[index].binding.profile_name.as_deref();
+    ui.capture_profile_menu_snapshot();
+    ui.session_profile_menu_idx = selected
+        .and_then(|name| {
+            ui.profile_menu_options()
+                .iter()
+                .position(|profile| profile.name == name)
+        })
+        .map(|index| index + 1)
+        .unwrap_or_else(|| {
+            usize::from(selected.is_none() && !ui.profile_menu_options().is_empty())
+        });
+    ui.overlay = Overlay::SessionProfileMenu;
+    true
+}
+
+fn open_session_model_menu(ui: &mut UiState, snapshot: &Snapshot) -> bool {
+    let Some(index) = prepare_session_binding_edit(ui, snapshot) else {
+        return true;
+    };
+    let row = &snapshot.rows[index];
+    let mut models = ui
+        .profile_options
+        .iter()
+        .filter_map(|profile| profile.model.clone())
+        .collect::<Vec<_>>();
+    for model in [
+        row.binding.model.as_deref(),
+        row.effective_model
+            .as_ref()
+            .map(|value| value.value.as_str()),
+        row.last_model.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let model = model.trim();
+        if !model.is_empty() {
+            models.push(model.to_string());
+        }
+    }
+    models.sort();
+    models.dedup();
+    ui.session_model_menu_idx = row
+        .binding
+        .model
+        .as_deref()
+        .and_then(|model| models.iter().position(|candidate| candidate == model))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    ui.session_model_options = models;
+    ui.session_binding_input_kind = SessionBindingInputKind::Model;
+    ui.session_binding_input = row.binding.model.clone().unwrap_or_default();
+    ui.session_binding_input_hint = row
+        .effective_model
+        .as_ref()
+        .map(|value| value.value.clone())
+        .or_else(|| row.last_model.clone());
+    ui.overlay = Overlay::SessionModelMenu;
+    true
+}
+
+fn open_session_effort_menu(ui: &mut UiState, snapshot: &Snapshot) -> bool {
+    let Some(index) = prepare_session_binding_edit(ui, snapshot) else {
+        return true;
+    };
+    let current = snapshot.rows[index].binding.reasoning_effort.as_deref();
+    ui.session_effort_menu_idx = SessionEffortChoice::ALL
+        .iter()
+        .position(|choice| choice.value() == current)
+        .unwrap_or(0);
+    ui.overlay = Overlay::SessionEffortMenu;
+    true
+}
+
+fn open_session_service_tier_menu(ui: &mut UiState, snapshot: &Snapshot) -> bool {
+    let Some(index) = prepare_session_binding_edit(ui, snapshot) else {
+        return true;
+    };
+    let row = &snapshot.rows[index];
+    let current = row.binding.service_tier.as_deref();
+    ui.session_service_tier_menu_idx = SessionServiceTierChoice::ALL
+        .iter()
+        .position(|choice| match choice {
+            SessionServiceTierChoice::Fast => current == Some("priority"),
+            choice => choice.value() == current,
+        })
+        .unwrap_or(SessionServiceTierChoice::ALL.len());
+    ui.session_binding_input_kind = SessionBindingInputKind::ServiceTier;
+    ui.session_binding_input = row.binding.service_tier.clone().unwrap_or_default();
+    ui.session_binding_input_hint = row
+        .effective_service_tier
+        .as_ref()
+        .map(|value| value.value.clone())
+        .or_else(|| row.last_service_tier.clone());
+    ui.overlay = Overlay::SessionServiceTierMenu;
+    true
+}
+
 pub(in crate::tui) fn routing_mutation_request(
     routing: &crate::dashboard_core::OperatorRoutingSummary,
     command: OperatorRoutingCommand,
@@ -416,9 +606,10 @@ fn apply_selected_session(ui: &mut UiState, snapshot: &Snapshot, idx: usize) {
     });
 
     ui.selected_request_idx = 0;
-    let req_len = filtered_requests_len(snapshot, ui.selected_session_idx);
-    ui.requests_table
-        .select(if req_len == 0 { None } else { Some(0) });
+    ui.selected_request_id = None;
+    ui.dashboard_details_scroll = 0;
+    ui.sessions_details_scroll = 0;
+    ui.sync_dashboard_request_selection(snapshot);
 }
 
 fn focus_session_in_sessions(ui: &mut UiState, snapshot: &Snapshot, sid: &str) -> bool {
@@ -428,6 +619,8 @@ fn focus_session_in_sessions(ui: &mut UiState, snapshot: &Snapshot, sid: &str) -
 
     ui.sessions_page_active_only = false;
     ui.sessions_page_errors_only = false;
+    ui.sessions_page_overrides_only = false;
+    ui.sessions_details_scroll = 0;
     ui.selected_sessions_page_idx = 0;
     ui.page = Page::Sessions;
     ui.focus = Focus::Sessions;
@@ -435,18 +628,44 @@ fn focus_session_in_sessions(ui: &mut UiState, snapshot: &Snapshot, sid: &str) -
     true
 }
 
-fn prepare_select_requests_for_session(ui: &mut UiState, sid: String) {
+fn require_runtime_session_bridge(ui: &mut UiState) -> bool {
+    if ui.can_bridge_runtime_sessions_to_local_codex() {
+        return true;
+    }
+
+    let message = match (ui.language, ui.runtime_connection.is_remote_observer()) {
+        (Language::Zh, true) => {
+            "远程观察模式无法将观察端本机 Codex 会话匹配到远程 Sessions/Requests"
+        }
+        (Language::En, true) => {
+            "remote observer mode cannot match observer-local Codex sessions to remote Sessions/Requests"
+        }
+        (Language::Zh, false) => "当前 TUI 无法将本机 Codex 会话匹配到运行时 Sessions/Requests",
+        (Language::En, false) => {
+            "this TUI cannot match local Codex sessions to runtime Sessions/Requests"
+        }
+    };
+    ui.toast = Some((message.to_string(), Instant::now()));
+    false
+}
+
+fn prepare_select_requests_for_session(ui: &mut UiState, snapshot: &Snapshot, sid: String) {
     ui.page = Page::Requests;
     ui.focus = Focus::Requests;
     ui.request_page_errors_only = false;
     ui.request_page_scope_session = true;
-    ui.focused_request_session_id = Some(sid);
+    ui.focused_request_session_id =
+        Some(crate::tui::model::runtime_session_key(snapshot, &sid).unwrap_or(sid));
     ui.selected_request_page_idx = 0;
+    ui.selected_request_page_id = None;
+    ui.sync_request_page_selection(snapshot);
+    ui.requests_details_scroll = 0;
 }
 
 fn clear_request_page_focus(ui: &mut UiState) {
     ui.focused_request_session_id = None;
     ui.selected_request_page_idx = 0;
+    ui.selected_request_page_id = None;
 }
 
 fn move_fleet_selection(ui: &mut UiState, delta: i32) -> bool {
@@ -676,6 +895,131 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         return true;
     }
 
+    if ui.page == Page::Settings {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                ui.settings_scroll = ui.settings_scroll.saturating_sub(1);
+                return true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                ui.settings_scroll = ui.settings_scroll.saturating_add(1);
+                return true;
+            }
+            KeyCode::PageUp => {
+                ui.settings_scroll = ui.settings_scroll.saturating_sub(8);
+                return true;
+            }
+            KeyCode::PageDown => {
+                ui.settings_scroll = ui.settings_scroll.saturating_add(8);
+                return true;
+            }
+            KeyCode::Home => {
+                ui.settings_scroll = 0;
+                return true;
+            }
+            KeyCode::End => {
+                ui.settings_scroll = u16::MAX;
+                return true;
+            }
+            KeyCode::Char('R') => {
+                queue_runtime_reload(ui);
+                return true;
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                if !ui.can_mutate_default_profile() {
+                    notify_read_only_operator_action(ui);
+                    return true;
+                }
+                let selected = if key.code == KeyCode::Char('p') {
+                    ui.configured_default_profile.clone()
+                } else {
+                    ui.runtime_default_profile_override.clone()
+                };
+                ui.capture_profile_menu_snapshot();
+                ui.settings_profile_menu_idx = selected
+                    .as_deref()
+                    .and_then(|selected| {
+                        ui.profile_menu_options()
+                            .iter()
+                            .position(|profile| profile.name == selected)
+                    })
+                    .map_or(0, |index| index + 1);
+                ui.overlay = if key.code == KeyCode::Char('p') {
+                    Overlay::ConfiguredDefaultProfileMenu
+                } else {
+                    Overlay::RuntimeDefaultProfileMenu
+                };
+                return true;
+            }
+            KeyCode::Char('C') => {
+                if !ui.can_inspect_relay_capabilities() {
+                    notify_read_only_operator_action(ui);
+                    return true;
+                }
+                let model = infer_codex_relay_model(
+                    snapshot,
+                    ui.selected_session_idx,
+                    ui.operator_read_model.as_ref(),
+                );
+                match ui
+                    .codex_relay_diagnostics
+                    .begin(ui.service_name, model, Instant::now())
+                {
+                    Ok(start) => {
+                        queue_relay_capabilities(ui, start);
+                    }
+                    Err(error) => ui.toast = Some((error.to_string(), Instant::now())),
+                }
+                return true;
+            }
+            KeyCode::Char('X') | KeyCode::Char('Y') => {
+                if !ui.can_run_relay_live_smoke() {
+                    notify_read_only_operator_action(ui);
+                    return true;
+                }
+                let model = infer_codex_relay_model(
+                    snapshot,
+                    ui.selected_session_idx,
+                    ui.operator_read_model.as_ref(),
+                );
+                let mode = if key.code == KeyCode::Char('X') {
+                    CodexRelayLiveSmokeMode::CompactOnly
+                } else {
+                    CodexRelayLiveSmokeMode::CompactAndImage
+                };
+                match ui.codex_relay_live_smoke.confirm_or_begin(
+                    ui.service_name,
+                    model,
+                    mode,
+                    Instant::now(),
+                ) {
+                    CodexRelayLiveSmokeDecision::ConfirmAgain { mode, .. } => {
+                        ui.toast = Some((
+                            match ui.language {
+                                Language::Zh => {
+                                    format!("再次按 {} 确认真实上游 smoke；会消耗余额", mode.key())
+                                }
+                                Language::En => format!(
+                                    "press {} again to confirm the billable live smoke",
+                                    mode.key()
+                                ),
+                            },
+                            Instant::now(),
+                        ));
+                    }
+                    CodexRelayLiveSmokeDecision::Started(start) => {
+                        queue_relay_live_smoke(ui, start);
+                    }
+                    CodexRelayLiveSmokeDecision::Blocked(error) => {
+                        ui.toast = Some((error.to_string(), Instant::now()));
+                    }
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Char('q') => {
             ui.should_exit = true;
@@ -687,6 +1031,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         }
         KeyCode::Char('?') => {
             ui.overlay = Overlay::Help;
+            ui.help_scroll = 0;
             true
         }
         KeyCode::Char('i') if ui.page == Page::Routing => {
@@ -694,7 +1039,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             super::open_provider_info(ui);
             true
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::BackTab => {
             if ui.page == Page::Dashboard {
                 ui.focus = match ui.focus {
                     Focus::Sessions => Focus::Requests,
@@ -703,6 +1048,41 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 };
             } else if ui.page == Page::Routing {
                 ui.focus = Focus::Providers;
+                if ui.routing_detail_available && snapshot.routing.is_some() {
+                    ui.routing_detail_focused = !ui.routing_detail_focused;
+                    ui.toast = Some((
+                        match (ui.language, ui.routing_detail_focused) {
+                            (Language::Zh, true) => "路由焦点：端点详情".to_string(),
+                            (Language::Zh, false) => "路由焦点：候选端点".to_string(),
+                            (Language::En, true) => "routing focus: endpoint details".to_string(),
+                            (Language::En, false) => {
+                                "routing focus: endpoint candidates".to_string()
+                            }
+                        },
+                        Instant::now(),
+                    ));
+                } else {
+                    ui.routing_detail_focused = false;
+                    ui.routing_detail_scroll = 0;
+                }
+            } else if ui.page == Page::ServiceStatus {
+                if ui.service_status_detail_available {
+                    ui.service_status_detail_focused = !ui.service_status_detail_focused;
+                    ui.toast = Some((
+                        match (ui.language, ui.service_status_detail_focused) {
+                            (Language::Zh, true) => "服务状态焦点：当前详情".to_string(),
+                            (Language::Zh, false) => "服务状态焦点：探针列表".to_string(),
+                            (Language::En, true) => {
+                                "service status focus: selected details".to_string()
+                            }
+                            (Language::En, false) => "service status focus: probe list".to_string(),
+                        },
+                        Instant::now(),
+                    ));
+                } else {
+                    ui.service_status_detail_focused = false;
+                    ui.service_status_detail_scroll = 0;
+                }
             } else if ui.page == Page::Stats {
                 ui.cycle_stats_focus();
                 ui.toast = Some((
@@ -749,6 +1129,60 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             ));
             true
         }
+        KeyCode::Up | KeyCode::Char('k') if ui.page == Page::ServiceStatus => {
+            if ui.service_status_detail_focused {
+                ui.service_status_detail_scroll = ui.service_status_detail_scroll.saturating_sub(1);
+                true
+            } else {
+                ui.move_service_status_selection(snapshot, -1)
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') if ui.page == Page::ServiceStatus => {
+            if ui.service_status_detail_focused {
+                ui.service_status_detail_scroll = ui.service_status_detail_scroll.saturating_add(1);
+                true
+            } else {
+                ui.move_service_status_selection(snapshot, 1)
+            }
+        }
+        KeyCode::PageUp if ui.page == Page::ServiceStatus => {
+            if ui.service_status_detail_focused {
+                ui.service_status_detail_scroll = ui.service_status_detail_scroll.saturating_sub(8);
+                true
+            } else {
+                ui.move_service_status_selection(
+                    snapshot,
+                    -(ui.service_status_visible_rows.min(i32::MAX as usize) as i32),
+                )
+            }
+        }
+        KeyCode::PageDown if ui.page == Page::ServiceStatus => {
+            if ui.service_status_detail_focused {
+                ui.service_status_detail_scroll = ui.service_status_detail_scroll.saturating_add(8);
+                true
+            } else {
+                ui.move_service_status_selection(
+                    snapshot,
+                    ui.service_status_visible_rows.min(i32::MAX as usize) as i32,
+                )
+            }
+        }
+        KeyCode::Home if ui.page == Page::ServiceStatus => {
+            if ui.service_status_detail_focused {
+                ui.service_status_detail_scroll = 0;
+                true
+            } else {
+                ui.select_service_status_edge(snapshot, false)
+            }
+        }
+        KeyCode::End if ui.page == Page::ServiceStatus => {
+            if ui.service_status_detail_focused {
+                ui.service_status_detail_scroll = u16::MAX;
+                true
+            } else {
+                ui.select_service_status_edge(snapshot, true)
+            }
+        }
         KeyCode::Char('t') if ui.page == Page::Fleet => {
             ui.fleet_view_mode = match ui.fleet_view_mode {
                 FleetViewMode::Tree => FleetViewMode::Flat,
@@ -786,24 +1220,54 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             }
         }
         KeyCode::PageUp if ui.page == Page::Routing => {
-            let delta = -(ui.routing_candidates_visible_rows.min(i32::MAX as usize) as i32);
-            move_routing_page_selection(ui, snapshot, providers.len(), delta)
+            if ui.routing_detail_focused {
+                ui.routing_detail_scroll = ui.routing_detail_scroll.saturating_sub(8);
+                true
+            } else {
+                let delta = -(ui.routing_candidates_visible_rows.min(i32::MAX as usize) as i32);
+                move_routing_page_selection(ui, snapshot, providers.len(), delta)
+            }
         }
         KeyCode::PageDown if ui.page == Page::Routing => {
-            let delta = ui.routing_candidates_visible_rows.min(i32::MAX as usize) as i32;
-            move_routing_page_selection(ui, snapshot, providers.len(), delta)
+            if ui.routing_detail_focused {
+                ui.routing_detail_scroll = ui.routing_detail_scroll.saturating_add(8);
+                true
+            } else {
+                let delta = ui.routing_candidates_visible_rows.min(i32::MAX as usize) as i32;
+                move_routing_page_selection(ui, snapshot, providers.len(), delta)
+            }
         }
         KeyCode::Home if ui.page == Page::Routing => {
-            select_routing_page_edge(ui, snapshot, providers.len(), false)
+            if ui.routing_detail_focused {
+                ui.routing_detail_scroll = 0;
+                true
+            } else {
+                select_routing_page_edge(ui, snapshot, providers.len(), false)
+            }
         }
         KeyCode::End if ui.page == Page::Routing => {
-            select_routing_page_edge(ui, snapshot, providers.len(), true)
+            if ui.routing_detail_focused {
+                ui.routing_detail_scroll = u16::MAX;
+                true
+            } else {
+                select_routing_page_edge(ui, snapshot, providers.len(), true)
+            }
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Routing => {
-            move_routing_page_selection(ui, snapshot, providers.len(), -1)
+            if ui.routing_detail_focused {
+                ui.routing_detail_scroll = ui.routing_detail_scroll.saturating_sub(1);
+                true
+            } else {
+                move_routing_page_selection(ui, snapshot, providers.len(), -1)
+            }
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::Routing => {
-            move_routing_page_selection(ui, snapshot, providers.len(), 1)
+            if ui.routing_detail_focused {
+                ui.routing_detail_scroll = ui.routing_detail_scroll.saturating_add(1);
+                true
+            } else {
+                move_routing_page_selection(ui, snapshot, providers.len(), 1)
+            }
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Stats => {
             ui.move_stats_selection(snapshot, -1)
@@ -813,20 +1277,43 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         }
         KeyCode::Char('g') if ui.page == Page::Stats => {
             ui.needs_snapshot_refresh = true;
-            ui.toast = Some((
-                match ui.language {
-                    Language::Zh => "额度：正在刷新 operator read model",
-                    Language::En => "quota: refreshing operator read model",
-                }
-                .to_string(),
-                Instant::now(),
-            ));
+            if ui.can_refresh_provider_balances() {
+                let _ = queue_balance_refresh(ui, true, true);
+            } else {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "额度：仅刷新观察快照；远程余额保持不变",
+                        Language::En => {
+                            "quota: refreshing snapshot-only view; upstream balances are unchanged"
+                        }
+                    }
+                    .to_string(),
+                    Instant::now(),
+                ));
+            }
             true
         }
         KeyCode::Char('y') if ui.page == Page::Stats => export_selected_stats_report(ui, snapshot),
+        KeyCode::PageUp if ui.page == Page::Dashboard => {
+            ui.dashboard_details_scroll = ui.dashboard_details_scroll.saturating_sub(8);
+            true
+        }
+        KeyCode::PageDown if ui.page == Page::Dashboard => {
+            ui.dashboard_details_scroll = ui.dashboard_details_scroll.saturating_add(8);
+            true
+        }
+        KeyCode::Home if ui.page == Page::Dashboard => {
+            ui.dashboard_details_scroll = 0;
+            true
+        }
+        KeyCode::End if ui.page == Page::Dashboard => {
+            ui.dashboard_details_scroll = u16::MAX;
+            true
+        }
         KeyCode::Char('a') if ui.page == Page::Sessions => {
             ui.sessions_page_active_only = !ui.sessions_page_active_only;
             ui.selected_sessions_page_idx = 0;
+            ui.sessions_details_scroll = 0;
             ui.toast = Some((
                 format!(
                     "{}: {}={}",
@@ -841,6 +1328,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         KeyCode::Char('e') if ui.page == Page::Sessions => {
             ui.sessions_page_errors_only = !ui.sessions_page_errors_only;
             ui.selected_sessions_page_idx = 0;
+            ui.sessions_details_scroll = 0;
             ui.toast = Some((
                 format!(
                     "{}: {}={}",
@@ -852,18 +1340,110 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             ));
             true
         }
+        KeyCode::Char('v') if ui.page == Page::Sessions => {
+            ui.sessions_page_overrides_only = !ui.sessions_page_overrides_only;
+            ui.selected_sessions_page_idx = 0;
+            ui.sessions_details_scroll = 0;
+            ui.toast = Some((
+                format!(
+                    "{}: {}={}",
+                    i18n::label(ui.language, "sessions filter"),
+                    i18n::label(ui.language, "overrides_only"),
+                    ui.sessions_page_overrides_only
+                ),
+                Instant::now(),
+            ));
+            true
+        }
         KeyCode::Char('r') if ui.page == Page::Sessions => {
             ui.sessions_page_active_only = false;
             ui.sessions_page_errors_only = false;
+            ui.sessions_page_overrides_only = false;
             ui.selected_sessions_page_idx = 0;
+            ui.sessions_details_scroll = 0;
             ui.toast = Some((
                 i18n::label(ui.language, "sessions filter: reset").to_string(),
                 Instant::now(),
             ));
             true
         }
+        KeyCode::Char('b') if session_binding_shortcuts_active(ui) => {
+            open_session_profile_menu(ui, snapshot)
+        }
+        KeyCode::Char('M') if session_binding_shortcuts_active(ui) => {
+            open_session_model_menu(ui, snapshot)
+        }
+        KeyCode::Char('E') if session_binding_shortcuts_active(ui) => {
+            open_session_effort_menu(ui, snapshot)
+        }
+        KeyCode::Enter if session_binding_shortcuts_active(ui) => {
+            open_session_effort_menu(ui, snapshot)
+        }
+        KeyCode::Char('f') if session_binding_shortcuts_active(ui) => {
+            open_session_service_tier_menu(ui, snapshot)
+        }
+        KeyCode::Char('l') | KeyCode::Char('m') | KeyCode::Char('h') | KeyCode::Char('X')
+            if session_binding_shortcuts_active(ui) =>
+        {
+            let Some(reasoning_effort) = (match key.code {
+                KeyCode::Char('l') => Some("low"),
+                KeyCode::Char('m') => Some("medium"),
+                KeyCode::Char('h') => Some("high"),
+                KeyCode::Char('X') => Some("xhigh"),
+                _ => None,
+            }) else {
+                return false;
+            };
+            if let Some(request) = selected_session_binding_request(
+                ui,
+                snapshot,
+                OperatorSessionBindingCommand::SetReasoningEffort {
+                    reasoning_effort: Some(reasoning_effort.to_string()),
+                },
+            ) {
+                let _ = queue_session_binding_mutation(ui, request);
+            }
+            true
+        }
+        KeyCode::Char('R') if session_binding_shortcuts_active(ui) => {
+            let has_manual_values = snapshot
+                .rows
+                .get(ui.selected_session_idx)
+                .is_some_and(|row| row.binding.has_manual_values());
+            if !has_manual_values {
+                ui.toast = Some((
+                    match ui.language {
+                        Language::Zh => "会话手动控制已经为空".to_string(),
+                        Language::En => "session manual controls are already clear".to_string(),
+                    },
+                    Instant::now(),
+                ));
+                return true;
+            }
+            if let Some(request) = selected_session_binding_request(
+                ui,
+                snapshot,
+                OperatorSessionBindingCommand::ResetManualOverrides,
+            ) {
+                let _ = queue_session_binding_mutation(ui, request);
+            }
+            true
+        }
+        KeyCode::Char('x') if session_binding_shortcuts_active(ui) => {
+            if let Some(request) = selected_session_binding_request(
+                ui,
+                snapshot,
+                OperatorSessionBindingCommand::SetReasoningEffort {
+                    reasoning_effort: None,
+                },
+            ) {
+                let _ = queue_session_binding_mutation(ui, request);
+            }
+            true
+        }
         KeyCode::Char('r') if ui.page == Page::History => {
             ui.needs_codex_history_refresh = true;
+            ui.codex_history_details_scroll = 0;
             ui.toast = Some((
                 i18n::text(ui.language, msg::HISTORY_REFRESHING).to_string(),
                 Instant::now(),
@@ -872,6 +1452,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         }
         KeyCode::Char('r') if ui.page == Page::Recent => {
             ui.needs_codex_recent_refresh = true;
+            ui.codex_recent_details_scroll = 0;
             ui.toast = Some((
                 i18n::text(ui.language, msg::RECENT_REFRESHING).to_string(),
                 Instant::now(),
@@ -884,9 +1465,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             } else {
                 ui.codex_recent_window_idx = ui.codex_recent_window_idx.saturating_sub(1);
             }
-            ui.codex_recent_selected_idx = 0;
-            ui.codex_recent_selected_id = None;
-            ui.codex_recent_table.select(None);
+            ui.codex_recent_details_scroll = 0;
+            ui.sync_codex_recent_selection(now_ms());
             ui.toast = Some((
                 format!(
                     "{}: {}",
@@ -900,9 +1480,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         KeyCode::Char(']') if ui.page == Page::Recent => {
             ui.codex_recent_window_idx =
                 (ui.codex_recent_window_idx + 1) % CODEX_RECENT_WINDOWS.len().max(1);
-            ui.codex_recent_selected_idx = 0;
-            ui.codex_recent_selected_id = None;
-            ui.codex_recent_table.select(None);
+            ui.codex_recent_details_scroll = 0;
+            ui.sync_codex_recent_selection(now_ms());
             ui.toast = Some((
                 format!(
                     "{}: {}",
@@ -922,7 +1501,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 return true;
             };
             let sid_label = short_sid(&sid, 18);
-            prepare_select_requests_for_session(ui, sid);
+            prepare_select_requests_for_session(ui, snapshot, sid);
             ui.toast = Some((
                 format!(
                     "{} {sid_label}",
@@ -1000,7 +1579,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 return true;
             };
             let sid_label = short_sid(&sid, 18);
-            prepare_select_requests_for_session(ui, sid);
+            prepare_select_requests_for_session(ui, snapshot, sid);
             ui.toast = Some((
                 format!(
                     "{} {sid_label}",
@@ -1181,6 +1760,9 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             true
         }
         KeyCode::Char('s') if ui.page == Page::Recent => {
+            if !require_runtime_session_bridge(ui) {
+                return true;
+            }
             let Some(r) = selected_recent_row(ui) else {
                 ui.toast = Some((
                     i18n::label(ui.language, "recent: no selection").to_string(),
@@ -1206,6 +1788,9 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             true
         }
         KeyCode::Char('f') if ui.page == Page::Recent => {
+            if !require_runtime_session_bridge(ui) {
+                return true;
+            }
             let Some(r) = selected_recent_row(ui) else {
                 ui.toast = Some((
                     i18n::label(ui.language, "recent: no selection").to_string(),
@@ -1214,7 +1799,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 return true;
             };
             let sid_label = short_sid(r.session_id.as_str(), 18);
-            prepare_select_requests_for_session(ui, r.session_id);
+            prepare_select_requests_for_session(ui, snapshot, r.session_id);
             ui.toast = Some((
                 format!(
                     "{} {sid_label}",
@@ -1351,7 +1936,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let Some(local_sid) = local_session_id_for_opaque_key(snapshot, opaque_sid) else {
+            let Some((local_sid, cwd)) = local_session_context_for_opaque_key(snapshot, opaque_sid)
+            else {
                 ui.toast = Some((
                     i18n::label(
                         ui.language,
@@ -1362,7 +1948,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let path = match find_codex_session_file_by_id(local_sid).await {
+            let path = match find_codex_session_file_by_id(&local_sid).await {
                 Ok(path) => path,
                 Err(e) => {
                     ui.toast = Some((
@@ -1375,7 +1961,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     return true;
                 }
             };
-            let summary = request_history_summary_from_request(&request, local_sid, path);
+            let summary = request_history_summary_from_request(&request, &local_sid, cwd, path);
             let sid_label = short_sid(opaque_sid, 18);
             prepare_select_history_from_external(
                 ui,
@@ -1414,6 +2000,9 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             true
         }
         KeyCode::Char('s') if ui.page == Page::History => {
+            if !require_runtime_session_bridge(ui) {
+                return true;
+            }
             let Some(sid) = ui
                 .codex_history_sessions
                 .get(ui.selected_codex_history_idx)
@@ -1443,6 +2032,9 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             true
         }
         KeyCode::Char('f') if ui.page == Page::History => {
+            if !require_runtime_session_bridge(ui) {
+                return true;
+            }
             let Some(summary) = ui
                 .codex_history_sessions
                 .get(ui.selected_codex_history_idx)
@@ -1455,7 +2047,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 return true;
             };
             let sid_label = short_sid(summary.id.as_str(), 18);
-            prepare_select_requests_for_session(ui, summary.id);
+            prepare_select_requests_for_session(ui, snapshot, summary.id);
             ui.toast = Some((
                 format!(
                     "{} {sid_label}",
@@ -1466,25 +2058,27 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             true
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::History => {
-            let len = ui.codex_history_sessions.len();
+            let len = ui.codex_history_visible_len();
             if let Some(next) = adjust_table_selection(&mut ui.codex_history_table, -1, len) {
                 ui.selected_codex_history_idx = next;
                 ui.selected_codex_history_id = ui
                     .codex_history_sessions
                     .get(next)
                     .map(|summary| summary.id.clone());
+                ui.codex_history_details_scroll = 0;
                 return true;
             }
             false
         }
         KeyCode::Down | KeyCode::Char('j') if ui.page == Page::History => {
-            let len = ui.codex_history_sessions.len();
+            let len = ui.codex_history_visible_len();
             if let Some(next) = adjust_table_selection(&mut ui.codex_history_table, 1, len) {
                 ui.selected_codex_history_idx = next;
                 ui.selected_codex_history_id = ui
                     .codex_history_sessions
                     .get(next)
                     .map(|summary| summary.id.clone());
+                ui.codex_history_details_scroll = 0;
                 return true;
             }
             false
@@ -1499,6 +2093,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     .codex_recent_rows
                     .get(visible[next])
                     .map(|r| r.session_id.clone());
+                ui.codex_recent_details_scroll = 0;
                 return true;
             }
             false
@@ -1513,9 +2108,42 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     .codex_recent_rows
                     .get(visible[next])
                     .map(|r| r.session_id.clone());
+                ui.codex_recent_details_scroll = 0;
                 return true;
             }
             false
+        }
+        KeyCode::PageUp if ui.page == Page::History => {
+            ui.codex_history_details_scroll = ui.codex_history_details_scroll.saturating_sub(8);
+            true
+        }
+        KeyCode::PageDown if ui.page == Page::History => {
+            ui.codex_history_details_scroll = ui.codex_history_details_scroll.saturating_add(8);
+            true
+        }
+        KeyCode::Home if ui.page == Page::History => {
+            ui.codex_history_details_scroll = 0;
+            true
+        }
+        KeyCode::End if ui.page == Page::History => {
+            ui.codex_history_details_scroll = u16::MAX;
+            true
+        }
+        KeyCode::PageUp if ui.page == Page::Recent => {
+            ui.codex_recent_details_scroll = ui.codex_recent_details_scroll.saturating_sub(8);
+            true
+        }
+        KeyCode::PageDown if ui.page == Page::Recent => {
+            ui.codex_recent_details_scroll = ui.codex_recent_details_scroll.saturating_add(8);
+            true
+        }
+        KeyCode::Home if ui.page == Page::Recent => {
+            ui.codex_recent_details_scroll = 0;
+            true
+        }
+        KeyCode::End if ui.page == Page::Recent => {
+            ui.codex_recent_details_scroll = u16::MAX;
+            true
         }
         KeyCode::Up | KeyCode::Char('k') if ui.page == Page::Sessions => {
             let filtered = ui.filtered_sessions_page_indices(snapshot);
@@ -1543,9 +2171,27 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             }
             false
         }
+        KeyCode::PageUp if ui.page == Page::Sessions => {
+            ui.sessions_details_scroll = ui.sessions_details_scroll.saturating_sub(8);
+            true
+        }
+        KeyCode::PageDown if ui.page == Page::Sessions => {
+            ui.sessions_details_scroll = ui.sessions_details_scroll.saturating_add(8);
+            true
+        }
+        KeyCode::Home if ui.page == Page::Sessions => {
+            ui.sessions_details_scroll = 0;
+            true
+        }
+        KeyCode::End if ui.page == Page::Sessions => {
+            ui.sessions_details_scroll = u16::MAX;
+            true
+        }
         KeyCode::Char('e') if ui.page == Page::Requests => {
             ui.request_page_errors_only = !ui.request_page_errors_only;
             ui.selected_request_page_idx = 0;
+            ui.selected_request_page_id = None;
+            ui.requests_details_scroll = 0;
             ui.toast = Some((
                 format!(
                     "{}: {}={}",
@@ -1560,6 +2206,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
         KeyCode::Char('c') if ui.page == Page::Requests => {
             ui.request_page_control_filter = ui.request_page_control_filter.next();
             ui.selected_request_page_idx = 0;
+            ui.selected_request_page_id = None;
+            ui.requests_details_scroll = 0;
             ui.toast = Some((
                 format!(
                     "{}: {}={}",
@@ -1580,6 +2228,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     .and_then(|row| row.session_id.clone());
             }
             ui.selected_request_page_idx = 0;
+            ui.selected_request_page_id = None;
+            ui.requests_details_scroll = 0;
             ui.toast = Some((
                 format!(
                     "{}: {}",
@@ -1651,7 +2301,8 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let Some(local_sid) = local_session_id_for_opaque_key(snapshot, opaque_sid) else {
+            let Some((local_sid, cwd)) = local_session_context_for_opaque_key(snapshot, opaque_sid)
+            else {
                 ui.toast = Some((
                     i18n::label(
                         ui.language,
@@ -1662,7 +2313,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 ));
                 return true;
             };
-            let path = match find_codex_session_file_by_id(local_sid).await {
+            let path = match find_codex_session_file_by_id(&local_sid).await {
                 Ok(path) => path,
                 Err(e) => {
                     ui.toast = Some((
@@ -1675,7 +2326,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                     return true;
                 }
             };
-            let summary = request_history_summary_from_request(&request, local_sid, path);
+            let summary = request_history_summary_from_request(&request, &local_sid, cwd, path);
             let sid_label = short_sid(opaque_sid, 18);
             prepare_select_history_from_external(
                 ui,
@@ -1695,8 +2346,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             let filtered_len = ui.request_page_filtered_indices(snapshot).len();
             if let Some(next) = adjust_table_selection(&mut ui.request_page_table, -1, filtered_len)
             {
-                ui.selected_request_page_idx = next;
-                return true;
+                return ui.select_request_page_index(snapshot, next);
             }
             false
         }
@@ -1704,10 +2354,25 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
             let filtered_len = ui.request_page_filtered_indices(snapshot).len();
             if let Some(next) = adjust_table_selection(&mut ui.request_page_table, 1, filtered_len)
             {
-                ui.selected_request_page_idx = next;
-                return true;
+                return ui.select_request_page_index(snapshot, next);
             }
             false
+        }
+        KeyCode::PageUp if ui.page == Page::Requests => {
+            ui.requests_details_scroll = ui.requests_details_scroll.saturating_sub(8);
+            true
+        }
+        KeyCode::PageDown if ui.page == Page::Requests => {
+            ui.requests_details_scroll = ui.requests_details_scroll.saturating_add(8);
+            true
+        }
+        KeyCode::Home if ui.page == Page::Requests => {
+            ui.requests_details_scroll = 0;
+            true
+        }
+        KeyCode::End if ui.page == Page::Requests => {
+            ui.requests_details_scroll = u16::MAX;
+            true
         }
         KeyCode::Up | KeyCode::Char('k') => match ui.focus {
             Focus::Sessions => {
@@ -1723,8 +2388,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 let filtered_len = filtered_requests_len(snapshot, ui.selected_session_idx);
                 if let Some(next) = adjust_table_selection(&mut ui.requests_table, -1, filtered_len)
                 {
-                    ui.selected_request_idx = next;
-                    return true;
+                    return ui.select_dashboard_request_index(snapshot, next);
                 }
                 false
             }
@@ -1744,8 +2408,7 @@ pub(super) async fn handle_key_normal(ctx: KeyEventContext<'_>, key: KeyEvent) -
                 let filtered_len = filtered_requests_len(snapshot, ui.selected_session_idx);
                 if let Some(next) = adjust_table_selection(&mut ui.requests_table, 1, filtered_len)
                 {
-                    ui.selected_request_idx = next;
-                    return true;
+                    return ui.select_dashboard_request_index(snapshot, next);
                 }
                 false
             }

@@ -4,14 +4,13 @@ use crate::config::resolve_service_profile_from_catalog;
 use crate::dashboard_core::window_stats::compute_window_stats;
 use crate::dashboard_core::{
     ApiV1OperatorSummary, ControlProfileOption, OperatorActiveRequestSummary,
-    OperatorProfileSummary, OperatorProviderBalanceSummary, OperatorProviderSummary,
-    OperatorReadCapture, OperatorReadData, OperatorReadModel, OperatorRequestSummary,
-    OperatorRetrySummary, OperatorRevisionBundle, OperatorRoutingControlView,
-    OperatorRuntimeSummary, OperatorSessionSummary, OperatorSummaryCounts,
-    build_operator_routing_summary, build_operator_session_stats,
-    build_profile_options_from_route_view, redact_operator_pricing_catalog,
-    redact_operator_quota_analytics, redact_operator_usage_day, redact_operator_usage_summaries,
-    summarize_recent_retry_observations,
+    OperatorLocalSessionMetadata, OperatorProfileSummary, OperatorProviderBalanceSummary,
+    OperatorProviderSummary, OperatorReadCapture, OperatorReadData, OperatorReadModel,
+    OperatorRequestSummary, OperatorRetrySummary, OperatorRevisionBundle,
+    OperatorRoutingControlView, OperatorRuntimeSummary, OperatorSessionSummary,
+    OperatorSummaryCounts, build_operator_routing_summary, build_profile_options_from_route_view,
+    redact_operator_pricing_catalog, redact_operator_quota_analytics, redact_operator_usage_day,
+    redact_operator_usage_summaries, summarize_recent_retry_observations,
 };
 use crate::state::{
     OperatorLifecycleSnapshot, SessionIdentityCardBuildInputs,
@@ -19,13 +18,23 @@ use crate::state::{
 };
 
 use super::ProxyService;
-use super::profile_defaults::effective_default_profile_name;
+use super::profile_defaults::effective_default_profile;
 use super::providers_api::build_provider_options_for_runtime_snapshot;
+use super::runtime_config::RuntimeSnapshot;
+use super::settings_control::EffectiveDefaultProfileSource;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProfilesResponse {
     pub default_profile: Option<String>,
     pub configured_default_profile: Option<String>,
+    #[serde(default)]
+    pub runtime_default_profile_override: Option<String>,
+    #[serde(default)]
+    pub default_profile_source: EffectiveDefaultProfileSource,
+    #[serde(default)]
+    pub default_profile_control_revision: u64,
+    #[serde(default)]
+    pub profile_catalog_key: String,
     pub profiles: Vec<ControlProfileOption>,
 }
 
@@ -37,7 +46,10 @@ pub(super) async fn build_operator_read_capture(
     for _ in 0..MAX_CAPTURE_ATTEMPTS {
         let lifecycle_snapshot = proxy
             .state
-            .capture_operator_lifecycle_snapshot(proxy.service_name, 200)
+            .capture_operator_lifecycle_snapshot(
+                proxy.service_name,
+                crate::state::recent_finished_max(),
+            )
             .await;
         let state_revision = lifecycle_snapshot.state_revision;
         #[cfg(test)]
@@ -87,6 +99,7 @@ async fn build_operator_read_model_once(
     let ledger_revision = lifecycle_snapshot.ledger_revision.to_string();
     let active = lifecycle_snapshot.active_requests;
     let recent = lifecycle_snapshot.recent_finished;
+    let session_stats = lifecycle_snapshot.session_stats;
     let (session_bindings, session_route_affinities, provider_balances, routing_control) = tokio::join!(
         proxy.state.list_session_bindings(),
         proxy.state.list_session_route_affinities(),
@@ -98,8 +111,9 @@ async fn build_operator_read_model_once(
         Some(route_graph.as_ref()),
         proxy.service_name,
     );
-    let default_profile = effective_default_profile_name(view);
-    let session_stats = build_operator_session_stats(&recent);
+    let (default_profile, default_profile_source) =
+        effective_default_profile(runtime_snapshot.as_ref(), proxy.service_name)?;
+    let default_profile_control = runtime_snapshot.default_profile_control(proxy.service_name)?;
     let policy_actions = proxy.state.policy_action_projections_for_snapshot(
         proxy.service_name,
         captured_at_ms,
@@ -157,19 +171,26 @@ async fn build_operator_read_model_once(
         crate::credentials::CredentialAggregateReadiness::from_endpoint_codes(credential_codes),
     );
     let retry_observations = summarize_recent_retry_observations(&recent);
-    let local_session_ids = session_cards
+    let local_sessions = session_cards
         .iter()
         .filter_map(|card| {
             card.session_id.as_ref().map(|session_id| {
                 (
                     crate::dashboard_core::operator_summary::operator_session_key(session_id),
-                    session_id.clone(),
+                    OperatorLocalSessionMetadata {
+                        raw_session_id: session_id.clone(),
+                        cwd: card.cwd.clone(),
+                        last_client_name: card.last_client_name.clone(),
+                        last_client_addr: card.last_client_addr.clone(),
+                        host_local_transcript_path: card.host_local_transcript_path.clone(),
+                    },
                 )
             })
         })
         .collect();
     let sessions = session_cards
         .iter()
+        .filter(|card| card.session_id.is_some())
         .enumerate()
         .map(|(index, card)| OperatorSessionSummary::from_session_card(card, index))
         .collect::<Vec<_>>();
@@ -180,12 +201,21 @@ async fn build_operator_read_model_once(
             runtime_loaded_at_ms: Some(loaded_at_ms),
             runtime_source_mtime_ms: source_mtime_ms,
             configured_default_profile,
-            default_profile,
+            default_profile: default_profile.clone(),
+            runtime_default_profile_override: default_profile_control.runtime_override.clone(),
+            default_profile_source,
+            default_profile_control_revision: default_profile_control.control_revision,
+            profile_catalog_key: default_profile_control.profile_catalog_key.clone(),
             default_profile_summary,
             operator_actions: crate::dashboard_core::OperatorActionCapabilities {
                 refresh_provider_balances: true,
                 mutate_routing: true,
                 mutate_session_affinity: true,
+                mutate_session_binding: true,
+                reload_runtime: true,
+                mutate_default_profile: true,
+                inspect_relay_capabilities: proxy.service_name == "codex",
+                run_relay_live_smoke: proxy.service_name == "codex",
             },
         },
         counts: OperatorSummaryCounts {
@@ -199,6 +229,7 @@ async fn build_operator_read_model_once(
             configured_profile: configured_retry.profile,
             upstream_max_attempts: resolved_retry.upstream.max_attempts,
             provider_max_attempts: resolved_retry.route.max_attempts,
+            policy: Some((&resolved_retry).into()),
             recent_retried_requests: retry_observations.recent_retried_requests,
             recent_cross_provider_failovers: retry_observations.recent_cross_provider_failovers,
             recent_same_provider_retries: retry_observations.recent_same_provider_retries,
@@ -271,18 +302,49 @@ async fn build_operator_read_model_once(
         .map_err(|message| anyhow!("invalid operator read model: {message}"))?;
     Ok(OperatorReadCapture {
         model,
-        local_session_ids,
+        local_sessions,
     })
 }
 
 pub(super) async fn make_profiles_response(proxy: &ProxyService) -> ProfilesResponse {
-    let config = proxy.config.capture().await.config();
+    let runtime = proxy.config.capture().await;
+    make_profiles_response_from_snapshot(proxy, runtime.as_ref()).unwrap_or_else(|error| {
+        tracing::warn!(
+            service = proxy.service_name,
+            "failed to project default profile controls: {error}"
+        );
+        let config = runtime.config();
+        let view =
+            super::control_plane_service::service_route_config(config.as_ref(), proxy.service_name);
+        ProfilesResponse {
+            default_profile: None,
+            configured_default_profile: view.default_profile.clone(),
+            runtime_default_profile_override: None,
+            default_profile_source: EffectiveDefaultProfileSource::None,
+            default_profile_control_revision: 0,
+            profile_catalog_key: String::new(),
+            profiles: build_profile_options_from_route_view(view, None),
+        }
+    })
+}
+
+pub(super) fn make_profiles_response_from_snapshot(
+    proxy: &ProxyService,
+    runtime: &RuntimeSnapshot,
+) -> Result<ProfilesResponse> {
+    let config = runtime.config();
     let view =
         super::control_plane_service::service_route_config(config.as_ref(), proxy.service_name);
-    let default_profile = effective_default_profile_name(view);
-    ProfilesResponse {
+    let (default_profile, default_profile_source) =
+        effective_default_profile(runtime, proxy.service_name)?;
+    let control = runtime.default_profile_control(proxy.service_name)?;
+    Ok(ProfilesResponse {
         default_profile: default_profile.clone(),
         configured_default_profile: view.default_profile.clone(),
+        runtime_default_profile_override: control.runtime_override,
+        default_profile_source,
+        default_profile_control_revision: control.control_revision,
+        profile_catalog_key: control.profile_catalog_key,
         profiles: build_profile_options_from_route_view(view, default_profile.as_deref()),
-    }
+    })
 }

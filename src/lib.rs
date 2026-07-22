@@ -4,16 +4,17 @@ pub mod commands;
 mod service_manager;
 mod service_receipt;
 
-pub use cli_app::run_cli;
+pub use cli_app::{run_ch_cli, run_cli};
 pub use cli_types::{
     CliError, CliResult, ConfigCommand, CredentialCommand, PricingCommand, PricingConfidence,
     ProviderAuthKind, ProviderCommand, RecentFormat, RecentTerminal, RetryProfile, RoutingCommand,
-    RoutingExhaustedAction, RoutingPolicy, SessionCommand, UsageCommand, UsageSummaryBy,
+    RoutingExhaustedAction, RoutingPolicy, SessionCommand, UsageCommand, UsageSource,
+    UsageSummaryBy,
 };
 pub use codex_helper_core::{
-    codex_integration, codex_switch, config, control_plane_client, dashboard_core, doctor,
-    endpoint_health, filter, logging, model_routing, notify, pricing, proxy, relay_target,
-    request_chain, request_ledger, routing_explain, routing_ir, runtime_host, runtime_manager,
-    runtime_store, sessions, state, usage, usage_providers,
+    codex_integration, codex_onboarding, codex_switch, config, control_plane_client,
+    dashboard_core, doctor, endpoint_health, filter, logging, model_routing, notify, pricing,
+    proxy, relay_target, request_chain, request_ledger, routing_explain, routing_ir, runtime_host,
+    runtime_manager, runtime_store, sessions, state, usage, usage_providers,
 };
 pub use codex_helper_tui::tui;

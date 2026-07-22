@@ -1,12 +1,15 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::auth_resolution::target_credential_readiness;
 use crate::config::SchedulingPreset;
+use crate::endpoint_health::RouteCapability;
 use crate::logging::log_control_trace_event;
 use crate::routing_ir::{
     RouteCandidate, RoutePlanAttemptSelection, RoutePlanAttemptState, RoutePlanExecutor,
     RoutePlanRuntimeState, RoutePlanTemplate,
 };
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::runtime_store::ProviderPolicySnapshot;
 use anyhow::Result;
 
@@ -23,16 +26,18 @@ pub(super) async fn route_graph_runtime_for_request(
     routing_control_graph_key: &str,
     runtime_revision: u64,
     provider_policy: &ProviderPolicySnapshot,
+    transient_health_capability: Option<RouteCapability>,
     session_id: Option<&str>,
 ) -> Result<RoutePlanRuntimeState> {
     let runtime_identities = template.candidate_identities()?;
     let mut runtime = proxy
         .state
-        .route_plan_runtime_state_with_provider_policy(
+        .route_plan_runtime_state_with_provider_policy_for_capability(
             proxy.service_name,
             provider_policy,
             runtime_revision,
             runtime_identities.as_slice(),
+            transient_health_capability,
         )
         .await;
     apply_auth_resolution_to_runtime(proxy.service_name, template, &mut runtime)?;
@@ -167,6 +172,26 @@ pub(super) fn runtime_for_acquired_candidate_revalidation(
     let mut validation_runtime = runtime.clone();
     clear_candidate_concurrency_saturation(template, candidate, &mut validation_runtime);
     validation_runtime
+}
+
+pub(super) fn runtime_for_transient_half_open_selection(
+    template: &RoutePlanTemplate,
+    runtime: &RoutePlanRuntimeState,
+    eligible_provider_endpoints: &HashSet<ProviderEndpointKey>,
+) -> RoutePlanRuntimeState {
+    let mut selection_runtime = runtime.clone();
+    for candidate in &template.candidates {
+        let provider_endpoint = template.candidate_provider_endpoint_key(candidate);
+        if !eligible_provider_endpoints.contains(&provider_endpoint) {
+            continue;
+        }
+        let mut state = selection_runtime.provider_endpoint(&provider_endpoint);
+        state.failure_count = 0;
+        state.cooldown_active = false;
+        state.cooldown_remaining_secs = None;
+        selection_runtime.set_provider_endpoint(provider_endpoint, state);
+    }
+    selection_runtime
 }
 
 fn clear_candidate_concurrency_saturation(

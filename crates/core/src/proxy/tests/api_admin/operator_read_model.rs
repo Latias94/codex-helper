@@ -167,6 +167,28 @@ async fn operator_read_model_isolates_requests_and_sessions_by_service() {
 }
 
 #[tokio::test]
+async fn operator_read_model_uses_the_runtime_recent_request_retention_limit() {
+    const REQUEST_COUNT: usize = 250;
+
+    let proxy = proxy_service(make_helper_config(Vec::new(), RetryConfig::default()));
+    for index in 0..REQUEST_COUNT {
+        let started_at_ms = u64::try_from(index).expect("request index");
+        let request_id =
+            begin_request(&proxy, "codex", "retained-operator-session", started_at_ms).await;
+        finish_request(&proxy, request_id, started_at_ms.saturating_add(1)).await;
+    }
+
+    let model = proxy
+        .operator_read_model()
+        .await
+        .expect("build retained operator read model");
+    let data = model.data.expect("ready operator read data");
+    let expected = REQUEST_COUNT.min(crate::state::recent_finished_max());
+    assert_eq!(data.recent_requests.len(), expected);
+    assert_eq!(data.summary.counts.recent_requests, expected);
+}
+
+#[tokio::test]
 async fn local_operator_capture_keeps_raw_session_ids_out_of_the_wire_model() {
     let proxy = proxy_service(make_helper_config(Vec::new(), RetryConfig::default()));
     let raw_session_id = "local-session-command-handle";
@@ -181,9 +203,9 @@ async fn local_operator_capture_keeps_raw_session_ids_out_of_the_wire_model() {
 
     assert_eq!(
         capture
-            .local_session_ids
+            .local_sessions
             .get(session_key)
-            .map(String::as_str),
+            .map(|session| session.raw_session_id.as_str()),
         Some(raw_session_id)
     );
     let serialized = serde_json::to_string(&capture.model).expect("serialize wire model");

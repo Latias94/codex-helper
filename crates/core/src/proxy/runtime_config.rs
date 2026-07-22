@@ -29,7 +29,14 @@ use crate::runtime_store::{ProviderPolicySnapshot, RuntimeStore};
 use crate::service_target::LocalCredentialRefreshStatus;
 use crate::state::{PreparedRoutingOperatorRouteGraph, ProxyState};
 use crate::usage_providers::{
-    credential_generation_catalog, usage_provider_source_revision_from_disk,
+    UsageProviderCatalog, UsageProviderCredentialCatalog, credential_generation_catalog,
+    usage_provider_source_revision_from_disk,
+};
+
+use super::settings_control::{
+    OperatorDefaultProfileMutationStatus, RuntimeDefaultProfileControlSnapshot,
+    RuntimeDefaultProfileControls, RuntimeDefaultProfileMutationError,
+    RuntimeDefaultProfileMutationExpectation, validate_target_profile,
 };
 
 const AUTH_FAILURE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -92,6 +99,8 @@ struct PreparedRuntimeSnapshot {
     provider_catalog: Arc<ProviderCatalogSnapshot>,
     operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
     credential_generation: Arc<CredentialGeneration>,
+    usage_provider_catalog: Arc<UsageProviderCatalog>,
+    default_profile_controls: RuntimeDefaultProfileControls,
     digest_seed: Sha256,
     loaded_at_ms: u64,
     source_stamp: RuntimeSourceStamp,
@@ -104,12 +113,14 @@ impl PreparedRuntimeSnapshot {
         source_stamp: RuntimeSourceStamp,
         credential_runtime: &CredentialRuntime,
     ) -> Result<Self> {
-        Self::build_with_previous(
+        let usage_provider_catalog = credential_generation_catalog(None);
+        Self::build_with_credential_catalog(
             config,
             operator_pricing_catalog,
             source_stamp,
             credential_runtime,
             None,
+            usage_provider_catalog,
         )
     }
 
@@ -119,22 +130,45 @@ impl PreparedRuntimeSnapshot {
         source_stamp: RuntimeSourceStamp,
         credential_runtime: &CredentialRuntime,
         previous_generation: &CredentialGeneration,
+        previous_usage_provider_catalog: &UsageProviderCatalog,
     ) -> Result<Self> {
-        Self::build_with_previous(
+        let usage_provider_catalog =
+            credential_generation_catalog(Some(previous_usage_provider_catalog));
+        Self::build_with_credential_catalog(
             config,
             operator_pricing_catalog,
             source_stamp,
             credential_runtime,
             Some(previous_generation),
+            usage_provider_catalog,
         )
     }
 
-    fn build_with_previous(
+    #[cfg(test)]
+    fn build_with_usage_provider_catalog_for_test(
+        config: Arc<HelperConfig>,
+        operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
+        source_stamp: RuntimeSourceStamp,
+        credential_runtime: &CredentialRuntime,
+        usage_provider_catalog: UsageProviderCredentialCatalog,
+    ) -> Result<Self> {
+        Self::build_with_credential_catalog(
+            config,
+            operator_pricing_catalog,
+            source_stamp,
+            credential_runtime,
+            None,
+            usage_provider_catalog,
+        )
+    }
+
+    fn build_with_credential_catalog(
         config: Arc<HelperConfig>,
         operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
         source_stamp: RuntimeSourceStamp,
         credential_runtime: &CredentialRuntime,
         previous_generation: Option<&CredentialGeneration>,
+        usage_provider_catalog: UsageProviderCredentialCatalog,
     ) -> Result<Self> {
         let source_config = TransientRuntimeConfig(match Arc::try_unwrap(config) {
             Ok(config) => config,
@@ -174,8 +208,8 @@ impl PreparedRuntimeSnapshot {
                         }),
                 )
         };
-        let (named_credentials, named_catalog_revision) =
-            credential_generation_catalog().into_parts();
+        let (named_credentials, named_catalog_revision, usage_provider_catalog) =
+            usage_provider_catalog.into_parts();
         let credential_generation = match previous_generation {
             Some(previous) => credential_runtime.build_generation_from_previous_with_named(
                 candidates(),
@@ -207,6 +241,7 @@ impl PreparedRuntimeSnapshot {
                 )?,
         );
         let provider_catalog = Arc::new(ProviderCatalogSnapshot::bundled());
+        let default_profile_controls = RuntimeDefaultProfileControls::from_config(config.as_ref())?;
         let digest_seed = runtime_snapshot_digest_seed(
             config.as_ref(),
             codex_route_graph.as_ref(),
@@ -223,6 +258,8 @@ impl PreparedRuntimeSnapshot {
             provider_catalog,
             operator_pricing_catalog,
             credential_generation,
+            usage_provider_catalog,
+            default_profile_controls,
             digest_seed,
             loaded_at_ms: now_ms(),
             source_stamp,
@@ -264,6 +301,8 @@ impl PreparedRuntimeSnapshot {
             provider_catalog: Arc::clone(&snapshot.provider_catalog),
             operator_pricing_catalog: Arc::clone(&snapshot.operator_pricing_catalog),
             credential_generation,
+            usage_provider_catalog: Arc::clone(&snapshot.usage_provider_catalog),
+            default_profile_controls: snapshot.default_profile_controls.clone(),
             digest_seed,
             loaded_at_ms: now_ms(),
             source_stamp: snapshot.source_stamp,
@@ -275,7 +314,11 @@ impl PreparedRuntimeSnapshot {
         provider_policy: Arc<ProviderPolicySnapshot>,
         revision: u64,
     ) -> RuntimeSnapshot {
-        let digest = runtime_snapshot_digest_from_seed(self.digest_seed.clone(), &provider_policy);
+        let digest = runtime_snapshot_digest_from_seed(
+            self.digest_seed.clone(),
+            &provider_policy,
+            &self.default_profile_controls,
+        );
         RuntimeSnapshot {
             config: self.config,
             codex_route_graph: self.codex_route_graph,
@@ -283,7 +326,9 @@ impl PreparedRuntimeSnapshot {
             provider_catalog: self.provider_catalog,
             operator_pricing_catalog: self.operator_pricing_catalog,
             credential_generation: self.credential_generation,
+            usage_provider_catalog: self.usage_provider_catalog,
             provider_policy,
+            default_profile_controls: self.default_profile_controls,
             revision,
             digest,
             digest_seed: self.digest_seed,
@@ -301,7 +346,9 @@ pub(super) struct RuntimeSnapshot {
     provider_catalog: Arc<ProviderCatalogSnapshot>,
     operator_pricing_catalog: Arc<CapturedModelPriceCatalog>,
     credential_generation: Arc<CredentialGeneration>,
+    usage_provider_catalog: Arc<UsageProviderCatalog>,
     provider_policy: Arc<ProviderPolicySnapshot>,
+    default_profile_controls: RuntimeDefaultProfileControls,
     revision: u64,
     digest: String,
     digest_seed: Sha256,
@@ -387,7 +434,11 @@ impl RuntimeSnapshot {
         revision: u64,
         loaded_at_ms: u64,
     ) -> Self {
-        let digest = runtime_snapshot_digest_from_seed(self.digest_seed.clone(), &provider_policy);
+        let digest = runtime_snapshot_digest_from_seed(
+            self.digest_seed.clone(),
+            &provider_policy,
+            &self.default_profile_controls,
+        );
         Self {
             config: Arc::clone(&self.config),
             codex_route_graph: Arc::clone(&self.codex_route_graph),
@@ -395,7 +446,9 @@ impl RuntimeSnapshot {
             provider_catalog: Arc::clone(&self.provider_catalog),
             operator_pricing_catalog: Arc::clone(&self.operator_pricing_catalog),
             credential_generation: Arc::clone(&self.credential_generation),
+            usage_provider_catalog: Arc::clone(&self.usage_provider_catalog),
             provider_policy,
+            default_profile_controls: self.default_profile_controls.clone(),
             revision,
             digest,
             digest_seed: self.digest_seed.clone(),
@@ -418,7 +471,11 @@ impl RuntimeSnapshot {
             operator_pricing_catalog.revision(),
             self.credential_generation.as_ref(),
         )?;
-        let digest = runtime_snapshot_digest_from_seed(digest_seed.clone(), &self.provider_policy);
+        let digest = runtime_snapshot_digest_from_seed(
+            digest_seed.clone(),
+            &self.provider_policy,
+            &self.default_profile_controls,
+        );
         Ok(Self {
             config: Arc::clone(&self.config),
             codex_route_graph: Arc::clone(&self.codex_route_graph),
@@ -426,7 +483,9 @@ impl RuntimeSnapshot {
             provider_catalog: Arc::clone(&self.provider_catalog),
             operator_pricing_catalog,
             credential_generation: Arc::clone(&self.credential_generation),
+            usage_provider_catalog: Arc::clone(&self.usage_provider_catalog),
             provider_policy: Arc::clone(&self.provider_policy),
+            default_profile_controls: self.default_profile_controls.clone(),
             revision,
             digest,
             digest_seed,
@@ -459,8 +518,48 @@ impl RuntimeSnapshot {
         Arc::clone(&self.credential_generation)
     }
 
+    pub(super) fn usage_provider_catalog(&self) -> Arc<UsageProviderCatalog> {
+        Arc::clone(&self.usage_provider_catalog)
+    }
+
     pub(super) fn provider_policy(&self) -> Arc<ProviderPolicySnapshot> {
         Arc::clone(&self.provider_policy)
+    }
+
+    pub(super) fn default_profile_control(
+        &self,
+        service_name: &str,
+    ) -> anyhow::Result<RuntimeDefaultProfileControlSnapshot> {
+        self.default_profile_controls.get(service_name).cloned()
+    }
+
+    fn with_default_profile_controls(
+        &self,
+        default_profile_controls: RuntimeDefaultProfileControls,
+        revision: u64,
+        loaded_at_ms: u64,
+    ) -> Self {
+        let digest = runtime_snapshot_digest_from_seed(
+            self.digest_seed.clone(),
+            &self.provider_policy,
+            &default_profile_controls,
+        );
+        Self {
+            config: Arc::clone(&self.config),
+            codex_route_graph: Arc::clone(&self.codex_route_graph),
+            claude_route_graph: Arc::clone(&self.claude_route_graph),
+            provider_catalog: Arc::clone(&self.provider_catalog),
+            operator_pricing_catalog: Arc::clone(&self.operator_pricing_catalog),
+            credential_generation: Arc::clone(&self.credential_generation),
+            usage_provider_catalog: Arc::clone(&self.usage_provider_catalog),
+            provider_policy: Arc::clone(&self.provider_policy),
+            default_profile_controls,
+            revision,
+            digest,
+            digest_seed: self.digest_seed.clone(),
+            loaded_at_ms,
+            source_stamp: self.source_stamp,
+        }
     }
 
     fn candidate_identities(&self) -> Result<Vec<RuntimeUpstreamIdentity>> {
@@ -628,6 +727,54 @@ impl RuntimeConfig {
             next_build_ticket: AtomicU64::new(1),
             policy_state: Some(Arc::clone(&state)),
             automatic_reload,
+        };
+        Ok((runtime, state))
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_usage_provider_catalog_for_test(
+        initial_config: Arc<HelperConfig>,
+        runtime_store: Arc<RuntimeStore>,
+        credential_sources: CredentialSourceCapabilities,
+        usage_provider_catalog: UsageProviderCredentialCatalog,
+    ) -> Result<(Self, Arc<ProxyState>)> {
+        let credential_runtime =
+            CredentialRuntime::from_runtime_store(credential_sources, runtime_store.as_ref())?;
+        let operator_pricing_catalog = try_capture_operator_model_price_catalog()
+            .map(Arc::new)
+            .map_err(anyhow::Error::msg)
+            .context("load initial operator pricing catalog")?;
+        let source_stamp = runtime_source_stamp_from_disk_sync();
+        let prepared = PreparedRuntimeSnapshot::build_with_usage_provider_catalog_for_test(
+            initial_config,
+            operator_pricing_catalog,
+            source_stamp,
+            &credential_runtime,
+            usage_provider_catalog,
+        )?;
+        let provider_policy = Arc::new(
+            runtime_store
+                .reconcile_runtime_upstream_identities(&prepared.candidate_identities()?, now_ms())
+                .context("reconcile initial runtime upstream identities")?,
+        );
+        let state = ProxyState::new_with_runtime_store(runtime_store)?;
+        let initial = prepared.finish(provider_policy, 1);
+        let runtime = Self {
+            current: RwLock::new(Arc::new(initial)),
+            credential_runtime,
+            pending_credential_refresh: Mutex::new(BTreeMap::new()),
+            recent_auth_refresh: Mutex::new(BTreeMap::new()),
+            credential_refresh_notify: Notify::new(),
+            credential_refresh_wait_epoch: AtomicU64::new(0),
+            reload_check: AsyncMutex::new(RuntimeConfigReloadCheckState {
+                last_check_at: Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .unwrap_or_else(Instant::now),
+            }),
+            publish: AsyncMutex::new(RuntimeConfigPublishState::default()),
+            next_build_ticket: AtomicU64::new(1),
+            policy_state: Some(Arc::clone(&state)),
+            automatic_reload: RuntimeAutomaticReload::unchanged(source_stamp),
         };
         Ok((runtime, state))
     }
@@ -1171,13 +1318,14 @@ impl RuntimeConfig {
         let ticket = self.reserve_build_ticket();
         let (loaded, source_stamp) = source().await?;
         let operator_pricing_catalog = pricing().await?;
-        let previous_generation = self.capture_current().credential_generation();
+        let previous = self.capture_current();
         let prepared = prepare_runtime_snapshot(
             loaded,
             source_stamp,
             operator_pricing_catalog,
             self.credential_runtime.clone(),
-            previous_generation,
+            previous.credential_generation(),
+            previous.usage_provider_catalog(),
         )
         .await?;
         self.publish_prepared(ticket, prepared).await
@@ -1221,13 +1369,14 @@ impl RuntimeConfig {
         let ticket = self.reserve_build_ticket();
         let loaded = loader().await?;
         let operator_pricing_catalog = pricing().await?;
-        let previous_generation = self.capture_current().credential_generation();
+        let previous = self.capture_current();
         let prepared = prepare_runtime_snapshot(
             loaded,
             source_stamp,
             operator_pricing_catalog,
             self.credential_runtime.clone(),
-            previous_generation,
+            previous.credential_generation(),
+            previous.usage_provider_catalog(),
         )
         .await?;
         self.publish_prepared(ticket, prepared).await
@@ -1250,7 +1399,7 @@ impl RuntimeConfig {
     async fn publish_prepared_with_expected(
         &self,
         ticket: u64,
-        prepared: PreparedRuntimeSnapshot,
+        mut prepared: PreparedRuntimeSnapshot,
         expected: Option<&Arc<RuntimeSnapshot>>,
     ) -> Result<PreparedRuntimePublishOutcome> {
         let mut publish_state = self.publish.lock().await;
@@ -1262,6 +1411,9 @@ impl RuntimeConfig {
         if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &previous)) {
             return Ok(PreparedRuntimePublishOutcome::Stale);
         }
+        prepared.default_profile_controls = previous
+            .default_profile_controls
+            .reconciled_for_config(prepared.config.as_ref(), now_ms())?;
         publish_state.highest_publish_ticket = ticket;
         let next_identities = prepared.candidate_identities()?;
         let routing_control_graphs = [
@@ -1309,6 +1461,51 @@ impl RuntimeConfig {
             self.store_current(next);
             Ok(PreparedRuntimePublishOutcome::Published { changed })
         }
+    }
+
+    pub(super) async fn mutate_runtime_default_profile(
+        &self,
+        service_name: &str,
+        expected: RuntimeDefaultProfileMutationExpectation,
+        runtime_override: Option<String>,
+    ) -> std::result::Result<OperatorDefaultProfileMutationStatus, RuntimeDefaultProfileMutationError>
+    {
+        let _publisher_guard = self.publish.lock().await;
+        let previous = self.capture_current();
+        let config = previous.config();
+        let view =
+            super::control_plane_service::service_route_config(config.as_ref(), service_name);
+        let control = previous.default_profile_control(service_name)?;
+        if expected.profile_catalog_key != control.profile_catalog_key
+            || expected.control_revision != control.control_revision
+            || expected.configured_profile != view.default_profile
+            || expected.runtime_profile != control.runtime_override
+        {
+            return Err(RuntimeDefaultProfileMutationError::Conflict);
+        }
+        validate_target_profile(view, runtime_override.as_deref()).map_err(|error| {
+            RuntimeDefaultProfileMutationError::InvalidTarget(error.to_string())
+        })?;
+        if control.runtime_override == runtime_override {
+            return Ok(OperatorDefaultProfileMutationStatus::Unchanged);
+        }
+
+        let now_ms = now_ms();
+        let controls = previous.default_profile_controls.with_runtime_override(
+            service_name,
+            runtime_override,
+            now_ms,
+        )?;
+        let next = previous.with_default_profile_controls(
+            controls,
+            previous.revision().saturating_add(1),
+            now_ms,
+        );
+        self.store_current(next);
+        if let Some(policy_state) = self.policy_state.as_ref() {
+            policy_state.notify_runtime_snapshot_changed();
+        }
+        Ok(OperatorDefaultProfileMutationStatus::Applied)
     }
 
     pub(super) async fn publish_provider_policy(
@@ -1460,6 +1657,7 @@ async fn prepare_runtime_snapshot(
     operator_pricing_catalog: CapturedModelPriceCatalog,
     credential_runtime: CredentialRuntime,
     previous_generation: Arc<CredentialGeneration>,
+    previous_usage_provider_catalog: Arc<UsageProviderCatalog>,
 ) -> Result<PreparedRuntimeSnapshot> {
     tokio::task::spawn_blocking(move || {
         PreparedRuntimeSnapshot::build_from_previous(
@@ -1468,6 +1666,7 @@ async fn prepare_runtime_snapshot(
             source_stamp,
             &credential_runtime,
             previous_generation.as_ref(),
+            previous_usage_provider_catalog.as_ref(),
         )
     })
     .await
@@ -1506,7 +1705,12 @@ fn runtime_snapshot_digest(
         operator_pricing_revision,
         CredentialGeneration::empty().as_ref(),
     )?;
-    Ok(runtime_snapshot_digest_from_seed(seed, provider_policy))
+    let default_profile_controls = RuntimeDefaultProfileControls::from_config(config)?;
+    Ok(runtime_snapshot_digest_from_seed(
+        seed,
+        provider_policy,
+        &default_profile_controls,
+    ))
 }
 
 fn runtime_snapshot_digest_seed(
@@ -1542,8 +1746,28 @@ fn runtime_snapshot_digest_seed(
 fn runtime_snapshot_digest_from_seed(
     mut hasher: Sha256,
     provider_policy: &ProviderPolicySnapshot,
+    default_profile_controls: &RuntimeDefaultProfileControls,
 ) -> String {
     hash_digest_part(&mut hasher, &provider_policy.policy_revision.to_be_bytes());
+    for (service_name, control) in default_profile_controls.entries() {
+        hash_digest_part(&mut hasher, service_name.as_bytes());
+        hash_digest_part(&mut hasher, &control.control_revision.to_be_bytes());
+        match control.runtime_override.as_deref() {
+            Some(profile_name) => {
+                hash_digest_part(&mut hasher, b"runtime-override:some");
+                hash_digest_part(&mut hasher, profile_name.as_bytes());
+            }
+            None => hash_digest_part(&mut hasher, b"runtime-override:none"),
+        }
+        hash_digest_part(&mut hasher, control.profile_catalog_key.as_bytes());
+        match control.updated_at_ms {
+            Some(updated_at_ms) => {
+                hash_digest_part(&mut hasher, b"updated-at:some");
+                hash_digest_part(&mut hasher, &updated_at_ms.to_be_bytes());
+            }
+            None => hash_digest_part(&mut hasher, b"updated-at:none"),
+        }
+    }
     format!("sha256:{:x}", hasher.finalize())
 }
 

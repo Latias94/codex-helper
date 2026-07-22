@@ -323,6 +323,85 @@ async fn proxy_forwards_responses_compact_to_upstream_v1_compact_path() {
 }
 
 #[tokio::test]
+async fn compact_sse_missing_terminal_cools_only_remote_compaction_capability() {
+    let inference_hits = Arc::new(AtomicUsize::new(0));
+    let inference_hits_for_route = Arc::clone(&inference_hits);
+    let upstream = spawn_test_upstream(
+        axum::Router::new()
+            .route(
+                "/v1/responses/compact",
+                post(|| async {
+                    let mut response = Response::new(Body::from(
+                        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-compact-incomplete\"}}\n\n",
+                    ));
+                    response.headers_mut().insert(
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    response
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let inference_hits = Arc::clone(&inference_hits_for_route);
+                    async move {
+                        inference_hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "id": "resp-inference-after-compact-failure",
+                            "object": "response",
+                            "output": []
+                        }))
+                    }
+                }),
+            ),
+    );
+    let config = make_helper_config(
+        vec![upstream.upstream_config()],
+        retry_config_with_cooldowns(1, "", Vec::new(), RetryStrategy::Failover, 0, 0, 30),
+    );
+    let service = proxy_service(config);
+    let state = Arc::clone(&service.state);
+    let proxy = spawn_proxy_service(service);
+    let client = reqwest::Client::new();
+
+    let compact = client
+        .post(proxy.compact_url())
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(r#"{"model":"gpt-5","input":[{"type":"reasoning","encrypted_content":"state"}]}"#)
+        .send()
+        .await
+        .expect("send streaming compact request");
+    assert_eq!(compact.status(), StatusCode::OK);
+    let compact_body = compact.text().await.expect("drain compact failure event");
+    assert!(compact_body.contains("response.failed"), "{compact_body}");
+    assert!(
+        compact_body.contains("upstream_stream_error"),
+        "{compact_body}"
+    );
+
+    let runtime = state
+        .route_plan_runtime_state_for_provider_endpoints("codex")
+        .await;
+    let inference_health = runtime.provider_endpoint(
+        &crate::runtime_identity::ProviderEndpointKey::new("codex", "test", "default"),
+    );
+    assert_eq!(inference_health.failure_count, 0);
+    assert!(!inference_health.cooldown_active);
+
+    let inference = client
+        .post(proxy.responses_url())
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","input":"inference remains healthy"}"#)
+        .send()
+        .await
+        .expect("send inference after compact stream failure");
+    assert_eq!(inference.status(), StatusCode::OK);
+    assert_eq!(inference_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn proxy_normalizes_responses_compact_body_before_forwarding() {
     let upstream_body = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
 
@@ -720,7 +799,7 @@ async fn proxy_uses_official_session_id_affinity_for_responses_compact() {
         }),
         "finished requests should preserve official header session source"
     );
-    let cards = state.list_session_identity_cards(20).await;
+    let cards = state.list_session_identity_cards("codex", 20).await;
     let card = cards
         .iter()
         .find(|card| card.session_id.as_deref() == Some("sid-official"))
@@ -1605,6 +1684,22 @@ async fn proxy_does_not_provider_failover_responses_compact_after_affinity_failu
     assert_eq!(b_compact_hits.load(Ordering::SeqCst), 1);
     assert_eq!(c_compact_hits.load(Ordering::SeqCst), 0);
 
+    let inference = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("session-id", "sid-compact-failure")
+        .body(r#"{"model":"gpt-5","input":"still healthy"}"#)
+        .send()
+        .await
+        .expect("send inference after compact failure")
+        .error_for_status()
+        .expect("inference remains routable")
+        .json::<serde_json::Value>()
+        .await
+        .expect("inference json");
+    assert_eq!(inference["provider"].as_str(), Some("b"));
+    assert_eq!(b_responses_hits.load(Ordering::SeqCst), 2);
+
     proxy_handle.abort();
     b_handle.abort();
     c_handle.abort();
@@ -2435,15 +2530,17 @@ async fn proxy_allows_remote_compaction_v2_without_route_affinity_under_fallback
 
     assert_eq!(compact.status(), StatusCode::OK);
     let body = compact
-        .json::<serde_json::Value>()
+        .text()
         .await
-        .expect("remote compaction response json");
-    assert_eq!(body["provider"].as_str(), Some("b"));
-    assert_eq!(body["compact_v2"].as_bool(), Some(true));
+        .expect("remote compaction response body");
+    assert!(
+        body.contains("event: response.output_item.done") && body.contains("summary-b"),
+        "expected downgraded compact SSE, got: {body}"
+    );
     assert_eq!(fixture.hits("b", transport), 1);
     assert_eq!(
         fixture.hits("b", CompactPolicyTransport::ResponsesCompact),
-        0
+        1
     );
     assert_eq!(fixture.hits("c", transport), 0);
 
@@ -2452,11 +2549,321 @@ async fn proxy_allows_remote_compaction_v2_without_route_affinity_under_fallback
         compact_record["codex_bridge"]["remote_compaction_v2_request"].as_bool(),
         Some(true)
     );
+    assert_eq!(
+        compact_record["codex_bridge"]["remote_compaction_v1_request"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        compact_record["codex_bridge"]["downgraded_to_responses_compact"].as_bool(),
+        Some(true)
+    );
     fixture.assert_affinity_provider(session_id, "b").await;
 }
 
 #[tokio::test]
-async fn proxy_preserves_remote_compaction_v2_response_without_helper_downgrade() {
+async fn proxy_downgrades_remote_compaction_v2_success_shape_and_normalizes_v1_body() {
+    let responses_hits = Arc::new(AtomicUsize::new(0));
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+    let compact_body = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+
+    let responses_counter = responses_hits.clone();
+    let compact_counter = compact_hits.clone();
+    let compact_body_seen = compact_body.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move || {
+                let responses_counter = responses_counter.clone();
+                async move {
+                    responses_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "provider": "plain", "ok": true })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move |body: axum::body::Bytes| {
+                let compact_counter = compact_counter.clone();
+                let compact_body_seen = compact_body_seen.clone();
+                async move {
+                    compact_counter.fetch_add(1, Ordering::SeqCst);
+                    *compact_body_seen.lock().expect("body lock") =
+                        Some(serde_json::from_slice(&body).expect("compact body json"));
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": "resp_compact_plain",
+                            "output": [
+                                { "type": "compaction", "encrypted_content": "summary-plain" }
+                            ]
+                        })),
+                    )
+                }
+            }),
+        );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_helper_config(
+        vec![upstream.upstream_config()],
+        retry_config(1, "502", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = spawn_test_proxy(cfg);
+
+    let resp = post_responses_json(
+        &reqwest::Client::new(),
+        &proxy,
+        CompactPolicyTransport::RemoteCompactionV2.request_body(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = resp.text().await.expect("sse body");
+    assert!(
+        body.contains("event: response.output_item.done")
+            && body.contains(r#""type":"compaction""#)
+            && body.contains("summary-plain"),
+        "expected synthesized remote_compaction_v2 SSE, got: {body}"
+    );
+    assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+
+    let forwarded = compact_body
+        .lock()
+        .expect("body lock")
+        .clone()
+        .expect("forwarded compact body");
+    assert!(forwarded.get("stream").is_none());
+    let input = forwarded["input"].as_array().expect("compact input array");
+    assert_eq!(input.len(), 1);
+    assert!(!input.iter().any(|item| {
+        item.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
+    }));
+}
+
+#[tokio::test]
+async fn proxy_downgrades_explicit_remote_compaction_v2_unsupported_status() {
+    let responses_hits = Arc::new(AtomicUsize::new(0));
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+
+    let responses_counter = responses_hits.clone();
+    let compact_counter = compact_hits.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move || {
+                let responses_counter = responses_counter.clone();
+                async move {
+                    responses_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": { "message": "compaction_trigger is not supported" }
+                        })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move || {
+                let compact_counter = compact_counter.clone();
+                async move {
+                    compact_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": "resp_compact_unsupported",
+                            "output": [
+                                { "type": "compaction", "encrypted_content": "summary-unsupported" }
+                            ]
+                        })),
+                    )
+                }
+            }),
+        );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_helper_config(
+        vec![upstream.upstream_config()],
+        retry_config(1, "", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = spawn_test_proxy(cfg);
+
+    let resp = post_responses_json(
+        &reqwest::Client::new(),
+        &proxy,
+        CompactPolicyTransport::RemoteCompactionV2.request_body(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("sse body");
+    assert!(
+        body.contains("summary-unsupported"),
+        "expected v1 compact fallback SSE, got: {body}"
+    );
+    assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn proxy_returns_response_failed_sse_when_remote_v2_downgrade_fails() {
+    let responses_hits = Arc::new(AtomicUsize::new(0));
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+
+    let responses_counter = responses_hits.clone();
+    let compact_counter = compact_hits.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move || {
+                let responses_counter = responses_counter.clone();
+                async move {
+                    responses_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "provider": "plain", "ok": true })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move || {
+                let compact_counter = compact_counter.clone();
+                async move {
+                    compact_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": { "message": "compact failed" }
+                        })),
+                    )
+                }
+            }),
+        );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_helper_config(
+        vec![upstream.upstream_config()],
+        retry_config(1, "", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = spawn_test_proxy(cfg);
+
+    let resp = post_responses_json(
+        &reqwest::Client::new(),
+        &proxy,
+        CompactPolicyTransport::RemoteCompactionV2.request_body(),
+    )
+    .await;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let body = resp.text().await.expect("error body");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected response body: {body}; responses_hits={}; compact_hits={}",
+        responses_hits.load(Ordering::SeqCst),
+        compact_hits.load(Ordering::SeqCst),
+    );
+    assert_eq!(content_type.as_deref(), Some("text/event-stream"));
+    assert!(
+        body.contains("event: response.failed") && body.contains("compact failed"),
+        "expected compact failure SSE, got: {body}"
+    );
+    assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn proxy_retries_only_the_v1_request_after_remote_v2_downgrade() {
+    let responses_hits = Arc::new(AtomicUsize::new(0));
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+
+    let responses_counter = responses_hits.clone();
+    let compact_counter = compact_hits.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/v1/responses",
+            post(move || {
+                let responses_counter = responses_counter.clone();
+                async move {
+                    responses_counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "provider": "plain", "ok": true })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(move || {
+                let compact_counter = compact_counter.clone();
+                async move {
+                    let attempt = compact_counter.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": { "message": "retry compact" }
+                            })),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": "resp_compact_retry",
+                            "output": [
+                                { "type": "compaction", "encrypted_content": "summary-retry" }
+                            ]
+                        })),
+                    )
+                }
+            }),
+        );
+    let upstream = spawn_test_upstream(upstream);
+    let cfg = make_helper_config(
+        vec![upstream.upstream_config()],
+        retry_config(2, "502", Vec::new(), RetryStrategy::Failover),
+    );
+    let proxy = spawn_test_proxy(cfg);
+
+    let resp = post_responses_json(
+        &reqwest::Client::new(),
+        &proxy,
+        CompactPolicyTransport::RemoteCompactionV2.request_body(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("retry fallback SSE");
+    assert!(body.contains("summary-retry"), "unexpected body: {body}");
+    assert_eq!(
+        responses_hits.load(Ordering::SeqCst),
+        1,
+        "the original v2 request must never be replayed after fallback"
+    );
+    assert_eq!(
+        compact_hits.load(Ordering::SeqCst),
+        2,
+        "configured same-upstream retries must stay on the v1 compact request"
+    );
+}
+
+#[tokio::test]
+async fn proxy_preserves_remote_compaction_v2_response_when_downgrade_is_disabled() {
     let responses_hits = Arc::new(AtomicUsize::new(0));
     let compact_hits = Arc::new(AtomicUsize::new(0));
 
@@ -2507,6 +2914,9 @@ async fn proxy_preserves_remote_compaction_v2_response_without_helper_downgrade(
             routing: Some(RouteGraphConfig::ordered_failover(vec![
                 "plain".to_string(),
             ])),
+            compaction: Some(crate::config::CodexCompactionConfig {
+                remote_v2_downgrade: false,
+            }),
             ..ServiceRouteConfig::default()
         },
         ..HelperConfig::default()
@@ -3088,9 +3498,12 @@ async fn proxy_waits_short_affinity_cooldown_before_responses_compact_under_hard
     assert_eq!(b_responses_hits.load(Ordering::SeqCst), 1);
 
     state
-        .penalize_runtime_upstream_attempt(
+        .penalize_runtime_upstream_attempt_for_domain(
             "codex",
             &b_identity,
+            crate::endpoint_health::RuntimeHealthDomain::Capability(
+                crate::endpoint_health::RouteCapability::RemoteCompaction,
+            ),
             1,
             crate::endpoint_health::CooldownBackoff {
                 factor: 1,
@@ -3115,9 +3528,10 @@ async fn proxy_waits_short_affinity_cooldown_before_responses_compact_under_hard
         .expect("compact json");
 
     assert_eq!(compact["provider"].as_str(), Some("b"));
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() >= Duration::from_secs(1),
-        "compact should wait out the short affinity cooldown"
+        elapsed >= Duration::from_secs(1),
+        "compact should wait out the short affinity cooldown, elapsed={elapsed:?}"
     );
     assert_eq!(b_compact_hits.load(Ordering::SeqCst), 1);
     assert_eq!(c_compact_hits.load(Ordering::SeqCst), 0);
@@ -3312,7 +3726,7 @@ async fn proxy_uses_prompt_cache_key_affinity_when_session_headers_are_absent() 
         }),
         "finished requests should preserve prompt_cache_key session source"
     );
-    let cards = state.list_session_identity_cards(20).await;
+    let cards = state.list_session_identity_cards("codex", 20).await;
     let card = cards
         .iter()
         .find(|card| card.session_id.as_deref() == Some("pcache-affinity"))
