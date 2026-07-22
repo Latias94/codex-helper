@@ -13,6 +13,10 @@ use super::{ProxyControlError, ProxyService};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum OperatorSessionAffinityCommand {
+    Bind {
+        provider_id: String,
+        endpoint_id: String,
+    },
     Rebind {
         provider_id: String,
         endpoint_id: String,
@@ -55,6 +59,15 @@ pub(super) async fn mutate_operator_session_affinity(
     {
         return Err(bad_request("expected_affinity_revision is empty"));
     }
+    if matches!(
+        &request.command,
+        OperatorSessionAffinityCommand::Bind { .. }
+    ) && request.expected_affinity_revision.is_some()
+    {
+        return Err(bad_request(
+            "session affinity bind requires expected_affinity_revision to be omitted",
+        ));
+    }
 
     let operator_capture = proxy.operator_read_capture().await?;
     let session_id = operator_capture
@@ -78,20 +91,45 @@ pub(super) async fn mutate_operator_session_affinity(
 
     let command = match &request.command {
         OperatorSessionAffinityCommand::Clear => SessionRouteAffinityControlCommand::Clear,
+        OperatorSessionAffinityCommand::Bind {
+            provider_id,
+            endpoint_id,
+        } => {
+            let route_graph_key = template.route_graph_key();
+            validate_operator_affinity_topology(&template, "bind")?;
+            if let Some(current) = current.as_ref() {
+                return Ok(response(
+                    OperatorSessionAffinityMutationStatus::Conflict,
+                    session_key,
+                    Some(current),
+                ));
+            }
+            let target_candidate = candidate(
+                &template,
+                required_value(provider_id, "provider_id")?,
+                required_value(endpoint_id, "endpoint_id")?,
+            )?;
+            validate_target_available(
+                proxy,
+                runtime_snapshot.as_ref(),
+                &template,
+                target_candidate,
+            )
+            .await?;
+            SessionRouteAffinityControlCommand::Bind(SessionRouteAffinityTarget {
+                route_graph_key,
+                session_identity_source: None,
+                provider_endpoint: template.candidate_provider_endpoint_key(target_candidate),
+                upstream_base_url: target_candidate.base_url.clone(),
+                route_path: target_candidate.route_path.clone(),
+            })
+        }
         OperatorSessionAffinityCommand::Rebind {
             provider_id,
             endpoint_id,
         } => {
             let route_graph_key = template.route_graph_key();
-            if template
-                .nodes
-                .values()
-                .any(|node| node.strategy == RouteStrategy::Conditional)
-            {
-                return Err(conflict(
-                    "ambiguous_conditional_topology: session affinity rebind is unavailable for conditional routes",
-                ));
-            }
+            validate_operator_affinity_topology(&template, "rebind")?;
             let current = current.as_ref().ok_or_else(|| {
                 conflict("session has no route affinity to rebind; allow automatic first selection")
             })?;
@@ -125,28 +163,56 @@ pub(super) async fn mutate_operator_session_affinity(
         }
     };
 
-    let commit = proxy
-        .state
-        .compare_and_mutate_session_route_affinity_with_control(
-            &route_control_guard,
-            request.expected_affinity_revision.as_deref(),
-            command,
-            crate::logging::now_ms(),
-        )
+    let Some(commit) = proxy
+        .config
+        .commit_if_snapshot_current(&runtime_snapshot, || {
+            proxy
+                .state
+                .compare_and_mutate_session_route_affinity_with_control(
+                    &route_control_guard,
+                    request.expected_affinity_revision.as_deref(),
+                    command,
+                    crate::logging::now_ms(),
+                )
+        })
         .await
-        .map_err(|error| {
-            tracing::error!(
-                session_key,
-                error = %error,
-                "failed to commit operator session affinity mutation"
-            );
-            ProxyControlError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "session affinity mutation unavailable",
-            )
-        })?;
+    else {
+        let current = proxy.state.get_session_route_affinity(&session_id).await;
+        return Ok(response(
+            OperatorSessionAffinityMutationStatus::Conflict,
+            session_key,
+            current.as_ref(),
+        ));
+    };
+    let commit = commit.map_err(|error| {
+        tracing::error!(
+            session_key,
+            error = %error,
+            "failed to commit operator session affinity mutation"
+        );
+        ProxyControlError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session affinity mutation unavailable",
+        )
+    })?;
     let status = commit.status.into();
     Ok(response(status, session_key, commit.affinity.as_ref()))
+}
+
+fn validate_operator_affinity_topology(
+    template: &RoutePlanTemplate,
+    operation: &str,
+) -> Result<(), ProxyControlError> {
+    if template
+        .nodes
+        .values()
+        .any(|node| node.strategy == RouteStrategy::Conditional)
+    {
+        return Err(conflict(format!(
+            "ambiguous_conditional_topology: session affinity {operation} is unavailable for conditional routes"
+        )));
+    }
+    Ok(())
 }
 
 fn candidate<'a>(

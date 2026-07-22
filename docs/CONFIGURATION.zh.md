@@ -134,9 +134,15 @@ codex-helper switch on --preset official-imagegen --compaction remote-v2 --respo
 codex-helper switch on --translate-models=false --hosted-image-generation disabled
 codex-helper switch status
 codex-helper switch off
+codex-helper switch on --claude                 # http://127.0.0.1:3210
+codex-helper switch on --claude --base-url https://relay.example
+codex-helper switch status --claude
+codex-helper switch off --claude
 ```
 
 `switch on` 会加载下文 `[codex.client_patch]` 的完整声明，记录原 selector、helper stanza、相关 feature flags，以及 preset 需要时的 auth facade，然后应用 helper 自有的 `model_providers.codex_proxy`。`switch off` 会解析当前有效 TOML，只恢复该 patch 实际拥有的 `model_provider`、`model_providers.codex_proxy` 和 feature keys；其它 provider entry、feature sibling、project、注释及运行期编辑保持当前值。受管字段冲突、TOML/type 无效或最终 capture 后文件又变化时会进入 `recovery_required`，no-replace CAS 不会覆盖竞争文件。恢复 journal 位于 `~/.codex-helper/state/`；auth 使用下文更严格的 facade 契约，认证型 patch 关闭后仍保留恢复点并显示 `Off`，用于修复 Codex 随后重写的语义等价 facade。
+
+`switch ... --claude` 是独立的本机兼容生命周期，只接受 `--port` / `--base-url`，拒绝 Codex preset、compaction、Responses WebSocket、`/models` 翻译和 hosted-image overrides。原 Claude settings 保存在私有 raw backup；私有 sidecar 只保存原始/应用后指纹、helper target、缺文件标记和不含凭据的前台代次。`switch off --claude` 只有在当前 settings 仍等于 helper 应用的投影时才恢复，外部编辑会原样保留并失败关闭。0.20.3 留下的 raw backup 只有在当前文件可验证为对应旧 helper patch 时才会被接管。前台 `ch --claude` 在本地 listener 就绪后应用该临时 patch，仅在仍拥有该代次时恢复，后来的显式或另一个前台切换会被保留；普通 `codex-helper`、resident/supervisor/desktop 和已安装 service 均不隐式修改 Claude settings。
 
 Client patch 只决定 Codex 客户端是否愿意暴露对应能力，并不证明所选 relay 真能处理请求。例如 official preset 可能让 Codex 调用 `/responses/compact` 或发起 WebSocket，imagegen preset 可能产生 hosted image-generation 流量；relay 契约需要另行验证。helper 生成的精确 actor marker 会在每次 HTTP 或 WebSocket 上游握手前于本地消费，不会转发。真实 actor-authorization 值只允许在“未配置 helper 凭据且目标为 OpenAI 官方源站”时透传；第三方或 helper-authenticated route 会剥离它。两类值在请求诊断中都会脱敏。
 
@@ -973,6 +979,8 @@ codex-helper service status --json
 
 只有平台 service manager 明确证明不存在任何注册时，缺失 receipt 才会被视为首次安装。平台注册仍存在但 receipt 缺失、receipt 属于旧 schema，或平台查询结果不确定时，都会在修改任何 service 文件前失败关闭。请使用创建该注册的兼容 helper 版本卸载，或显式修复/迁移匹配的 receipt。由更高版本 helper 写入的 receipt 会标记为 `unsupported` 而不是 `legacy`，应升级当前检查 binary，不能猜测新 schema 的目标。
 
+macOS/Linux 的当前 receipt 还记录 canonical daemon executable。每次 `service install/start/stop/restart/uninstall` 变更前，helper 都会从 receipt 重建完整 LaunchAgent plist 或 systemd user unit，并与磁盘字节及 manager 注册核对。macOS 已加载 job 必须来自预期 plist；Linux 必须是同一 `FragmentPath`、`LoadState=loaded`、`UnitFileState=enabled`、无 drop-in 且 `NeedDaemonReload=no`。定义缺失、被编辑、外部同名注册或 manager 尚未 reload 都失败关闭且不停止现有 runtime。正常 binary relocation 由 `service install` 先按旧 receipt 验证旧定义，再发布当前 executable 的新定义和 receipt；不能让新路径自行证明一个不匹配的旧定义。
+
 显式执行 `service stop` 会先恢复匹配的 helper-managed Codex switch，再停止 runtime。`service restart` 则刻意保留 switch，因为同一个已验证 target 预期会恢复；若 restart 失败，命令会保留清晰错误与已停止状态，不会静默改写客户端文件。
 
 默认的 `service uninstall` 会先精确恢复确实由 helper 管理、且指向该 service 的 Codex switch，再停止 runtime。随后它以事务方式停止并验证 runtime、移除平台自动启动注册与 definition，最后移除 install receipt。若可逆的平台步骤失败，只要仍能证明原快照，就会恢复之前的注册、definition、receipt 和 running/stopped 状态。若客户端 switch 已经成功恢复，而后续平台卸载失败，Codex 会保持 Off；自动重新套用 proxy 可能覆盖并发的客户端编辑。receipt 缺失、旧版、未来版本或无法唯一反推出 service target 时，默认卸载会失败关闭；请使用兼容 helper 版本卸载，或显式修复/迁移匹配的 receipt，再重试默认卸载。
@@ -1440,10 +1448,10 @@ CODEX_HELPER_HTTP_DEBUG_SPLIT=1
 
 - `CODEX_HELPER_HTTP_DEBUG=1` 开启完整 HTTP 诊断；默认只记录最终失败的请求，包括 HTTP 200 但以 `response.failed` 结束的 SSE。
 - `CODEX_HELPER_HTTP_DEBUG_ALL=1` 在 debug 已开启时记录成功和失败请求。不开启时不会为成功请求写完整正文。
-- `CODEX_HELPER_HTTP_LOG_REQUEST_BODY=1` 才会保存 client request body 和实际 upstream request body；默认关闭。响应正文随对应的 debug/warn 记录捕获。
+- `CODEX_HELPER_HTTP_LOG_REQUEST_BODY=1` 才会保存 client request body 和实际 upstream request body；默认关闭。响应正文只随显式 HTTP debug 记录捕获。
 - `CODEX_HELPER_HTTP_DEBUG_BODY_MAX` 是普通请求/响应 preview 上限，默认 64 KiB。示例中的 1 MiB 只适合短期排障。
 - `CODEX_HELPER_HTTP_DEBUG_SPLIT=1` 把大块 `http_debug` 写入 `requests_debug.jsonl`，并在 `requests.jsonl` 留引用；当前默认就是分文件。
-- 非成功响应默认还会生成最多 8 KiB 的小型 warn preview；可用 `CODEX_HELPER_HTTP_WARN=0` 关闭，或用 `CODEX_HELPER_HTTP_WARN_BODY_MAX` 修改上限。该 warn 开关不决定是否保存请求正文。
+- 非成功响应默认还会生成 header-only warn 诊断；可用 `CODEX_HELPER_HTTP_WARN=0` 关闭。为兼容既有环境保留 `CODEX_HELPER_HTTP_WARN_BODY_MAX`，但 warn 不会保存请求或响应正文。
 
 普通 buffered HTTP 响应、连接/读取失败和 SSE terminal failure 都会进入这条链路。SSE 使用尾部环形窗口而不是缓存无限流；`CODEX_HELPER_STREAM_BUFFER_MAX_BYTES` 默认为 1 MiB，可配置范围为 64 KiB 到 32 MiB。被截断的记录带有准确的 `original_len`、`truncated = true` 和 `window = "tail"`。WebSocket frame payload 不属于这个 HTTP 日志功能，不会被记录。
 
@@ -1451,7 +1459,7 @@ CODEX_HELPER_HTTP_DEBUG_SPLIT=1
 
 - `Authorization`、cookies、`api-key`、`x-api-key`、`x-auth-token` 以及匹配 `*-token`、`*-secret`、`*-password`、`*-private-key` 的请求头始终写成 `[REDACTED]`；被 HTTP 库标记为 sensitive 的其它头也会脱敏。
 - `client_uri` 只保存 path，query、fragment、userinfo 不会进入日志；upstream 只保存 origin。
-- 请求体和响应体**不会做 JSON 字段级脱敏**。它们可能包含 prompt、代码、文件内容或业务 secret，只应短期开启，并在排障后关闭和清理相应日志。
+- 请求体和响应体**不会做通用 JSON 字段级脱敏**。显式 HTTP debug 会按实际敏感请求头的值脱敏上游响应回显，但它们仍可能包含 prompt、代码、文件内容或业务 secret；只应短期开启，并在排障后关闭和清理相应日志。
 - Unix 当前 active log 会创建或修复为 `0600`；Windows 日志目录和 active file 会应用当前用户私有 DACL。它们不能代替磁盘加密、主机访问控制或日志保留策略。
 
 这些开关按 helper 进程生命周期读取。前台排障应在同一个 shell 设置变量后再启动 helper。已安装的 Scheduled Task、LaunchAgent 或 systemd user service 不会捕获后来设置的临时 shell 变量；修改其真实持久环境后必须重启。Windows 上，正在运行的 task 看不到启动后才设置的 PowerShell `$env:`；最可预测的短期排障方式是停止 service，在当前 PowerShell 设置变量并以前台模式启动 helper。

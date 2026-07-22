@@ -2,9 +2,9 @@ use std::ffi::OsStr;
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -81,9 +81,10 @@ impl ProcessFixture {
         }
     }
 
-    fn run_serve(&self, binary: impl AsRef<OsStr>, port: u16) -> Output {
+    fn serve_command(&self, binary: impl AsRef<OsStr>, port: u16) -> Command {
         let port = port.to_string();
-        Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .args([
                 "serve",
                 "--codex",
@@ -101,9 +102,20 @@ impl ProcessFixture {
             .env_remove("CODEX_HELPER_ADMIN_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn run_serve(&self, binary: impl AsRef<OsStr>, port: u16) -> Output {
+        self.serve_command(binary, port)
             .output()
             .expect("run packaged CLI binary")
+    }
+
+    fn spawn_serve(&self, binary: impl AsRef<OsStr>, port: u16) -> Child {
+        self.serve_command(binary, port)
+            .spawn()
+            .expect("spawn packaged ch binary")
     }
 
     fn run_supervise(&self, binary: impl AsRef<OsStr>, port: u16) -> Output {
@@ -205,6 +217,27 @@ request_max_retries = 0
     }
 }
 
+struct RunningChild {
+    child: Child,
+}
+
+impl RunningChild {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().expect("inspect packaged ch process")
+    }
+}
+
+impl Drop for RunningChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn occupied_loopback_port() -> (TcpListener, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a loopback test port");
     let port = listener
@@ -212,6 +245,43 @@ fn occupied_loopback_port() -> (TcpListener, u16) {
         .expect("read reserved loopback address")
         .port();
     (listener, port)
+}
+
+fn free_loopback_runtime_port() -> u16 {
+    for _ in 0..100 {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("reserve candidate proxy port");
+        let port = proxy
+            .local_addr()
+            .expect("read candidate proxy port")
+            .port();
+        let admin = codex_helper_core::proxy::admin_loopback_addr_for_proxy_port(port);
+        if let Ok(admin_listener) = TcpListener::bind(admin) {
+            drop(admin_listener);
+            drop(proxy);
+            return port;
+        }
+    }
+    panic!("reserve a free proxy/admin port pair");
+}
+
+fn wait_for_foreground_listener_then_switch(fixture: &ProcessFixture, port: u16) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut listener_observed = false;
+    while Instant::now() < deadline {
+        let listening = std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(50),
+        )
+        .is_ok();
+        listener_observed |= listening;
+        let switched = fs::read_to_string(&fixture.codex_config_path)
+            .is_ok_and(|config| config.contains("model_provider = \"codex_proxy\""));
+        if switched {
+            return listener_observed;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 fn process_diagnostics(output: &Output) -> String {
@@ -247,6 +317,23 @@ fn ch_binary_imports_on_first_run_but_does_not_switch_when_bind_fails() {
     assert!(!helper_config.contains("binary-test-secret-canary"));
     fixture.assert_codex_files_unchanged();
     fixture.assert_no_switch_journal();
+}
+
+#[test]
+fn ch_binary_switches_after_its_foreground_runtime_is_listening() {
+    let fixture = ProcessFixture::new("ch-foreground-switch");
+    let port = free_loopback_runtime_port();
+    let mut child = RunningChild::new(fixture.spawn_serve(env!("CARGO_BIN_EXE_ch"), port));
+
+    assert!(
+        wait_for_foreground_listener_then_switch(&fixture, port),
+        "ch must apply its switch only after the foreground runtime is listening; child status={:?}",
+        child.try_wait(),
+    );
+    assert!(
+        fixture.helper_home.join("config.toml").exists(),
+        "successful ch startup must persist its imported helper route"
+    );
 }
 
 #[test]

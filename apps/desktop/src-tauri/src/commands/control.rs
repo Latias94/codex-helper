@@ -530,6 +530,7 @@ mod tests {
             CodexSwitchSnapshot::from_status(codex_helper_core::codex_switch::CodexSwitchStatus {
                 phase: codex_helper_core::codex_switch::CodexSwitchPhase::RecoveryRequired,
                 enabled: false,
+                model_provider: None,
                 managed: true,
                 base_url: Some("http://127.0.0.1:3211/v1".to_string()),
                 client_patch: Some(codex_helper_core::config::CodexClientPatchConfig {

@@ -143,6 +143,7 @@ impl CodexSwitchChange {
 pub struct CodexSwitchStatus {
     pub phase: CodexSwitchPhase,
     pub enabled: bool,
+    pub model_provider: Option<String>,
     pub managed: bool,
     pub base_url: Option<String>,
     pub client_patch: Option<CodexClientPatchConfig>,
@@ -1470,6 +1471,9 @@ fn legacy_switch_status(paths: &SwitchPaths) -> Result<CodexSwitchStatus, CodexS
     let enabled = config.as_ref().is_some_and(|config| {
         config.model_provider.as_deref() == Some(PROVIDER_ID) && config.helper_stanza.is_some()
     });
+    let model_provider = config
+        .as_ref()
+        .and_then(|config| config.model_provider.clone());
     let base_url = config.and_then(|config| config.helper_base_url);
     let mut recovery_reason = legacy_switch_error(paths).to_string();
     if let Some(current_state_path) = current_state_path.as_ref() {
@@ -1485,6 +1489,7 @@ fn legacy_switch_status(paths: &SwitchPaths) -> Result<CodexSwitchStatus, CodexS
     Ok(CodexSwitchStatus {
         phase: CodexSwitchPhase::RecoveryRequired,
         enabled,
+        model_provider,
         managed: current_state_path.is_some(),
         base_url,
         client_patch: None,
@@ -3227,6 +3232,7 @@ fn status_from_snapshot(
         return Ok(CodexSwitchStatus {
             phase: CodexSwitchPhase::RecoveryRequired,
             enabled: false,
+            model_provider: None,
             managed: true,
             base_url: Some(journal.target_base_url.clone()),
             client_patch: Some(journal.client_patch),
@@ -3245,6 +3251,7 @@ fn status_from_snapshot(
         return Ok(CodexSwitchStatus {
             phase: CodexSwitchPhase::RecoveryRequired,
             enabled: false,
+            model_provider: None,
             managed: true,
             base_url: Some(journal.target_base_url.clone()),
             client_patch: Some(journal.client_patch),
@@ -3259,10 +3266,11 @@ fn status_from_snapshot(
     let config = inspect_config(paths.config.as_path(), current.text.as_str())?;
     let enabled =
         config.model_provider.as_deref() == Some(PROVIDER_ID) && config.helper_stanza.is_some();
+    let model_provider = config.model_provider.clone();
     let config_base_url = config.helper_base_url;
 
     let Some(journal) = journal else {
-        let orphaned = config.model_provider.as_deref() == Some(PROVIDER_ID);
+        let orphaned = model_provider.as_deref() == Some(PROVIDER_ID);
         return Ok(CodexSwitchStatus {
             phase: if orphaned {
                 CodexSwitchPhase::RecoveryRequired
@@ -3270,6 +3278,7 @@ fn status_from_snapshot(
                 CodexSwitchPhase::Off
             },
             enabled,
+            model_provider,
             managed: false,
             base_url: config_base_url,
             client_patch: None,
@@ -3292,6 +3301,7 @@ fn status_from_snapshot(
         return Ok(CodexSwitchStatus {
             phase: CodexSwitchPhase::RecoveryRequired,
             enabled,
+            model_provider: model_provider.clone(),
             managed: true,
             base_url: config_base_url.or_else(|| Some(journal.target_base_url.clone())),
             client_patch: Some(journal.client_patch),
@@ -3403,6 +3413,7 @@ fn status_from_snapshot(
     Ok(CodexSwitchStatus {
         phase,
         enabled,
+        model_provider,
         managed: true,
         base_url: config_base_url.or_else(|| Some(journal.target_base_url.clone())),
         client_patch: Some(journal.client_patch),
@@ -5588,43 +5599,8 @@ fn config_path_fingerprint(path: &Path) -> String {
 }
 
 fn resolve_existing_ancestor(path: &Path) -> Result<PathBuf, CodexSwitchError> {
-    let mut existing = path;
-    let mut missing = Vec::new();
-    loop {
-        match std::fs::symlink_metadata(existing) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = existing.file_name().ok_or_else(|| {
-                    io_error(
-                        "resolve existing ancestor for",
-                        path,
-                        std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "no existing path ancestor",
-                        ),
-                    )
-                })?;
-                missing.push(name.to_os_string());
-                existing = existing.parent().ok_or_else(|| {
-                    io_error(
-                        "resolve existing ancestor for",
-                        path,
-                        std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "no existing path ancestor",
-                        ),
-                    )
-                })?;
-            }
-            Err(source) => return Err(io_error("inspect path identity for", existing, source)),
-        }
-    }
-    let mut resolved = std::fs::canonicalize(existing)
-        .map_err(|source| io_error("canonicalize path identity for", existing, source))?;
-    for component in missing.iter().rev() {
-        resolved.push(component);
-    }
-    Ok(resolved)
+    crate::path_identity::resolve_path_identity(path)
+        .map_err(|source| io_error("resolve path identity for", path, source))
 }
 
 #[cfg(test)]
@@ -5976,6 +5952,29 @@ trust_level = "trusted"
                 .expect("read sqlite sentinel"),
             b"sqlite sentinel"
         );
+    }
+
+    #[test]
+    fn switch_status_retains_the_current_model_provider_for_legacy_consumers() {
+        let env = TestEnvironment::new();
+        env.write_config("model_provider = \"external\"\n");
+
+        assert_eq!(
+            inspect()
+                .expect("inspect unmanaged Codex config")
+                .model_provider
+                .as_deref(),
+            Some("external")
+        );
+
+        let applied = apply(CodexSwitchIntent::On {
+            validated_base_url: ValidatedCodexBaseUrl::local(3211),
+        })
+        .expect("switch on");
+        assert_eq!(applied.status.model_provider.as_deref(), Some(PROVIDER_ID));
+
+        let restored = apply(CodexSwitchIntent::Off).expect("switch off");
+        assert_eq!(restored.status.model_provider.as_deref(), Some("external"));
     }
 
     #[test]

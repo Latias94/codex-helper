@@ -91,7 +91,6 @@ impl ServiceReceipt {
         &self.client_home
     }
 
-    #[cfg(any(windows, test))]
     pub(crate) fn daemon_executable(&self) -> Option<&Path> {
         self.daemon_executable.as_deref()
     }

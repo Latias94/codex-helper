@@ -1,4 +1,5 @@
 use axum::http::HeaderMap;
+use zeroize::Zeroizing;
 
 use crate::logging::{
     AuthResolutionLog, BodyPreview, HeaderEntry, HttpDebugLog, make_body_preview,
@@ -19,11 +20,10 @@ pub(super) struct HttpDebugBase {
     pub(super) upstream_uri: Option<String>,
     pub(super) client_headers: Vec<HeaderEntry>,
     pub(super) upstream_request_headers: Vec<HeaderEntry>,
+    pub(super) body_redactions: Vec<Zeroizing<Vec<u8>>>,
     pub(super) auth_resolution: Option<AuthResolutionLog>,
     pub(super) client_body_debug: Option<BodyPreview>,
     pub(super) upstream_request_body_debug: Option<BodyPreview>,
-    pub(super) client_body_warn: Option<BodyPreview>,
-    pub(super) upstream_request_body_warn: Option<BodyPreview>,
 }
 
 pub(super) struct HttpDebugResponseParams<'a> {
@@ -58,10 +58,7 @@ impl HttpDebugBase {
 
     fn request_bodies(&self, for_warn: bool) -> (Option<BodyPreview>, Option<BodyPreview>) {
         if for_warn {
-            (
-                self.client_body_warn.clone(),
-                self.upstream_request_body_warn.clone(),
-            )
+            (None, None)
         } else {
             (
                 self.client_body_debug.clone(),
@@ -111,12 +108,18 @@ impl HttpDebugBase {
             auth_resolution: self.auth_resolution.clone(),
             client_body,
             upstream_request_body,
-            upstream_response_headers: Some(header_map_to_entries(response_headers)),
-            upstream_response_body: Some(make_body_preview(
-                response_preview_body,
-                response_content_type,
-                max,
+            upstream_response_headers: Some(redacted_response_headers(
+                response_headers,
+                &self.body_redactions,
             )),
+            upstream_response_body: (!for_warn).then(|| {
+                make_redacted_body_preview(
+                    response_preview_body,
+                    response_content_type,
+                    max,
+                    &self.body_redactions,
+                )
+            }),
             upstream_error: None,
         })
     }
@@ -160,10 +163,83 @@ impl HttpDebugBase {
             auth_resolution: self.auth_resolution.clone(),
             client_body,
             upstream_request_body,
-            upstream_response_headers: response_headers.map(header_map_to_entries),
+            upstream_response_headers: response_headers
+                .map(|headers| redacted_response_headers(headers, &self.body_redactions)),
             upstream_response_body: None,
             upstream_error: Some(upstream_error),
         })
+    }
+}
+
+fn make_redacted_body_preview(
+    bytes: &[u8],
+    content_type: Option<&str>,
+    max: usize,
+    redactions: &[Zeroizing<Vec<u8>>],
+) -> BodyPreview {
+    let original_len = bytes.len();
+    let take = original_len.min(max);
+    let mut preview = bytes[..take].to_vec();
+    redact_known_values(&mut preview, redactions);
+    let mut body = make_body_preview(&preview, content_type, take);
+    body.original_len = original_len;
+    body.truncated = original_len > take;
+    body
+}
+
+fn redacted_response_headers(
+    headers: &HeaderMap,
+    redactions: &[Zeroizing<Vec<u8>>],
+) -> Vec<HeaderEntry> {
+    header_map_to_entries(headers)
+        .into_iter()
+        .map(|mut entry| {
+            let mut value = Zeroizing::new(entry.value.into_bytes());
+            redact_known_values(value.as_mut_slice(), redactions);
+            entry.value = String::from_utf8_lossy(value.as_slice()).into_owned();
+            entry
+        })
+        .collect()
+}
+
+fn redact_known_values(bytes: &mut [u8], redactions: &[Zeroizing<Vec<u8>>]) {
+    for value in redactions {
+        redact_body_value(bytes, value.as_slice());
+    }
+}
+
+fn redact_body_value(bytes: &mut [u8], value: &[u8]) {
+    if value.is_empty() {
+        return;
+    }
+    for start in 0..=bytes.len().saturating_sub(value.len()) {
+        if bytes[start..].starts_with(value) {
+            bytes[start..start + value.len()].fill(b'*');
+        }
+    }
+    redact_partial_body_value(bytes, value, true);
+    redact_partial_body_value(bytes, value, false);
+}
+
+fn redact_partial_body_value(bytes: &mut [u8], value: &[u8], leading: bool) {
+    const MIN_PARTIAL_MATCH_BYTES: usize = 4;
+
+    let maximum = value.len().min(bytes.len()).saturating_sub(1);
+    for length in (MIN_PARTIAL_MATCH_BYTES..=maximum).rev() {
+        let (preview, secret) = if leading {
+            (&bytes[..length], &value[value.len() - length..])
+        } else {
+            (&bytes[bytes.len() - length..], &value[..length])
+        };
+        if preview == secret {
+            if leading {
+                bytes[..length].fill(b'*');
+            } else {
+                let start = bytes.len() - length;
+                bytes[start..].fill(b'*');
+            }
+            return;
+        }
     }
 }
 
@@ -188,7 +264,14 @@ pub(super) fn format_reqwest_error_for_retry_chain(error: &reqwest::Error) -> St
 fn warn_http_debug_json(http_debug: &HttpDebugLog) -> Option<String> {
     const MAX_CHARS: usize = 2048;
 
-    let mut json = serde_json::to_string(http_debug).ok()?;
+    // Warnings are enabled by default. Never permit a caller to turn them into a
+    // body sink by accidentally passing a full debug record.
+    let mut warning = http_debug.clone();
+    warning.client_body = None;
+    warning.upstream_request_body = None;
+    warning.upstream_response_body = None;
+
+    let mut json = serde_json::to_string(&warning).ok()?;
     if json.chars().count() > MAX_CHARS {
         json = json.chars().take(MAX_CHARS).collect::<String>() + "...[TRUNCATED_FOR_LOG]";
     }
@@ -204,8 +287,34 @@ pub(super) fn warn_http_debug(status_code: u16, http_debug: &HttpDebugLog) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_reqwest_error_for_retry_chain, warn_http_debug_json};
-    use crate::logging::{HeaderEntry, HttpDebugLog};
+    use axum::http::{HeaderMap, HeaderValue};
+    use zeroize::Zeroizing;
+
+    use super::{
+        HttpDebugBase, HttpDebugResponseParams, HttpDebugTransportErrorParams,
+        format_reqwest_error_for_retry_chain, warn_http_debug_json,
+    };
+    use crate::logging::{HeaderEntry, HttpDebugLog, make_body_preview};
+
+    fn debug_base(redactions: Vec<Zeroizing<Vec<u8>>>) -> HttpDebugBase {
+        let request_body = make_body_preview(b"request-body", Some("text/plain"), 1024);
+        HttpDebugBase {
+            route_attempt_index: 0,
+            debug_max_body_bytes: 1024,
+            warn_max_body_bytes: 1024,
+            request_body_len: request_body.original_len,
+            upstream_request_body_len: request_body.original_len,
+            client_uri: "/v1/responses".to_string(),
+            upstream_origin: Some("https://example.com".to_string()),
+            upstream_uri: Some("/v1/responses".to_string()),
+            client_headers: Vec::new(),
+            upstream_request_headers: Vec::new(),
+            body_redactions: redactions,
+            auth_resolution: None,
+            client_body_debug: Some(request_body.clone()),
+            upstream_request_body_debug: Some(request_body.clone()),
+        }
+    }
 
     fn make_http_debug_log(value: &str) -> HttpDebugLog {
         HttpDebugLog {
@@ -272,5 +381,121 @@ mod tests {
         for secret in ["user:secret", "secret-path", "token=hidden", "example.test"] {
             assert!(!formatted.contains(secret));
         }
+    }
+
+    #[test]
+    fn warning_logs_omit_request_and_response_bodies() {
+        let secret = "warning-header-secret-2cb1";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-upstream-credential-echo",
+            format!("Bearer {secret}")
+                .parse()
+                .expect("valid header value"),
+        );
+        let log = debug_base(vec![
+            Zeroizing::new(format!("Bearer {secret}").into_bytes()),
+            Zeroizing::new(secret.as_bytes().to_vec()),
+        ])
+        .response_log(HttpDebugResponseParams {
+            status_code: 500,
+            response_headers: &headers,
+            response_body: format!("upstream response body {secret}").as_bytes(),
+            response_preview_body: None,
+            upstream_headers_ms: 10,
+            upstream_first_chunk_ms: None,
+            upstream_body_read_ms: Some(12),
+            for_warn: true,
+        })
+        .expect("warning log");
+
+        assert!(log.client_body.is_none());
+        assert!(log.upstream_request_body.is_none());
+        assert!(log.upstream_response_body.is_none());
+
+        let warning_json = warn_http_debug_json(&log).expect("warning JSON");
+        assert!(!warning_json.contains(secret));
+    }
+
+    #[test]
+    fn warning_sink_strips_body_fields_from_full_debug_records() {
+        let secret = "warning-body-secret-b5f7";
+        let body = make_body_preview(secret.as_bytes(), Some("text/plain"), 1024);
+        let mut log = make_http_debug_log("small");
+        log.client_body = Some(body.clone());
+        log.upstream_request_body = Some(body.clone());
+        log.upstream_response_body = Some(body);
+
+        let warning_json = warn_http_debug_json(&log).expect("warning JSON");
+
+        assert!(!warning_json.contains(secret));
+        assert!(!warning_json.contains("\"client_body\":"));
+        assert!(!warning_json.contains("\"upstream_request_body\":"));
+        assert!(!warning_json.contains("\"upstream_response_body\":"));
+    }
+
+    #[test]
+    fn transport_warning_redacts_known_credentials_in_custom_response_headers() {
+        let secret = "transport-header-secret-7d3c";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-upstream-credential-echo",
+            secret.parse().expect("valid header value"),
+        );
+        let log = debug_base(vec![Zeroizing::new(secret.as_bytes().to_vec())])
+            .transport_error_log(HttpDebugTransportErrorParams {
+                response_headers: Some(&headers),
+                upstream_headers_ms: Some(4),
+                upstream_body_read_ms: Some(8),
+                error_class: "upstream_body_read_error",
+                error_hint: "upstream body read failed",
+                upstream_error: "upstream HTTP transport failed".to_string(),
+                for_warn: true,
+            })
+            .expect("warning log");
+
+        let warning_json = warn_http_debug_json(&log).expect("warning JSON");
+        assert!(!warning_json.contains(secret));
+    }
+
+    #[test]
+    fn debug_response_redacts_known_credentials_in_body_and_custom_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let secret = "native-secret-93ac";
+        headers.insert(
+            "x-upstream-credential-echo",
+            format!("Bearer {secret}")
+                .parse()
+                .expect("valid header value"),
+        );
+        let response = format!(r#"{{"authorization":"Bearer {secret}","api_key":"{secret}"}}"#);
+        let log = debug_base(vec![
+            Zeroizing::new(format!("Bearer {secret}").into_bytes()),
+            Zeroizing::new(secret.as_bytes().to_vec()),
+        ])
+        .response_log(HttpDebugResponseParams {
+            status_code: 500,
+            response_headers: &headers,
+            response_body: response.as_bytes(),
+            response_preview_body: None,
+            upstream_headers_ms: 10,
+            upstream_first_chunk_ms: None,
+            upstream_body_read_ms: Some(12),
+            for_warn: false,
+        })
+        .expect("debug log");
+
+        let body = log
+            .upstream_response_body
+            .as_ref()
+            .expect("debug response body")
+            .data
+            .as_str();
+        assert!(!body.contains(secret));
+        assert!(body.contains("***"));
+
+        let debug_json = serde_json::to_string(&log).expect("debug JSON");
+        assert!(!debug_json.contains(secret));
     }
 }

@@ -980,6 +980,22 @@ impl RuntimeConfig {
         self.capture_current()
     }
 
+    pub(super) async fn commit_if_snapshot_current<T, Commit, CommitFuture>(
+        &self,
+        expected: &Arc<RuntimeSnapshot>,
+        commit: Commit,
+    ) -> Option<T>
+    where
+        Commit: FnOnce() -> CommitFuture,
+        CommitFuture: Future<Output = T>,
+    {
+        let _publish_guard = self.publish.lock().await;
+        if !Arc::ptr_eq(expected, &self.capture_current()) {
+            return None;
+        }
+        Some(commit().await)
+    }
+
     pub(super) fn automatic_reload_check_interval(&self) -> Duration {
         self.automatic_reload.min_check_interval
     }
@@ -2360,6 +2376,36 @@ mod tests {
         assert!(!Arc::ptr_eq(&old, &new));
         assert_eq!(new.revision(), old_revision + 1);
         assert_ne!(new.digest(), old_digest);
+    }
+
+    #[tokio::test]
+    async fn snapshot_commit_guard_rejects_mutation_after_runtime_reload() {
+        let runtime = runtime_config("old");
+        let old = runtime.capture().await;
+        assert!(
+            runtime
+                .reload_with_source(|| async { Ok((loaded_route_graph("new"), None)) })
+                .await
+                .expect("reload replacement runtime snapshot")
+        );
+
+        let stale_commit_calls = AtomicUsize::new(0);
+        let stale = runtime
+            .commit_if_snapshot_current(&old, || {
+                stale_commit_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(())
+            })
+            .await;
+        assert!(stale.is_none());
+        assert_eq!(stale_commit_calls.load(Ordering::SeqCst), 0);
+
+        let current = runtime.capture().await;
+        assert_eq!(
+            runtime
+                .commit_if_snapshot_current(&current, || std::future::ready("committed"))
+                .await,
+            Some("committed")
+        );
     }
 
     #[tokio::test]

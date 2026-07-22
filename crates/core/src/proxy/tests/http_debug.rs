@@ -92,6 +92,7 @@ async fn http_debug_all_transport_child() {
     const AUTH_TOKEN_SECRET: &str = "auth-token-secret-c611";
     const ATTESTATION_SECRET: &str = "attestation-secret-d78a";
     const RESPONSE_HEADER_SECRET: &str = "response-header-secret-e17d";
+    const HELPER_BEARER_TOKEN: &str = "helper-bearer-secret-746b";
     const SESSION_ID: &str = "debug-session-415b";
 
     let captured_upstream_body = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
@@ -105,7 +106,7 @@ async fn http_debug_all_transport_child() {
                     .lock()
                     .expect("capture upstream request body") = Some(body.to_vec());
                 let mut response = Response::new(Body::from(format!(
-                    r#"{{"id":"resp-debug","output":"{RESPONSE_BODY_SENTINEL}"}}"#
+                    r#"{{"id":"resp-debug","output":"{RESPONSE_BODY_SENTINEL}","echo_authorization":"Bearer {HELPER_BEARER_TOKEN}","echo_token":"{HELPER_BEARER_TOKEN}"}}"#
                 )));
                 response.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
@@ -123,7 +124,10 @@ async fn http_debug_all_transport_child() {
     let config = make_helper_config(
         vec![UpstreamConfig {
             base_url: format!("http://{upstream_addr}/gateway"),
-            auth: UpstreamAuth::default(),
+            auth: UpstreamAuth {
+                auth_token: Some(HELPER_BEARER_TOKEN.to_string().into()),
+                ..UpstreamAuth::default()
+            },
             tags: HashMap::new(),
             supported_models: HashMap::new(),
             model_mapping: HashMap::new(),
@@ -211,6 +215,7 @@ async fn http_debug_all_transport_child() {
         AUTH_TOKEN_SECRET,
         ATTESTATION_SECRET,
         RESPONSE_HEADER_SECRET,
+        HELPER_BEARER_TOKEN,
     ] {
         assert!(!serialized.contains(secret), "leaked secret {secret}");
     }

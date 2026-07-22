@@ -105,7 +105,7 @@ ch
 - 交互终端中打开 TUI；
 - 退出时停止当前前台控制台启动的代理。
 
-两个入口共享同一 runtime，但客户端切换契约不同。`codex-helper` 从不自动修改 Codex 客户端；`ch` 是兼容入口，会在本地 Codex runtime 验证就绪后通过 journal 自动 `switch on`。首次 onboarding 不保存凭据值；认证来源不明确或第三方 origin 不安全时会失败关闭，已有 helper provider/route 不会被覆盖。新启动的前台 runtime 使用临时 lease，按 `q` 停止 runtime 后以 CAS 恢复 helper 管理的配置投影，同时保留 Codex 运行期产生的其它有效 TOML 编辑；`--resident` 保留 switch。若匹配的 native service 已经运行，`ch` 以安装 receipt、签名 runtime identity、helper/Codex home、端口和 install generation 作为附着授权依据；owner marker 只用于辅助观测，缺失或损坏不会阻断附着，但存在且可解析时必须与 service identity 一致，否则会在 switch 前拒绝。附着后退出 TUI 不会停止服务或恢复 switch。任意占用相同端口的进程都不会被接管。
+两个入口共享同一 runtime，但客户端切换契约不同。`codex-helper` 从不自动修改客户端文件；`ch` 是兼容入口。对 Codex，`ch` 会在本地 runtime 验证就绪后通过 journal 自动 `switch on`；对前台 `ch --claude`，它只在 Claude runtime 的 TCP listener 就绪后临时写入 `ANTHROPIC_BASE_URL`，退出时仅在仍持有该切换代次时从私有恢复材料还原，绝不撤销后来显式或另一前台会话的选择。普通 `codex-helper`、`--resident`、supervisor、桌面端和已安装 service 都不会隐式修改 Claude settings。首次 Codex onboarding 不保存凭据值；认证来源不明确或第三方 origin 不安全时会失败关闭，已有 helper provider/route 不会被覆盖。新启动的前台 Codex runtime 使用临时 lease，按 `q` 停止 runtime 后以 CAS 恢复 helper 管理的配置投影，同时保留 Codex 运行期产生的其它有效 TOML 编辑；`--resident` 保留 switch。若匹配的 native service 已经运行，`ch` 以安装 receipt、签名 runtime identity、helper/Codex home、端口和 install generation 作为附着授权依据；owner marker 只用于辅助观测，缺失或损坏不会阻断附着，但存在且可解析时必须与 service identity 一致，否则会在 switch 前拒绝。附着后退出 TUI 不会停止服务或恢复 switch。任意占用相同端口的进程都不会被接管。
 
 自动配置迁移只会把受支持的旧语法转换为 version 6，并保留源文件的精确备份；它不会复制、删除或重新解释任何凭据值。把值导入 OS 凭据存储是另一项必须显式执行的操作，例如 `codex-helper credential import relay.primary --from-env RELAY_TOKEN`。
 
@@ -126,13 +126,13 @@ codex-helper tui --codex
 codex-helper service stop
 ```
 
-默认 `codex-helper serve` 的内置 TUI 遵循“界面拥有代理”：退出界面会停止它自己启动的代理，但不会执行 `switch on/off`。`daemon status` 只读查询 resident proxy；`daemon stop` 只允许同一用户通过一次性签名的 loopback action 停止手工 `serve --resident` runtime。它不会恢复旧的未鉴权 shutdown 入口，也不会接受远端调用。若 runtime 由 `daemon supervise`、系统服务或桌面应用拥有，命令会拒绝并分别提示在 supervisor 前台按 Ctrl-C、运行 `service stop` 或使用桌面的显式 Stop Proxy。显式 `service stop` 会先恢复匹配的 helper-managed Codex switch，`service restart` 则为即将返回的同一 target 保留 switch；同 identity 的 `service install --no-start` 若会把运行中服务替换为停止状态，也会先恢复 switch。已有平台注册对应的 receipt 缺失或属于旧 schema 时不会猜测 identity。`tui` 子命令附着到已有 resident proxy：在 daemon 所在机器，本机签名 operator capability 可执行 daemon 明确声明的余额刷新、路由和会话操作；本机签名不可用时会降级为只读。`RemoteObserver` 绝对只读，不发送 operator mutation。退出 attached TUI 不会停止代理。需要自动拉起/崩溃重启时可用 `codex-helper daemon supervise --codex`，supervisor 会写入轻量 crash marker 到 `~/.codex-helper/run/` 便于排查。
+默认 `codex-helper serve` 的内置 TUI 遵循“界面拥有代理”：退出界面会停止它自己启动的代理，但不会执行 `switch on/off`。`daemon status` 只读查询 resident proxy；`daemon stop` 只允许同一用户通过一次性签名的 loopback action 停止手工 `serve --resident` runtime。它不会恢复旧的未鉴权 shutdown 入口，也不会接受远端调用。若 runtime 由 `daemon supervise`、系统服务或桌面应用拥有，命令会拒绝并分别提示在 supervisor 前台按 Ctrl-C、运行 `service stop` 或使用桌面的显式 Stop Proxy。显式 `service stop` 会先恢复匹配的 helper-managed Codex switch，`service restart` 则为即将返回的同一 target 保留 switch；同 identity 的 `service install --no-start` 若会把运行中服务替换为停止状态，也会先恢复 switch。已有平台注册对应的 receipt 缺失或属于旧 schema 时不会猜测 identity；macOS/Linux 还会在任何 start/stop/reinstall/uninstall 变更前核对 receipt、完整 plist/unit 和 launchd/systemd 注册，定义被替换、存在 drop-in 或 manager 尚未 reload 时失败关闭。`tui` 子命令附着到已有 resident proxy：在 daemon 所在机器，本机签名 operator capability 可执行 daemon 明确声明的余额刷新、路由和会话操作；本机签名不可用时会降级为只读。`RemoteObserver` 绝对只读，不发送 operator mutation。退出 attached TUI 不会停止代理。需要自动拉起/崩溃重启时可用 `codex-helper daemon supervise --codex`，supervisor 会写入轻量 crash marker 到 `~/.codex-helper/run/` 便于排查。
 
 `daemon status` 会尽量显示当前 resident proxy 的 owner marker（manual CLI、supervisor 或未来桌面/托盘 owner）；marker 只用于可观测性，读取或清理失败不会阻断代理启动/退出。`daemon status --json` 使用显式 `schema_version`，同时保留根级 operator summary 路径和完整的 `operator_read_model`。面向未来桌面端的 sidecar 语义已经预留为隐藏的 managed 启动模式，普通用户无需手动判断或使用。
 
 Tauri 桌面端采用更接近 Clash 的常驻客户端语义：关闭主窗口隐藏到托盘，`Quit App` 只退出桌面进程，两者都不会停止 runtime。停止 runtime 属于显式的本地 CLI/service 操作，不在桌面端 query-only 控制面内。Windows NSIS packaged 路径已通过隔离生命周期 smoke，但尚未进入公开发布；macOS/Linux packaged parity、签名发布链路和回滚流程仍需单独完成。
 
-显式切换 Codex 客户端到 helper：
+显式切换本机 Codex 或 Claude 客户端到 helper：
 
 ```bash
 codex-helper switch on
@@ -142,7 +142,13 @@ codex-helper switch on --preset imagegen-bridge
 codex-helper switch on --preset official-imagegen --compaction remote-v2 --responses-websocket
 codex-helper switch status
 codex-helper switch off
+codex-helper switch on --claude                 # 默认 http://127.0.0.1:3210
+codex-helper switch on --claude --base-url https://relay.example
+codex-helper switch status --claude
+codex-helper switch off --claude
 ```
+
+Claude switch 只接受 `--port` / `--base-url`，不接受 Codex client-patch preset 或 capability overrides。它把原 settings 保存到私有 raw backup，private sidecar 只记录指纹、helper target、缺文件标记和不含凭据的前台代次；关闭时只有当前文件仍等于 helper 应用的投影才会恢复。前台 `ch --claude` 只恢复自己仍拥有的代次。外部编辑会保留并进入人工恢复状态。0.20.3 留下的 raw Claude backup 只有在当前 settings 可验证为对应 helper patch 时才会被接管。
 
 NAS / 远端 relay target：
 

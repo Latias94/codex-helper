@@ -23,9 +23,9 @@ const WINDOWS_SERVICE_NAME: &str = "codex-helper";
 const WINDOWS_TASK_BASENAME: &str = "codex-helper";
 #[cfg(windows)]
 const WINDOWS_TASK_DEFINITION_FILE: &str = "windows-task.xml";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 const MACOS_LABEL: &str = "io.github.latias94.codex-helper";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const LINUX_UNIT_NAME: &str = "codex-helper.service";
 const MAX_SERVICE_DEFINITION_BYTES: usize = 1024 * 1024;
 
@@ -535,28 +535,9 @@ fn windows_path_text<'a>(path: &'a Path, description: &str) -> CliResult<&'a str
     })
 }
 
+#[cfg(any(windows, test))]
 fn windows_paths_equal(left: &str, right: &str) -> bool {
-    let normalize = |value: &str| {
-        let normalized = value.replace('/', "\\").to_ascii_lowercase();
-        let mut normalized = if let Some(path) = normalized.strip_prefix(r"\\?\unc\") {
-            format!(r"\\{path}")
-        } else if let Some(path) = normalized.strip_prefix(r"\\?\") {
-            path.to_string()
-        } else {
-            normalized
-        };
-        while normalized.ends_with('\\') && !windows_path_is_root(&normalized) {
-            normalized.pop();
-        }
-        normalized
-    };
-    normalize(left) == normalize(right)
-}
-
-fn windows_path_is_root(path: &str) -> bool {
-    path == r"\"
-        || path == r"\\"
-        || matches!(path.as_bytes(), [drive, b':', b'\\'] if drive.is_ascii_alphabetic())
+    codex_helper_core::path_identity::windows_path_strings_equal(left, right)
 }
 
 #[cfg(any(windows, test))]
@@ -1426,6 +1407,7 @@ fn reconcile_installed_service_switch_for_operation(
             "refusing to {operation} without a current install receipt: {error}. Run `codex-helper switch off` first if Codex points at this service, then repair the receipt with the codex-helper version that created the service"
         ))
     })?;
+    verify_installed_service_definition_authority(&receipt)?;
     let preparation = reconcile_service_switch_before_runtime_stop(
         &receipt,
         true,
@@ -1609,10 +1591,8 @@ impl CanonicalServiceInstallIdentity {
 fn service_paths_identify_same_location(left: &Path, right: &Path) -> CliResult<bool> {
     let left = resolve_service_path_identity(left)?;
     let right = resolve_service_path_identity(right)?;
-    Ok(service_path_identities_equal_with_windows_semantics(
-        &left,
-        &right,
-        cfg!(windows),
+    Ok(codex_helper_core::path_identity::path_identities_equal(
+        &left, &right,
     ))
 }
 
@@ -1624,62 +1604,28 @@ fn resolve_service_path_identity(path: &Path) -> CliResult<PathBuf> {
         )));
     }
 
-    let mut existing = path;
-    let mut missing = Vec::new();
-    loop {
-        match std::fs::symlink_metadata(existing) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = existing.file_name().ok_or_else(|| {
-                    CliError::Other(format!(
-                        "no existing ancestor is available for service path {}",
-                        path.display()
-                    ))
-                })?;
-                missing.push(name.to_os_string());
-                existing = existing.parent().ok_or_else(|| {
-                    CliError::Other(format!(
-                        "no existing ancestor is available for service path {}",
-                        path.display()
-                    ))
-                })?;
-            }
-            Err(error) => {
-                return Err(CliError::Other(format!(
-                    "inspect service path identity {}: {error}",
-                    existing.display()
-                )));
-            }
-        }
-    }
-
-    let mut resolved = std::fs::canonicalize(existing).map_err(|error| {
+    codex_helper_core::path_identity::resolve_path_identity(path).map_err(|error| {
         CliError::Other(format!(
-            "canonicalize service path identity {}: {error}",
-            existing.display()
+            "resolve service path identity {}: {error}",
+            path.display()
         ))
-    })?;
-    for component in missing.iter().rev() {
-        resolved.push(component);
-    }
-    Ok(resolved)
+    })
 }
 
+#[cfg(test)]
 fn service_path_identities_equal_with_windows_semantics(
     left: &Path,
     right: &Path,
     windows_semantics: bool,
 ) -> bool {
-    if windows_semantics {
-        return left
-            .to_str()
-            .zip(right.to_str())
-            .is_some_and(|(left, right)| windows_paths_equal(left, right));
-    }
-    left == right
+    codex_helper_core::path_identity::path_identities_equal_with_windows_semantics(
+        left,
+        right,
+        windows_semantics,
+    )
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn service_install_options_from_receipt(
     receipt: &ServiceReceipt,
     start: bool,
@@ -1713,6 +1659,242 @@ fn service_install_options_from_receipt(
         client_home: receipt.client_home().to_path_buf(),
         install_generation: receipt.install_generation().clone(),
     })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn unix_service_definition_name(backend: ServicePlatformBackend) -> CliResult<&'static str> {
+    match backend {
+        ServicePlatformBackend::MacosLaunchAgent => Ok("LaunchAgent plist"),
+        ServicePlatformBackend::LinuxSystemdUser => Ok("systemd user unit"),
+        ServicePlatformBackend::WindowsScheduledTask => Err(CliError::Other(
+            "a Windows service receipt cannot authorize a Unix service definition".to_string(),
+        )),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn required_unix_daemon_executable(receipt: &ServiceReceipt) -> CliResult<&Path> {
+    let definition_name = unix_service_definition_name(receipt.platform_backend())?;
+    receipt.daemon_executable().ok_or_else(|| {
+        CliError::Other(format!(
+            "refusing to manage the installed {definition_name}: the current schema-1 service receipt has no daemon_executable authority. No service registration, definition, receipt, or runtime was changed. Use the codex-helper binary/version that installed this service to uninstall it, then run `codex-helper service install` with the current binary"
+        ))
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn expected_unix_service_definition(receipt: &ServiceReceipt) -> CliResult<Vec<u8>> {
+    let executable = required_unix_daemon_executable(receipt)?;
+    let options = service_install_options_from_receipt(receipt, false)?;
+    let definition = match receipt.platform_backend() {
+        ServicePlatformBackend::MacosLaunchAgent => render_launch_agent_definition(
+            executable,
+            &receipt.helper_home().join("logs"),
+            &options,
+        ),
+        ServicePlatformBackend::LinuxSystemdUser => render_systemd_unit(executable, &options),
+        ServicePlatformBackend::WindowsScheduledTask => {
+            return Err(CliError::Other(
+                "a Windows service receipt cannot authorize a Unix service definition".to_string(),
+            ));
+        }
+    };
+    Ok(definition.into_bytes())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn verify_unix_service_definition_snapshot(
+    receipt: &ServiceReceipt,
+    actual: Option<&[u8]>,
+) -> CliResult<()> {
+    let definition_name = unix_service_definition_name(receipt.platform_backend())?;
+    let expected = expected_unix_service_definition(receipt)?;
+    match actual {
+        Some(actual) if actual == expected.as_slice() => Ok(()),
+        Some(_) => Err(CliError::Other(format!(
+            "refusing to mutate the installed {definition_name}: its complete on-disk definition does not match the current service receipt (daemon executable, command, service, host, port, helper/client homes, install generation, logs, or restart policy). No service registration, definition, receipt, or runtime was changed. Restore the matching definition or use the codex-helper binary/version that installed it to uninstall it, then run `codex-helper service install`"
+        ))),
+        None => Err(CliError::Other(format!(
+            "refusing to mutate the installed {definition_name}: its definition is missing while a current service receipt still claims it. No service registration, definition, receipt, or runtime was changed. Restore the matching definition or use the codex-helper binary/version that installed it to uninstall it, then run `codex-helper service install`"
+        ))),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn verify_unix_service_install_replacement(
+    installed_receipt: Option<&ServiceReceipt>,
+    actual: Option<&[u8]>,
+    candidate_backend: ServicePlatformBackend,
+) -> CliResult<()> {
+    match installed_receipt {
+        Some(receipt) if receipt.platform_backend() == candidate_backend => {
+            verify_unix_service_definition_snapshot(receipt, actual)
+        }
+        Some(receipt) => Err(CliError::Other(format!(
+            "refusing to replace a {:?} service using a {:?} receipt. No service registration, definition, receipt, or runtime was changed; use the codex-helper binary/version that created the service to uninstall it, then run `codex-helper service install`",
+            candidate_backend,
+            receipt.platform_backend(),
+        ))),
+        None if actual.is_none() => Ok(()),
+        None => {
+            let definition_name = unix_service_definition_name(candidate_backend)?;
+            Err(CliError::Other(format!(
+                "refusing to replace an existing {definition_name} without a current service receipt proving its complete definition. No service registration, definition, receipt, or runtime was changed. Use the codex-helper binary/version that created it to uninstall it, then run `codex-helper service install`"
+            )))
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn verify_unix_service_definition_at(
+    receipt: &ServiceReceipt,
+    expected_backend: ServicePlatformBackend,
+    path: &Path,
+) -> CliResult<()> {
+    if receipt.platform_backend() != expected_backend {
+        return Err(CliError::Other(format!(
+            "refusing to manage a {:?} service with a {:?} receipt. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying",
+            expected_backend,
+            receipt.platform_backend(),
+        )));
+    }
+    let snapshot = codex_helper_core::read_managed_file_snapshot(
+        path,
+        MAX_SERVICE_DEFINITION_BYTES,
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "inspect the installed service definition {} before mutation: {error}. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying",
+            path.display(),
+        ))
+    })?;
+    verify_unix_service_definition_snapshot(receipt, snapshot.bytes())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn verify_current_service_receipt_snapshot(
+    helper_home: &Path,
+    expected: Option<&ServiceReceipt>,
+    operation: &str,
+) -> CliResult<()> {
+    let actual = match read_service_receipt(helper_home) {
+        Ok(receipt) => Some(receipt),
+        Err(ServiceReceiptError::Missing) => None,
+        Err(error) => {
+            return Err(CliError::Other(format!(
+                "refusing to {operation}: reread the current service receipt at the mutation boundary: {error}. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying"
+            )));
+        }
+    };
+    if actual.as_ref() == expected {
+        return Ok(());
+    }
+    Err(CliError::Other(format!(
+        "refusing to {operation}: the service receipt changed after the transaction began. No service registration, definition, receipt, or runtime was changed; retry from a fresh service state"
+    )))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn verify_current_unix_service_definition_bytes(
+    path: &Path,
+    expected: Option<&[u8]>,
+    operation: &str,
+) -> CliResult<()> {
+    let snapshot = codex_helper_core::read_managed_file_snapshot(
+        path,
+        MAX_SERVICE_DEFINITION_BYTES,
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "refusing to {operation}: reread the current service definition {} at the mutation boundary: {error}. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying",
+            path.display(),
+        ))
+    })?;
+    if snapshot.bytes() == expected {
+        return Ok(());
+    }
+    Err(CliError::Other(format!(
+        "refusing to {operation}: the service definition {} changed after the transaction began. No service registration, definition, receipt, or runtime was changed; retry from a fresh service state",
+        path.display(),
+    )))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn verify_launchd_registration_snapshot(
+    output: Option<&str>,
+    expected_definition_path: &Path,
+) -> CliResult<()> {
+    let Some(output) = output else {
+        // `service stop` unloads the job while preserving its authoritative plist.
+        return Ok(());
+    };
+    let registered_path = output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("path = ")
+            .map(|path| path.trim_matches('"'))
+    });
+    let Some(registered_path) = registered_path else {
+        return Err(CliError::Other(
+            "refusing to mutate the loaded LaunchAgent because launchd did not expose its source plist path. No service registration, definition, receipt, or runtime was changed; unload the unverified job and rerun `codex-helper service install`"
+                .to_string(),
+        ));
+    };
+    let path_matches = service_paths_identify_same_location(
+        Path::new(registered_path),
+        expected_definition_path,
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "refusing to mutate the loaded LaunchAgent because its registered plist path is not a valid comparable authority: {error}. No service registration, definition, receipt, or runtime was changed; unload the external registration and rerun `codex-helper service install`"
+        ))
+    })?;
+    if path_matches {
+        return Ok(());
+    }
+    Err(CliError::Other(format!(
+        "refusing to mutate the loaded LaunchAgent because launchd registered it from {}, not the receipt-authorized plist {}. No service registration, definition, receipt, or runtime was changed; unload the external registration and rerun `codex-helper service install`",
+        registered_path,
+        expected_definition_path.display(),
+    )))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn verify_systemd_registration_snapshot(
+    load_state: &str,
+    unit_file_state: &str,
+    fragment_path: &str,
+    drop_in_paths: &str,
+    need_daemon_reload: &str,
+    expected_definition_path: &Path,
+) -> CliResult<()> {
+    let fragment_matches = if load_state != "loaded"
+        || unit_file_state != "enabled"
+        || fragment_path.is_empty()
+    {
+        false
+    } else {
+        service_paths_identify_same_location(
+            Path::new(fragment_path),
+            expected_definition_path,
+        )
+        .map_err(|error| {
+            CliError::Other(format!(
+                "refusing to mutate the systemd user service because FragmentPath={fragment_path:?} is not a valid comparable authority: {error}. No service registration, definition, receipt, or runtime was changed; restore the matching unit, run `systemctl --user daemon-reload` and `systemctl --user enable {LINUX_UNIT_NAME}`, then retry `codex-helper service install`"
+            ))
+        })?
+    };
+    let registration_matches = load_state == "loaded"
+        && unit_file_state == "enabled"
+        && fragment_matches
+        && drop_in_paths.is_empty()
+        && need_daemon_reload == "no";
+    if registration_matches {
+        return Ok(());
+    }
+    Err(CliError::Other(format!(
+        "refusing to mutate the systemd user service because its registration does not match the receipt-authorized unit (LoadState={load_state:?}, UnitFileState={unit_file_state:?}, FragmentPath={fragment_path:?}, DropInPaths={drop_in_paths:?}, NeedDaemonReload={need_daemon_reload:?}, expected={}). No service registration, definition, receipt, or runtime was changed; remove untrusted drop-ins, run `systemctl --user daemon-reload` and `systemctl --user enable {LINUX_UNIT_NAME}` after restoring the matching unit, then retry `codex-helper service install`",
+        expected_definition_path.display(),
+    )))
 }
 
 #[derive(Debug)]
@@ -2067,15 +2249,31 @@ fn print_logs() {
 }
 
 fn uninstall_with_receipt(stop_first: bool) -> CliResult<()> {
-    validate_service_receipt_for_uninstall(
+    let receipt = validate_service_receipt_for_uninstall(
         read_service_receipt(proxy_home_dir()),
         ServicePlatformBackend::current(),
     )?;
+    verify_installed_service_definition_authority(&receipt)?;
     run_service_uninstall_with_switch_preflight(
         stop_first,
         reconcile_installed_service_switch,
         uninstall_platform_with_receipt,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn verify_installed_service_definition_authority(receipt: &ServiceReceipt) -> CliResult<()> {
+    macos::verify_receipt_definition(receipt)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_installed_service_definition_authority(receipt: &ServiceReceipt) -> CliResult<()> {
+    linux::verify_receipt_definition(receipt)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn verify_installed_service_definition_authority(_receipt: &ServiceReceipt) -> CliResult<()> {
+    Ok(())
 }
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -4640,6 +4838,8 @@ mod macos {
         path: PathBuf,
         domain: OsString,
         target: String,
+        helper_home: PathBuf,
+        installed_receipt: Option<ServiceReceipt>,
         was_loaded: bool,
         original_definition_exists: bool,
         definition: codex_helper_core::ManagedFileTransaction,
@@ -4652,12 +4852,11 @@ mod macos {
     impl NativeMacosInstallBackend {
         fn new(options: ServiceInstallOptions) -> CliResult<Self> {
             let executable = service_executable(&current_executable()?)?;
-            let log_dir = ensure_service_log_dir()?;
+            let log_dir = service_log_dir();
             let path = launch_agent_path()?;
             let document = render_launch_agent(&executable, &log_dir, &options);
             let domain = launchd_domain()?;
             let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
-            let was_loaded = NativeMacosUninstallBackend::query_loaded(&target)?;
             let definition = codex_helper_core::ManagedFileTransaction::begin(
                 path.clone(),
                 MAX_SERVICE_DEFINITION_BYTES,
@@ -4666,12 +4865,33 @@ mod macos {
             let original_definition_exists = definition.current().bytes().is_some();
             let (receipt_transaction, receipt, install_preflight) =
                 begin_service_receipt_transaction_with_daemon_executable(&options, &executable)?;
+            verify_unix_service_install_replacement(
+                install_preflight.installed_receipt.as_ref(),
+                definition.current().bytes(),
+                ServicePlatformBackend::MacosLaunchAgent,
+            )?;
+            let current_registration = NativeMacosUninstallBackend::query_registration(&target)?;
+            match install_preflight.installed_receipt.as_ref() {
+                Some(_) => {
+                    verify_launchd_registration_snapshot(current_registration.as_deref(), &path)?
+                }
+                None if current_registration.is_some() => {
+                    return Err(CliError::Other(
+                        "refusing to replace a loaded LaunchAgent without a current service receipt proving its registration. No service registration, definition, receipt, or runtime was changed; unload the unverified job, then run `codex-helper service install`"
+                            .to_string(),
+                    ));
+                }
+                None => {}
+            }
+            ensure_service_log_dir()?;
             prepare_service_switch_for_install(&options, &install_preflight)?;
             Ok(Self {
                 path,
                 domain,
                 target,
-                was_loaded,
+                helper_home: receipt.helper_home().to_path_buf(),
+                installed_receipt: install_preflight.installed_receipt,
+                was_loaded: false,
                 original_definition_exists,
                 definition,
                 receipt_transaction,
@@ -4680,10 +4900,71 @@ mod macos {
                 replacement_start_attempted: false,
             })
         }
+
+        fn revalidate_original_authority(&self, require_unloaded: bool) -> CliResult<bool> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                self.installed_receipt.as_ref(),
+                "replace the LaunchAgent",
+            )?;
+            match self.installed_receipt.as_ref() {
+                Some(receipt) => verify_unix_service_definition_at(
+                    receipt,
+                    ServicePlatformBackend::MacosLaunchAgent,
+                    &self.path,
+                )?,
+                None => verify_current_unix_service_definition_bytes(
+                    &self.path,
+                    None,
+                    "replace the LaunchAgent",
+                )?,
+            }
+            let registration = NativeMacosUninstallBackend::query_registration(&self.target)?;
+            match self.installed_receipt.as_ref() {
+                Some(_) => {
+                    verify_launchd_registration_snapshot(registration.as_deref(), &self.path)?
+                }
+                None if registration.is_some() => {
+                    return Err(CliError::Other(
+                        "refusing to replace a loaded LaunchAgent without a current service receipt proving its registration. No service registration, definition, receipt, or runtime was changed; unload the unverified job, then run `codex-helper service install`"
+                            .to_string(),
+                    ));
+                }
+                None => {}
+            }
+            if require_unloaded && registration.is_some() {
+                return Err(CliError::Other(
+                    "refusing to replace the LaunchAgent because it became loaded after the transaction began. No service registration, definition, receipt, or runtime was changed; retry from a fresh service state"
+                        .to_string(),
+                ));
+            }
+            Ok(registration.is_some())
+        }
+
+        fn revalidate_replacement_before_receipt_publish(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                self.installed_receipt.as_ref(),
+                "publish the LaunchAgent service receipt",
+            )?;
+            verify_current_unix_service_definition_bytes(
+                &self.path,
+                Some(self.document.as_bytes()),
+                "publish the LaunchAgent service receipt",
+            )?;
+            if NativeMacosUninstallBackend::query_registration(&self.target)?.is_some() {
+                return Err(CliError::Other(
+                    "refusing to publish the LaunchAgent service receipt because launchd loaded a registration while its replacement definition was being prepared. No service registration, definition, receipt, or runtime was changed; retry from a fresh service state"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
     }
 
     impl UnixInstallTransactionBackend for NativeMacosInstallBackend {
         fn prepare_replacement(&mut self) -> CliResult<()> {
+            self.was_loaded = self.revalidate_original_authority(false)?;
             if self.was_loaded {
                 run_command(
                     "launchctl",
@@ -4694,6 +4975,7 @@ mod macos {
                     ],
                 )?;
             }
+            self.revalidate_original_authority(true)?;
             self.definition
                 .replace(self.document.as_bytes())
                 .map_err(|error| {
@@ -4708,6 +4990,7 @@ mod macos {
                 "plutil",
                 &[OsString::from("-lint"), self.path.clone().into_os_string()],
             )?;
+            self.revalidate_replacement_before_receipt_publish()?;
             self.receipt_transaction
                 .replace(&self.receipt)
                 .map_err(|error| {
@@ -4774,14 +5057,7 @@ mod macos {
                         );
                     }
                 } else if !NativeMacosUninstallBackend::query_loaded(&self.target)?
-                    && let Err(error) = run_command(
-                        "launchctl",
-                        &[
-                            OsString::from("bootstrap"),
-                            self.domain.clone(),
-                            self.path.clone().into_os_string(),
-                        ],
-                    )
+                    && let Err(error) = start()
                 {
                     failures.push(format!("reload previous LaunchAgent: {error}"));
                 }
@@ -4813,8 +5089,11 @@ mod macos {
         path: PathBuf,
         domain: OsString,
         target: String,
+        helper_home: PathBuf,
+        installed_receipt: ServiceReceipt,
         was_loaded: bool,
         stopped: bool,
+        stop_requested: bool,
         original_definition_exists: bool,
         definition: codex_helper_core::ManagedFileTransaction,
         receipt: ServiceReceiptTransaction,
@@ -4825,7 +5104,6 @@ mod macos {
             let path = launch_agent_path()?;
             let domain = launchd_domain()?;
             let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
-            let was_loaded = Self::query_loaded(&target)?;
             let definition = codex_helper_core::ManagedFileTransaction::begin(
                 path.clone(),
                 MAX_SERVICE_DEFINITION_BYTES,
@@ -4837,33 +5115,111 @@ mod macos {
             let receipt = ServiceReceiptTransaction::begin(proxy_home_dir()).map_err(|error| {
                 CliError::Other(format!("begin service receipt removal: {error}"))
             })?;
+            let installed_receipt = receipt
+                .current()
+                .map_err(|error| {
+                    CliError::Other(format!(
+                        "read the locked service receipt before LaunchAgent removal: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    CliError::Other(
+                        "refusing to remove the LaunchAgent without a current service receipt. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying"
+                            .to_string(),
+                    )
+                })?;
+            if installed_receipt.platform_backend() != ServicePlatformBackend::MacosLaunchAgent {
+                return Err(CliError::Other(
+                    "refusing to remove the LaunchAgent with a receipt for another platform backend. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying"
+                        .to_string(),
+                ));
+            }
+            verify_unix_service_definition_snapshot(
+                &installed_receipt,
+                definition.current().bytes(),
+            )?;
+            let current_registration = Self::query_registration(&target)?;
+            verify_launchd_registration_snapshot(current_registration.as_deref(), &path)?;
             Ok(Self {
                 path,
                 domain,
                 target,
-                was_loaded,
+                helper_home: installed_receipt.helper_home().to_path_buf(),
+                installed_receipt,
+                was_loaded: false,
                 stopped: false,
+                stop_requested: false,
                 original_definition_exists,
                 definition,
                 receipt,
             })
         }
 
-        fn query_loaded(target: &str) -> CliResult<bool> {
+        fn query_registration(target: &str) -> CliResult<Option<String>> {
             match run_command(
                 "launchctl",
                 &[OsString::from("print"), OsString::from(target)],
             ) {
-                Ok(_) => Ok(true),
-                Err(error) if launchctl_reports_missing(&error) => Ok(false),
+                Ok(output) => Ok(Some(output)),
+                Err(error) if launchctl_reports_missing(&error) => Ok(None),
                 Err(error) => Err(CliError::Other(format!(
-                    "query LaunchAgent state before uninstalling it: {error}"
+                    "query the LaunchAgent registration before managing it: {error}"
                 ))),
             }
         }
 
+        fn query_loaded(target: &str) -> CliResult<bool> {
+            Self::query_registration(target).map(|registration| registration.is_some())
+        }
+
         fn is_loaded(&self) -> CliResult<bool> {
             Self::query_loaded(&self.target)
+        }
+
+        fn revalidate_installed_authority(&self, require_unloaded: bool) -> CliResult<bool> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                Some(&self.installed_receipt),
+                "remove the LaunchAgent",
+            )?;
+            verify_unix_service_definition_at(
+                &self.installed_receipt,
+                ServicePlatformBackend::MacosLaunchAgent,
+                &self.path,
+            )?;
+            let registration = Self::query_registration(&self.target)?;
+            verify_launchd_registration_snapshot(registration.as_deref(), &self.path)?;
+            if require_unloaded && registration.is_some() {
+                return Err(CliError::Other(
+                    "refusing to remove the LaunchAgent because it became loaded after the transaction began. No service registration, definition, receipt, or runtime was changed; retry from a fresh service state"
+                        .to_string(),
+                ));
+            }
+            Ok(registration.is_some())
+        }
+
+        fn revalidate_before_receipt_removal(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                Some(&self.installed_receipt),
+                "remove the LaunchAgent service receipt",
+            )?;
+            verify_current_unix_service_definition_bytes(
+                &self.path,
+                None,
+                "remove the LaunchAgent service receipt",
+            )?;
+            let registration = Self::query_registration(&self.target)?;
+            if self.stop_requested && registration.is_some() {
+                return Err(CliError::Other(
+                    "refusing to remove the LaunchAgent service receipt because launchd loaded the job after it was stopped. No service registration, definition, receipt, or runtime was changed; retry from a fresh service state"
+                        .to_string(),
+                ));
+            }
+            if let Some(registration) = registration.as_deref() {
+                verify_launchd_registration_snapshot(Some(registration), &self.path)?;
+            }
+            Ok(())
         }
     }
 
@@ -4876,10 +5232,11 @@ mod macos {
 
     impl ServiceUninstallTransactionBackend for NativeMacosUninstallBackend {
         fn stop_and_verify(&mut self) -> CliResult<()> {
-            if !self.is_loaded()? {
+            self.stop_requested = true;
+            self.was_loaded = self.revalidate_installed_authority(false)?;
+            if !self.was_loaded {
                 return Ok(());
             }
-            self.was_loaded = true;
             self.stopped = true;
             run_command(
                 "launchctl",
@@ -4907,6 +5264,7 @@ mod macos {
         }
 
         fn remove_definition(&mut self) -> CliResult<()> {
+            self.revalidate_installed_authority(self.stop_requested)?;
             self.definition.remove().map_err(|error| {
                 CliError::Other(format!(
                     "remove LaunchAgent definition {}: {error}",
@@ -4923,6 +5281,7 @@ mod macos {
         }
 
         fn remove_receipt(&mut self) -> CliResult<()> {
+            self.revalidate_before_receipt_removal()?;
             self.receipt.remove().map_err(|error| {
                 CliError::Other(format!(
                     "remove service receipt after LaunchAgent removal: {error}"
@@ -4952,14 +5311,7 @@ mod macos {
                     match self.is_loaded() {
                         Ok(true) => {}
                         Ok(false) => {
-                            if let Err(error) = run_command(
-                                "launchctl",
-                                &[
-                                    OsString::from("bootstrap"),
-                                    self.domain.clone(),
-                                    self.path.clone().into_os_string(),
-                                ],
-                            ) {
+                            if let Err(error) = start() {
                                 failures.push(format!("restart the previous LaunchAgent: {error}"));
                             } else {
                                 match self.is_loaded() {
@@ -4991,19 +5343,49 @@ mod macos {
         run_service_uninstall_transaction(&mut NativeMacosUninstallBackend::new()?, stop_first)
     }
 
-    pub(super) fn start() -> CliResult<()> {
+    pub(super) fn verify_receipt_definition(receipt: &ServiceReceipt) -> CliResult<()> {
+        let path = launch_agent_path()?;
+        verify_unix_service_definition_at(
+            receipt,
+            ServicePlatformBackend::MacosLaunchAgent,
+            &path,
+        )?;
         let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
-        match run_command(
-            "launchctl",
-            &[OsString::from("print"), OsString::from(&target)],
-        ) {
-            Ok(output) if output.contains("state = running") => Ok(()),
-            Ok(_) => run_command(
+        let registered_definition = NativeMacosUninstallBackend::query_registration(&target)?;
+        verify_launchd_registration_snapshot(registered_definition.as_deref(), &path)
+    }
+
+    fn read_verified_installed_receipt() -> CliResult<ServiceReceipt> {
+        let receipt = read_service_receipt(proxy_home_dir()).map_err(|error| {
+            CliError::Other(format!(
+                "refusing to manage the installed LaunchAgent without a current service receipt: {error}. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying"
+            ))
+        })?;
+        verify_receipt_definition(&receipt)?;
+        Ok(receipt)
+    }
+
+    pub(super) fn start() -> CliResult<()> {
+        read_verified_installed_receipt()?;
+        let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
+        if NativeMacosUninstallBackend::query_registration(&target)?
+            .as_deref()
+            .is_some_and(|output| output.contains("state = running"))
+        {
+            return Ok(());
+        }
+
+        // The state read above only selects the action. Revalidate receipt, definition, and
+        // registration immediately before the launchd mutation.
+        read_verified_installed_receipt()?;
+        match NativeMacosUninstallBackend::query_registration(&target)? {
+            Some(output) if output.contains("state = running") => Ok(()),
+            Some(_) => run_command(
                 "launchctl",
                 &[OsString::from("kickstart"), OsString::from(target)],
             )
             .map(|_| ()),
-            Err(error) if launchctl_reports_missing(&error) => run_command(
+            None => run_command(
                 "launchctl",
                 &[
                     OsString::from("bootstrap"),
@@ -5012,13 +5394,11 @@ mod macos {
                 ],
             )
             .map(|_| ()),
-            Err(error) => Err(CliError::Other(format!(
-                "query LaunchAgent state before starting it: {error}"
-            ))),
         }
     }
 
     pub(super) fn stop() -> CliResult<()> {
+        read_verified_installed_receipt()?;
         let target = format!("{}/{MACOS_LABEL}", launchd_domain_string()?);
         let domain = launchd_domain()?;
         let path = launch_agent_path()?;
@@ -5030,6 +5410,7 @@ mod macos {
                 )
             },
             || {
+                read_verified_installed_receipt()?;
                 run_command(
                     "launchctl",
                     &[OsString::from("bootout"), domain, path.into_os_string()],
@@ -5160,34 +5541,7 @@ mod macos {
         log_dir: &Path,
         options: &ServiceInstallOptions,
     ) -> String {
-        let service_flag = if options.service_name == "claude" {
-            "--claude"
-        } else {
-            "--codex"
-        };
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{MACOS_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>serve</string><string>{service_flag}</string><string>--host</string><string>{}</string><string>--port</string><string>{}</string><string>--no-tui</string><string>--service-managed</string></array>\n<key>EnvironmentVariables</key><dict><key>CODEX_HELPER_HOME</key><string>{}</string><key>{}</key><string>{}</string><key>{}</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
-            xml_escape(executable.to_string_lossy().as_ref()),
-            options.host,
-            options.port,
-            xml_escape(options.helper_home.to_string_lossy().as_ref()),
-            service_client_home_env(options.service_name),
-            xml_escape(options.client_home.to_string_lossy().as_ref()),
-            codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR,
-            options.install_generation,
-            xml_escape(
-                log_dir
-                    .join("service.stdout.log")
-                    .to_string_lossy()
-                    .as_ref()
-            ),
-            xml_escape(
-                log_dir
-                    .join("service.stderr.log")
-                    .to_string_lossy()
-                    .as_ref()
-            ),
-        )
+        render_launch_agent_definition(executable, log_dir, options)
     }
 
     fn base_status(
@@ -5214,58 +5568,249 @@ mod macos {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn render_launch_agent_definition(
+    executable: &Path,
+    log_dir: &Path,
+    options: &ServiceInstallOptions,
+) -> String {
+    let service_flag = if options.service_name == "claude" {
+        "--claude"
+    } else {
+        "--codex"
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{MACOS_LABEL}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>serve</string><string>{service_flag}</string><string>--host</string><string>{}</string><string>--port</string><string>{}</string><string>--no-tui</string><string>--service-managed</string></array>\n<key>EnvironmentVariables</key><dict><key>CODEX_HELPER_HOME</key><string>{}</string><key>{}</key><string>{}</string><key>{}</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+        xml_escape(executable.to_string_lossy().as_ref()),
+        options.host,
+        options.port,
+        xml_escape(options.helper_home.to_string_lossy().as_ref()),
+        service_client_home_env(options.service_name),
+        xml_escape(options.client_home.to_string_lossy().as_ref()),
+        codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR,
+        options.install_generation,
+        xml_escape(
+            log_dir
+                .join("service.stdout.log")
+                .to_string_lossy()
+                .as_ref()
+        ),
+        xml_escape(
+            log_dir
+                .join("service.stderr.log")
+                .to_string_lossy()
+                .as_ref()
+        ),
+    )
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
 
     struct NativeLinuxInstallBackend {
+        path: PathBuf,
+        helper_home: PathBuf,
+        installed_receipt: Option<ServiceReceipt>,
         was_active: bool,
         was_enabled: bool,
         definition: codex_helper_core::ManagedFileTransaction,
         receipt_transaction: ServiceReceiptTransaction,
         receipt: ServiceReceipt,
         document: String,
+        replacement_enabled: bool,
+        replacement_receipt_published: bool,
         replacement_start_attempted: bool,
     }
 
     impl NativeLinuxInstallBackend {
         fn new(options: ServiceInstallOptions) -> CliResult<Self> {
             let executable = service_executable(&current_executable()?)?;
-            ensure_service_log_dir()?;
             systemctl(&["show-environment"])?;
             let path = user_unit_path()?;
             let document = render_systemd_unit(&executable, &options);
-            let load_state = systemd_property("LoadState")?;
-            let unit_was_present = systemd_load_state_is_present(&load_state)?;
-            let was_active = unit_was_present
-                && systemd_active_state_requires_stop(&systemd_property("ActiveState")?)?;
-            let was_enabled = unit_was_present
-                && systemd_unit_file_state_requires_disable(&systemd_property("UnitFileState")?)?;
             let definition = codex_helper_core::ManagedFileTransaction::begin(
-                path,
+                path.clone(),
                 MAX_SERVICE_DEFINITION_BYTES,
             )
             .map_err(|error| CliError::Other(format!("begin systemd unit transaction: {error}")))?;
             let (receipt_transaction, receipt, install_preflight) =
                 begin_service_receipt_transaction_with_daemon_executable(&options, &executable)?;
+            verify_unix_service_install_replacement(
+                install_preflight.installed_receipt.as_ref(),
+                definition.current().bytes(),
+                ServicePlatformBackend::LinuxSystemdUser,
+            )?;
+            match install_preflight.installed_receipt.as_ref() {
+                Some(_) => verify_registration(&path)?,
+                None => verify_registration_absent()?,
+            }
+            ensure_service_log_dir()?;
             prepare_service_switch_for_install(&options, &install_preflight)?;
             Ok(Self {
-                was_active,
-                was_enabled,
+                path,
+                helper_home: receipt.helper_home().to_path_buf(),
+                installed_receipt: install_preflight.installed_receipt,
+                was_active: false,
+                was_enabled: false,
                 definition,
                 receipt_transaction,
                 receipt,
                 document,
+                replacement_enabled: false,
+                replacement_receipt_published: false,
                 replacement_start_attempted: false,
             })
+        }
+
+        fn revalidate_original_authority(&self) -> CliResult<(bool, bool)> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                self.installed_receipt.as_ref(),
+                "replace the systemd user unit",
+            )?;
+            match self.installed_receipt.as_ref() {
+                Some(receipt) => {
+                    verify_unix_service_definition_at(
+                        receipt,
+                        ServicePlatformBackend::LinuxSystemdUser,
+                        &self.path,
+                    )?;
+                    verify_registration(&self.path)?;
+                    Ok((
+                        systemd_active_state_requires_stop(&systemd_property("ActiveState")?)?,
+                        systemd_unit_file_state_requires_disable(&systemd_property(
+                            "UnitFileState",
+                        )?)?,
+                    ))
+                }
+                None => {
+                    verify_current_unix_service_definition_bytes(
+                        &self.path,
+                        None,
+                        "replace the systemd user unit",
+                    )?;
+                    verify_registration_absent()?;
+                    Ok((false, false))
+                }
+            }
+        }
+
+        fn revalidate_replacement_before_manager_reload(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                self.installed_receipt.as_ref(),
+                "reload the replacement systemd user unit",
+            )?;
+            verify_current_unix_service_definition_bytes(
+                &self.path,
+                Some(self.document.as_bytes()),
+                "reload the replacement systemd user unit",
+            )?;
+            verify_replacement_registration_before_reload(
+                &self.path,
+                self.installed_receipt.is_none(),
+            )
+        }
+
+        fn revalidate_replacement_before_enable(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                self.installed_receipt.as_ref(),
+                "enable the replacement systemd user unit",
+            )?;
+            verify_current_unix_service_definition_bytes(
+                &self.path,
+                Some(self.document.as_bytes()),
+                "enable the replacement systemd user unit",
+            )?;
+            verify_replacement_registration_after_reload(&self.path)
+        }
+
+        fn revalidate_replacement_before_receipt_publish(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                self.installed_receipt.as_ref(),
+                "publish the systemd service receipt",
+            )?;
+            verify_current_unix_service_definition_bytes(
+                &self.path,
+                Some(self.document.as_bytes()),
+                "publish the systemd service receipt",
+            )?;
+            verify_registration(&self.path)
+        }
+
+        fn revalidate_replacement_before_rollback_disable(&self) -> CliResult<()> {
+            let expected_receipt = if self.replacement_receipt_published {
+                Some(&self.receipt)
+            } else {
+                self.installed_receipt.as_ref()
+            };
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                expected_receipt,
+                "disable the replacement systemd user unit during rollback",
+            )?;
+            verify_current_unix_service_definition_bytes(
+                &self.path,
+                Some(self.document.as_bytes()),
+                "disable the replacement systemd user unit during rollback",
+            )?;
+            verify_registration(&self.path)
+        }
+
+        fn revalidate_restored_definition_before_manager_reload(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                self.installed_receipt.as_ref(),
+                "reload restored systemd user units",
+            )?;
+            match self.installed_receipt.as_ref() {
+                Some(receipt) => {
+                    verify_unix_service_definition_at(
+                        receipt,
+                        ServicePlatformBackend::LinuxSystemdUser,
+                        &self.path,
+                    )?;
+                    verify_replacement_registration_before_reload(&self.path, false)
+                }
+                None => {
+                    verify_current_unix_service_definition_bytes(
+                        &self.path,
+                        None,
+                        "reload restored systemd user units",
+                    )?;
+                    verify_registration_after_definition_removal(&self.path)
+                }
+            }
+        }
+
+        fn revalidate_restored_definition_before_enablement(&self) -> CliResult<()> {
+            let Some(receipt) = self.installed_receipt.as_ref() else {
+                return verify_registration_absent();
+            };
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                Some(receipt),
+                "restore systemd user unit enablement",
+            )?;
+            verify_unix_service_definition_at(
+                receipt,
+                ServicePlatformBackend::LinuxSystemdUser,
+                &self.path,
+            )?;
+            verify_replacement_registration_after_reload(&self.path)
         }
     }
 
     impl UnixInstallTransactionBackend for NativeLinuxInstallBackend {
         fn prepare_replacement(&mut self) -> CliResult<()> {
+            (self.was_active, self.was_enabled) = self.revalidate_original_authority()?;
             if self.was_active {
                 systemctl(&["stop", LINUX_UNIT_NAME])?;
             }
+            self.revalidate_original_authority()?;
             self.definition
                 .replace(self.document.as_bytes())
                 .map_err(|error| CliError::Other(format!("publish systemd user unit: {error}")))?;
@@ -5274,8 +5819,11 @@ mod linux {
                     "systemd user unit failed transaction read-back verification".to_string(),
                 ));
             }
+            self.revalidate_replacement_before_manager_reload()?;
             systemctl(&["daemon-reload"])?;
+            self.revalidate_replacement_before_enable()?;
             systemctl(&["enable", LINUX_UNIT_NAME])?;
+            self.replacement_enabled = true;
             if !matches!(
                 systemctl_output(&["is-enabled", LINUX_UNIT_NAME]).as_deref(),
                 Ok("enabled")
@@ -5284,16 +5832,19 @@ mod linux {
                     "systemd user unit did not report enabled after installation".to_string(),
                 ));
             }
+            self.revalidate_replacement_before_receipt_publish()?;
             self.receipt_transaction
                 .replace(&self.receipt)
                 .map_err(|error| {
                     CliError::Other(format!("publish systemd service receipt: {error}"))
-                })
+                })?;
+            self.replacement_receipt_published = true;
+            Ok(())
         }
 
         fn start_replacement(&mut self) -> CliResult<()> {
             self.replacement_start_attempted = true;
-            systemctl(&["start", LINUX_UNIT_NAME])
+            start()
         }
 
         async fn verify_started_runtime_identity(
@@ -5305,7 +5856,7 @@ mod linux {
         fn rollback(&mut self) -> CliResult<()> {
             let mut failures = Vec::new();
             let replacement_stopped = if self.replacement_start_attempted {
-                match systemctl(&["stop", LINUX_UNIT_NAME]) {
+                match stop() {
                     Ok(()) => true,
                     Err(stop_error) => match systemd_property("ActiveState") {
                         Ok(state) if matches!(state.as_str(), "inactive" | "failed") => true,
@@ -5333,25 +5884,58 @@ mod linux {
                 );
                 return Err(CliError::Other(failures.join("; ")));
             }
+            if self.installed_receipt.is_none() && self.replacement_enabled {
+                if let Err(error) = self
+                    .revalidate_replacement_before_rollback_disable()
+                    .and_then(|()| systemctl(&["disable", LINUX_UNIT_NAME]))
+                {
+                    failures.push(format!(
+                        "disable the replacement systemd user unit before removing its definition: {error}"
+                    ));
+                    failures.push(
+                        "the replacement systemd unit and service receipt were preserved because its registration could not be disabled safely"
+                            .to_string(),
+                    );
+                    return Err(CliError::Other(failures.join("; ")));
+                }
+            }
             if let Err(error) = self.receipt_transaction.rollback() {
                 failures.push(format!("restore previous service receipt: {error}"));
             }
             if let Err(error) = self.definition.rollback() {
                 failures.push(format!("restore previous systemd user unit: {error}"));
             }
-            if let Err(error) = systemctl(&["daemon-reload"]) {
-                failures.push(format!("reload restored systemd user units: {error}"));
-            }
-            let restore_enablement = if self.was_enabled {
-                systemctl(&["enable", LINUX_UNIT_NAME])
-            } else {
-                systemctl(&["disable", LINUX_UNIT_NAME])
+            let reloaded = match self.revalidate_restored_definition_before_manager_reload() {
+                Ok(()) => match systemctl(&["daemon-reload"]) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        failures.push(format!("reload restored systemd user units: {error}"));
+                        false
+                    }
+                },
+                Err(error) => {
+                    failures.push(format!(
+                        "revalidate restored systemd user unit before manager reload: {error}"
+                    ));
+                    false
+                }
             };
-            if let Err(error) = restore_enablement {
-                failures.push(format!("restore systemd user unit enablement: {error}"));
+            if reloaded && self.installed_receipt.is_some() {
+                let restore_enablement = self
+                    .revalidate_restored_definition_before_enablement()
+                    .and_then(|()| {
+                        if self.was_enabled {
+                            systemctl(&["enable", LINUX_UNIT_NAME])
+                        } else {
+                            systemctl(&["disable", LINUX_UNIT_NAME])
+                        }
+                    });
+                if let Err(error) = restore_enablement {
+                    failures.push(format!("restore systemd user unit enablement: {error}"));
+                }
             }
             if self.was_active {
-                match systemctl(&["start", LINUX_UNIT_NAME]) {
+                match start() {
                     Ok(()) => match systemd_property("ActiveState") {
                         Ok(state) if state == "active" => {}
                         Ok(state) => failures.push(format!(
@@ -5383,6 +5967,8 @@ mod linux {
 
     struct NativeLinuxUninstallBackend {
         path: PathBuf,
+        helper_home: PathBuf,
+        installed_receipt: ServiceReceipt,
         restore_active: bool,
         restore_enabled: bool,
         stopped: bool,
@@ -5394,18 +5980,6 @@ mod linux {
     impl NativeLinuxUninstallBackend {
         fn new() -> CliResult<Self> {
             let path = user_unit_path()?;
-            let load_state = systemd_property("LoadState")?;
-            let load_state_is_present = systemd_load_state_is_present(&load_state)?;
-            let restore_active = if !load_state_is_present {
-                false
-            } else {
-                systemd_active_state_requires_stop(&systemd_property("ActiveState")?)?
-            };
-            let restore_enabled = if !load_state_is_present {
-                false
-            } else {
-                systemd_unit_file_state_requires_disable(&systemd_property("UnitFileState")?)?
-            };
             let definition = codex_helper_core::ManagedFileTransaction::begin(
                 path.clone(),
                 MAX_SERVICE_DEFINITION_BYTES,
@@ -5416,27 +5990,139 @@ mod linux {
             let receipt = ServiceReceiptTransaction::begin(proxy_home_dir()).map_err(|error| {
                 CliError::Other(format!("begin service receipt removal: {error}"))
             })?;
+            let installed_receipt = receipt
+                .current()
+                .map_err(|error| {
+                    CliError::Other(format!(
+                        "read the locked service receipt before systemd unit removal: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    CliError::Other(
+                        "refusing to remove the systemd user unit without a current service receipt. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying"
+                            .to_string(),
+                    )
+                })?;
+            if installed_receipt.platform_backend() != ServicePlatformBackend::LinuxSystemdUser {
+                return Err(CliError::Other(
+                    "refusing to remove the systemd user unit with a receipt for another platform backend. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying"
+                        .to_string(),
+                ));
+            }
+            verify_unix_service_definition_snapshot(
+                &installed_receipt,
+                definition.current().bytes(),
+            )?;
+            verify_registration(&path)?;
             Ok(Self {
                 path,
-                restore_active,
-                restore_enabled,
+                helper_home: installed_receipt.helper_home().to_path_buf(),
+                installed_receipt,
+                restore_active: false,
+                restore_enabled: false,
                 stopped: false,
                 disabled: false,
                 definition,
                 receipt,
             })
         }
+
+        fn revalidate_installed_authority(&self, operation: &str) -> CliResult<(bool, bool)> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                Some(&self.installed_receipt),
+                operation,
+            )?;
+            verify_unix_service_definition_at(
+                &self.installed_receipt,
+                ServicePlatformBackend::LinuxSystemdUser,
+                &self.path,
+            )?;
+            verify_registration(&self.path)?;
+            Ok((
+                systemd_active_state_requires_stop(&systemd_property("ActiveState")?)?,
+                systemd_unit_file_state_requires_disable(&systemd_property("UnitFileState")?)?,
+            ))
+        }
+
+        fn revalidate_disabled_definition_authority(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                Some(&self.installed_receipt),
+                "remove the systemd user unit",
+            )?;
+            verify_unix_service_definition_at(
+                &self.installed_receipt,
+                ServicePlatformBackend::LinuxSystemdUser,
+                &self.path,
+            )?;
+            verify_registration_with_unit_file_states(&self.path, &["disabled"], Some("no"))
+        }
+
+        fn revalidate_removed_definition_before_manager_reload(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                Some(&self.installed_receipt),
+                "reload systemd after removing the user unit",
+            )?;
+            verify_current_unix_service_definition_bytes(
+                &self.path,
+                None,
+                "reload systemd after removing the user unit",
+            )?;
+            verify_registration_after_definition_removal(&self.path)
+        }
+
+        fn revalidate_before_receipt_removal(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                Some(&self.installed_receipt),
+                "remove the systemd service receipt",
+            )?;
+            verify_current_unix_service_definition_bytes(
+                &self.path,
+                None,
+                "remove the systemd service receipt",
+            )?;
+            verify_registration_absent()
+        }
+
+        fn revalidate_restored_definition_before_manager_reload(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                Some(&self.installed_receipt),
+                "reload the restored systemd user unit",
+            )?;
+            verify_unix_service_definition_at(
+                &self.installed_receipt,
+                ServicePlatformBackend::LinuxSystemdUser,
+                &self.path,
+            )?;
+            verify_registration_after_definition_removal(&self.path)
+        }
+
+        fn revalidate_restored_definition_before_enablement(&self) -> CliResult<()> {
+            verify_current_service_receipt_snapshot(
+                &self.helper_home,
+                Some(&self.installed_receipt),
+                "restore systemd user unit enablement",
+            )?;
+            verify_unix_service_definition_at(
+                &self.installed_receipt,
+                ServicePlatformBackend::LinuxSystemdUser,
+                &self.path,
+            )?;
+            verify_replacement_registration_after_reload(&self.path)
+        }
     }
 
     impl ServiceUninstallTransactionBackend for NativeLinuxUninstallBackend {
         fn stop_and_verify(&mut self) -> CliResult<()> {
-            let load_state = systemd_property("LoadState")?;
-            if !systemd_load_state_is_present(&load_state)? {
-                return Ok(());
-            }
-            let active_state = systemd_property("ActiveState")?;
-            if systemd_active_state_requires_stop(&active_state)? {
-                self.restore_active = true;
+            let (was_active, _) = self.revalidate_installed_authority(
+                "stop the systemd user unit before uninstalling it",
+            )?;
+            self.restore_active = was_active;
+            if was_active {
                 self.stopped = true;
                 systemctl(&["stop", LINUX_UNIT_NAME]).map_err(|error| {
                     CliError::Other(format!(
@@ -5454,13 +6140,11 @@ mod linux {
         }
 
         fn disable_and_verify(&mut self) -> CliResult<()> {
-            let load_state = systemd_property("LoadState")?;
-            if !systemd_load_state_is_present(&load_state)? {
-                return Ok(());
-            }
-            let unit_file_state = systemd_property("UnitFileState")?;
-            if systemd_unit_file_state_requires_disable(&unit_file_state)? {
-                self.restore_enabled = true;
+            let (_, was_enabled) = self.revalidate_installed_authority(
+                "disable the systemd user unit before removing it",
+            )?;
+            self.restore_enabled = was_enabled;
+            if was_enabled {
                 self.disabled = true;
                 systemctl(&["disable", LINUX_UNIT_NAME]).map_err(|error| {
                     CliError::Other(format!(
@@ -5478,6 +6162,7 @@ mod linux {
         }
 
         fn remove_definition(&mut self) -> CliResult<()> {
+            self.revalidate_disabled_definition_authority()?;
             self.definition.remove().map_err(|error| {
                 CliError::Other(format!(
                     "remove systemd user unit {}: {error}",
@@ -5490,6 +6175,7 @@ mod linux {
                     self.path.display()
                 )));
             }
+            self.revalidate_removed_definition_before_manager_reload()?;
             systemctl(&["daemon-reload"]).map_err(|error| {
                 CliError::Other(format!(
                     "reload systemd after removing {LINUX_UNIT_NAME}: {error}"
@@ -5498,6 +6184,7 @@ mod linux {
         }
 
         fn remove_receipt(&mut self) -> CliResult<()> {
+            self.revalidate_before_receipt_removal()?;
             self.receipt.remove().map_err(|error| {
                 CliError::Other(format!(
                     "remove service receipt after systemd unit removal: {error}"
@@ -5518,24 +6205,35 @@ mod linux {
                 failures.push(format!("restore the service receipt: {error}"));
             }
             if definition_restored {
-                let reloaded = match systemctl(&["daemon-reload"]) {
-                    Ok(()) => true,
+                let reloaded = match self.revalidate_restored_definition_before_manager_reload() {
+                    Ok(()) => match systemctl(&["daemon-reload"]) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            failures
+                                .push(format!("reload the restored systemd user unit: {error}"));
+                            false
+                        }
+                    },
                     Err(error) => {
-                        failures.push(format!("reload the restored systemd user unit: {error}"));
+                        failures.push(format!(
+                            "revalidate the restored systemd user unit before manager reload: {error}"
+                        ));
                         false
                     }
                 };
                 if reloaded
                     && self.disabled
                     && self.restore_enabled
-                    && let Err(error) = systemctl(&["enable", LINUX_UNIT_NAME])
+                    && let Err(error) = self
+                        .revalidate_restored_definition_before_enablement()
+                        .and_then(|()| systemctl(&["enable", LINUX_UNIT_NAME]))
                 {
                     failures.push(format!("re-enable the previous systemd user unit: {error}"));
                 }
                 if reloaded
                     && self.stopped
                     && self.restore_active
-                    && let Err(error) = systemctl(&["start", LINUX_UNIT_NAME])
+                    && let Err(error) = start()
                 {
                     failures.push(format!("restart the previous systemd user unit: {error}"));
                 }
@@ -5552,11 +6250,33 @@ mod linux {
         run_service_uninstall_transaction(&mut NativeLinuxUninstallBackend::new()?, stop_first)
     }
 
+    pub(super) fn verify_receipt_definition(receipt: &ServiceReceipt) -> CliResult<()> {
+        let path = user_unit_path()?;
+        verify_unix_service_definition_at(
+            receipt,
+            ServicePlatformBackend::LinuxSystemdUser,
+            &path,
+        )?;
+        verify_registration(&path)
+    }
+
+    fn read_verified_installed_receipt() -> CliResult<ServiceReceipt> {
+        let receipt = read_service_receipt(proxy_home_dir()).map_err(|error| {
+            CliError::Other(format!(
+                "refusing to manage the installed systemd user unit without a current service receipt: {error}. No service registration, definition, receipt, or runtime was changed; repair or reinstall the service before retrying"
+            ))
+        })?;
+        verify_receipt_definition(&receipt)?;
+        Ok(receipt)
+    }
+
     pub(super) fn start() -> CliResult<()> {
+        read_verified_installed_receipt()?;
         systemctl(&["start", LINUX_UNIT_NAME])
     }
 
     pub(super) fn stop() -> CliResult<()> {
+        read_verified_installed_receipt()?;
         systemctl(&["stop", LINUX_UNIT_NAME])
     }
 
@@ -5632,6 +6352,103 @@ mod linux {
         systemctl_output(&["show", LINUX_UNIT_NAME, property.as_str(), "--value"])
     }
 
+    fn verify_registration_with_unit_file_states(
+        expected_definition_path: &Path,
+        allowed_unit_file_states: &[&str],
+        expected_need_daemon_reload: Option<&str>,
+    ) -> CliResult<()> {
+        let load_state = systemd_property("LoadState")?;
+        let unit_file_state = systemd_property("UnitFileState")?;
+        let fragment_path = systemd_property("FragmentPath")?;
+        let drop_in_paths = systemd_property("DropInPaths")?;
+        let need_daemon_reload = systemd_property("NeedDaemonReload")?;
+        let fragment_matches = if load_state == "loaded" && !fragment_path.is_empty() {
+            service_paths_identify_same_location(
+                Path::new(&fragment_path),
+                expected_definition_path,
+            )
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "refusing to mutate the systemd user service because FragmentPath={fragment_path:?} is not a valid comparable authority: {error}. No service registration, definition, receipt, or runtime was changed; repair the matching unit before retrying"
+                ))
+            })?
+        } else {
+            false
+        };
+        let reload_matches = match expected_need_daemon_reload {
+            Some(expected) => need_daemon_reload == expected,
+            None => true,
+        };
+        if load_state == "loaded"
+            && allowed_unit_file_states.contains(&unit_file_state.as_str())
+            && fragment_matches
+            && drop_in_paths.is_empty()
+            && reload_matches
+        {
+            return Ok(());
+        }
+        Err(CliError::Other(format!(
+            "refusing to mutate the systemd user service because its current registration no longer matches the transaction authority (LoadState={load_state:?}, UnitFileState={unit_file_state:?}, FragmentPath={fragment_path:?}, DropInPaths={drop_in_paths:?}, NeedDaemonReload={need_daemon_reload:?}, expected={}). No service registration, definition, receipt, or runtime was changed; retry from a fresh service state",
+            expected_definition_path.display(),
+        )))
+    }
+
+    fn verify_replacement_registration_before_reload(
+        expected_definition_path: &Path,
+        allow_absent: bool,
+    ) -> CliResult<()> {
+        let load_state = systemd_property("LoadState")?;
+        if allow_absent && load_state == "not-found" {
+            return Ok(());
+        }
+        verify_registration_with_unit_file_states(
+            expected_definition_path,
+            &["enabled", "disabled"],
+            None,
+        )
+    }
+
+    fn verify_replacement_registration_after_reload(
+        expected_definition_path: &Path,
+    ) -> CliResult<()> {
+        verify_registration_with_unit_file_states(
+            expected_definition_path,
+            &["enabled", "disabled"],
+            Some("no"),
+        )
+    }
+
+    fn verify_registration_after_definition_removal(
+        expected_definition_path: &Path,
+    ) -> CliResult<()> {
+        let load_state = systemd_property("LoadState")?;
+        if load_state == "not-found" {
+            return Ok(());
+        }
+        verify_registration_with_unit_file_states(expected_definition_path, &["disabled"], None)
+    }
+
+    fn verify_registration(expected_definition_path: &Path) -> CliResult<()> {
+        verify_systemd_registration_snapshot(
+            &systemd_property("LoadState")?,
+            &systemd_property("UnitFileState")?,
+            &systemd_property("FragmentPath")?,
+            &systemd_property("DropInPaths")?,
+            &systemd_property("NeedDaemonReload")?,
+            expected_definition_path,
+        )
+    }
+
+    fn verify_registration_absent() -> CliResult<()> {
+        let load_state = systemd_property("LoadState")?;
+        if load_state == "not-found" {
+            return Ok(());
+        }
+        Err(CliError::Other(format!(
+            "refusing to replace a systemd user registration with LoadState={load_state:?} without a current service receipt proving it. No service registration, definition, receipt, or runtime was changed; remove the unverified registration, then run `codex-helper service install`"
+        )))
+    }
+
     fn systemd_active_state_requires_stop(state: &str) -> CliResult<bool> {
         match state {
             "active" | "activating" | "deactivating" | "reloading" | "refreshing" => Ok(true),
@@ -5705,7 +6522,7 @@ mod linux {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn render_systemd_unit(executable: &Path, options: &ServiceInstallOptions) -> String {
     let service_flag = if options.service_name == "claude" {
         "--claude"
@@ -5730,7 +6547,7 @@ fn render_systemd_unit(executable: &Path, options: &ServiceInstallOptions) -> St
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn systemd_environment_assignment(name: &str, value: &Path) -> String {
     let assignment = format!("{name}={}", value.to_string_lossy());
     format!(
@@ -5817,7 +6634,7 @@ fn replace_service_definition(temporary: &Path, destination: &Path) -> std::io::
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -5827,7 +6644,7 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn systemd_quote(path: &Path) -> String {
     let value = path.to_string_lossy();
     if value
@@ -5890,6 +6707,459 @@ mod tests {
             codex_helper_core::service_target::ServiceInstallGeneration::generate(),
         )
         .expect("build service identity receipt")
+    }
+
+    fn test_unix_definition_receipt(
+        backend: ServicePlatformBackend,
+        service: codex_helper_core::config::ServiceKind,
+        proxy_port: u16,
+        helper_home: &Path,
+        client_home: &Path,
+        daemon_executable: &Path,
+        install_generation: codex_helper_core::service_target::ServiceInstallGeneration,
+    ) -> ServiceReceipt {
+        ServiceReceipt::new(
+            service,
+            helper_home.to_path_buf(),
+            client_home.to_path_buf(),
+            codex_helper_core::proxy::local_admin_base_url_for_proxy_port(proxy_port),
+            backend,
+            install_generation,
+        )
+        .expect("build Unix service receipt")
+        .with_daemon_executable(daemon_executable.to_path_buf())
+        .expect("record Unix daemon executable authority")
+    }
+
+    #[test]
+    fn unix_service_receipts_reconstruct_complete_platform_definitions() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-unix-definition-authority-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper home");
+        let client_home = root.join("client home");
+        let executable = root.join("bin").join("codex-helper");
+
+        for backend in [
+            ServicePlatformBackend::MacosLaunchAgent,
+            ServicePlatformBackend::LinuxSystemdUser,
+        ] {
+            let receipt = test_unix_definition_receipt(
+                backend,
+                codex_helper_core::config::ServiceKind::Codex,
+                3211,
+                &helper_home,
+                &client_home,
+                &executable,
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+            );
+            let definition =
+                expected_unix_service_definition(&receipt).expect("reconstruct definition");
+
+            verify_unix_service_definition_snapshot(&receipt, Some(&definition))
+                .expect("the exact reconstructed definition must be authoritative");
+            let definition = String::from_utf8(definition).expect("definition is UTF-8");
+            assert!(definition.contains("codex-helper"));
+            assert!(definition.contains("3211"));
+            assert!(definition.contains(receipt.install_generation().as_str()));
+            assert!(definition.contains("CODEX_HELPER_HOME"));
+            assert!(definition.contains("CODEX_HOME"));
+            assert!(definition.contains("service-managed"));
+        }
+    }
+
+    #[test]
+    fn unix_service_definition_verifier_rejects_every_authoritative_field_tamper() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-unix-definition-tamper-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_home = root.join("client");
+        let executable = root.join("bin").join("codex-helper");
+        let receipt = test_unix_definition_receipt(
+            ServicePlatformBackend::LinuxSystemdUser,
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+            &executable,
+            codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        );
+        let options = service_install_options_from_receipt(&receipt, false)
+            .expect("derive installed options");
+        let mut tampered_definitions = Vec::new();
+
+        tampered_definitions.push(render_systemd_unit(
+            &root.join("other-bin").join("codex-helper"),
+            &options,
+        ));
+        let mut tampered_command = render_systemd_unit(&executable, &options);
+        tampered_command = tampered_command.replacen(" serve ", " proxy ", 1);
+        tampered_definitions.push(tampered_command);
+        let mut tampered_host = options.clone();
+        tampered_host.host = IpAddr::from([127, 0, 0, 2]);
+        tampered_definitions.push(render_systemd_unit(&executable, &tampered_host));
+        let mut tampered_port = options.clone();
+        tampered_port.port = 4321;
+        tampered_definitions.push(render_systemd_unit(&executable, &tampered_port));
+        let mut tampered_helper_home = options.clone();
+        tampered_helper_home.helper_home = root.join("other-helper");
+        tampered_definitions.push(render_systemd_unit(&executable, &tampered_helper_home));
+        let mut tampered_client_home = options.clone();
+        tampered_client_home.client_home = root.join("other-client");
+        tampered_definitions.push(render_systemd_unit(&executable, &tampered_client_home));
+        let mut tampered_generation = options.clone();
+        tampered_generation.install_generation =
+            codex_helper_core::service_target::ServiceInstallGeneration::generate();
+        tampered_definitions.push(render_systemd_unit(&executable, &tampered_generation));
+        let mut tampered_service = options;
+        tampered_service.service_name = "claude";
+        tampered_definitions.push(render_systemd_unit(&executable, &tampered_service));
+
+        for definition in tampered_definitions {
+            let error =
+                verify_unix_service_definition_snapshot(&receipt, Some(definition.as_bytes()))
+                    .expect_err("every authoritative field change must fail closed");
+            assert!(error.to_string().contains("does not match"));
+            assert!(error.to_string().contains("No service registration"));
+        }
+    }
+
+    #[test]
+    fn unix_service_definition_verifier_rejects_missing_definition_and_authority() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-unix-definition-missing-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_home = root.join("client");
+        let executable = root.join("bin").join("codex-helper");
+        let generation = codex_helper_core::service_target::ServiceInstallGeneration::generate();
+        let current = test_unix_definition_receipt(
+            ServicePlatformBackend::LinuxSystemdUser,
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+            &executable,
+            generation.clone(),
+        );
+        let missing_definition = verify_unix_service_definition_snapshot(&current, None)
+            .expect_err("a missing definition must fail closed");
+        assert!(
+            missing_definition
+                .to_string()
+                .contains("definition is missing")
+        );
+
+        let compatibility = ServiceReceipt::new(
+            codex_helper_core::config::ServiceKind::Codex,
+            helper_home,
+            client_home,
+            codex_helper_core::proxy::local_admin_base_url_for_proxy_port(3211),
+            ServicePlatformBackend::LinuxSystemdUser,
+            generation,
+        )
+        .expect("build schema-1 compatibility receipt");
+        let missing_authority =
+            verify_unix_service_definition_snapshot(&compatibility, Some(b"untrusted definition"))
+                .expect_err("a receipt without daemon authority must fail closed");
+        assert!(missing_authority.to_string().contains("daemon_executable"));
+        assert!(missing_authority.to_string().contains("service install"));
+    }
+
+    #[test]
+    fn unix_mutation_boundary_rereads_definition_and_receipt_after_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-unix-mutation-revalidation-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_home = root.join("client");
+        let executable = root.join("bin").join("codex-helper");
+        let definition_path = root.join("codex-helper.service");
+        std::fs::create_dir_all(&root).expect("create mutation revalidation test root");
+
+        let installed = test_unix_definition_receipt(
+            ServicePlatformBackend::LinuxSystemdUser,
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+            &executable,
+            codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        );
+        let expected_definition =
+            expected_unix_service_definition(&installed).expect("render installed definition");
+        std::fs::write(&definition_path, &expected_definition)
+            .expect("write initial unit definition");
+
+        {
+            let definition_transaction = codex_helper_core::ManagedFileTransaction::begin(
+                definition_path.clone(),
+                MAX_SERVICE_DEFINITION_BYTES,
+            )
+            .expect("begin definition transaction");
+            verify_unix_service_definition_at(
+                &installed,
+                ServicePlatformBackend::LinuxSystemdUser,
+                &definition_path,
+            )
+            .expect("initial definition authority");
+
+            // This is the deterministic replacement hook between transaction setup and mutation.
+            std::fs::write(&definition_path, b"foreign unit definition")
+                .expect("replace definition after initial snapshot");
+            assert_eq!(
+                definition_transaction.current().bytes(),
+                Some(expected_definition.as_slice()),
+                "the transaction cache intentionally retains its original snapshot"
+            );
+            let error = verify_unix_service_definition_at(
+                &installed,
+                ServicePlatformBackend::LinuxSystemdUser,
+                &definition_path,
+            )
+            .expect_err("the mutation-boundary revalidation must reread the replacement");
+            assert!(error.to_string().contains("does not match"), "{error}");
+        }
+
+        {
+            let mut publish = ServiceReceiptTransaction::begin(helper_home.clone())
+                .expect("begin initial receipt publication");
+            publish
+                .replace(&installed)
+                .expect("publish initial receipt");
+        }
+        let replacement = test_unix_definition_receipt(
+            ServicePlatformBackend::LinuxSystemdUser,
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+            &executable,
+            codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        );
+        {
+            let receipt_transaction = ServiceReceiptTransaction::begin(helper_home.clone())
+                .expect("begin receipt transaction");
+            assert_eq!(
+                receipt_transaction.current().expect("read cached receipt"),
+                Some(installed.clone())
+            );
+            verify_current_service_receipt_snapshot(
+                &helper_home,
+                Some(&installed),
+                "exercise receipt mutation boundary",
+            )
+            .expect("initial receipt authority");
+
+            // The service receipt lock is advisory, so a non-cooperating writer is still a
+            // deterministic way to prove that the boundary check is not using this cache.
+            let mut replacement_bytes =
+                serde_json::to_vec_pretty(&replacement).expect("serialize replacement receipt");
+            replacement_bytes.push(b'\n');
+            std::fs::write(
+                crate::service_receipt::service_receipt_path(&helper_home),
+                replacement_bytes,
+            )
+            .expect("replace receipt after initial snapshot");
+            assert_eq!(
+                receipt_transaction.current().expect("read cached receipt"),
+                Some(installed.clone()),
+                "the transaction cache intentionally retains its original snapshot"
+            );
+            let error = verify_current_service_receipt_snapshot(
+                &helper_home,
+                Some(&installed),
+                "exercise receipt mutation boundary",
+            )
+            .expect_err("the mutation-boundary revalidation must reread the replacement");
+            assert!(
+                error
+                    .to_string()
+                    .contains("service receipt changed after the transaction began"),
+                "{error}"
+            );
+        }
+
+        std::fs::remove_dir_all(root).expect("remove mutation revalidation test root");
+    }
+
+    #[test]
+    fn unix_install_replacement_verifies_the_old_executable_before_relocation() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-unix-definition-relocation-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_home = root.join("client");
+        let old_executable = root.join("old-bin").join("codex-helper");
+        let new_executable = root.join("new-bin").join("codex-helper");
+        let installed = test_unix_definition_receipt(
+            ServicePlatformBackend::LinuxSystemdUser,
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+            &old_executable,
+            codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        );
+        let candidate = test_unix_definition_receipt(
+            ServicePlatformBackend::LinuxSystemdUser,
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &client_home,
+            &new_executable,
+            codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        );
+        let installed_definition =
+            expected_unix_service_definition(&installed).expect("render installed definition");
+        let candidate_definition =
+            expected_unix_service_definition(&candidate).expect("render candidate definition");
+        assert_ne!(installed_definition, candidate_definition);
+
+        verify_unix_service_install_replacement(
+            Some(&installed),
+            Some(&installed_definition),
+            ServicePlatformBackend::LinuxSystemdUser,
+        )
+        .expect("a cargo-install relocation must verify against the old receipt authority");
+        verify_unix_service_install_replacement(
+            Some(&installed),
+            Some(&candidate_definition),
+            ServicePlatformBackend::LinuxSystemdUser,
+        )
+        .expect_err("the new binary cannot authorize replacement of a mismatched old definition");
+    }
+
+    #[test]
+    fn unix_install_replacement_rejects_an_existing_definition_without_a_receipt() {
+        let error = verify_unix_service_install_replacement(
+            None,
+            Some(b"externally installed definition"),
+            ServicePlatformBackend::LinuxSystemdUser,
+        )
+        .expect_err("an unowned definition must not be replaced");
+        assert!(
+            error
+                .to_string()
+                .contains("without a current service receipt")
+        );
+        assert!(error.to_string().contains("No service registration"));
+    }
+
+    #[test]
+    fn launchd_registration_accepts_unloaded_or_matching_plist_and_rejects_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-launchd-registration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create registration test root");
+        let expected = root.join("expected.plist");
+        let replacement = root.join("replacement.plist");
+        std::fs::write(&expected, b"expected").expect("write expected plist");
+        std::fs::write(&replacement, b"replacement").expect("write replacement plist");
+
+        verify_launchd_registration_snapshot(None, &expected)
+            .expect("an explicitly unloaded LaunchAgent remains manageable");
+        let matching_output = format!("path = {}\nstate = running", expected.display());
+        verify_launchd_registration_snapshot(Some(&matching_output), &expected)
+            .expect("the matching loaded plist is authoritative");
+        let replacement_output = format!("path = {}\nstate = running", replacement.display());
+        let replacement_error =
+            verify_launchd_registration_snapshot(Some(&replacement_output), &expected)
+                .expect_err("a loaded replacement plist must fail closed");
+        assert!(
+            replacement_error
+                .to_string()
+                .contains("not the receipt-authorized plist")
+        );
+        assert!(
+            verify_launchd_registration_snapshot(Some("state = running"), &expected)
+                .expect_err("a registration without a source plist is not authoritative")
+                .to_string()
+                .contains("did not expose")
+        );
+
+        std::fs::remove_dir_all(root).expect("remove registration test root");
+    }
+
+    #[test]
+    fn systemd_registration_requires_loaded_enabled_expected_fragment() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-systemd-registration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create registration test root");
+        let expected = root.join("expected.service");
+        let replacement = root.join("replacement.service");
+        std::fs::write(&expected, b"expected").expect("write expected unit");
+        std::fs::write(&replacement, b"replacement").expect("write replacement unit");
+
+        verify_systemd_registration_snapshot(
+            "loaded",
+            "enabled",
+            expected.to_string_lossy().as_ref(),
+            "",
+            "no",
+            &expected,
+        )
+        .expect("the matching enabled unit is authoritative");
+        for (load_state, unit_file_state, fragment_path, drop_in_paths, need_daemon_reload) in [
+            (
+                "not-found",
+                "enabled",
+                expected.to_string_lossy().into_owned(),
+                "",
+                "no",
+            ),
+            (
+                "loaded",
+                "disabled",
+                expected.to_string_lossy().into_owned(),
+                "",
+                "no",
+            ),
+            (
+                "loaded",
+                "enabled",
+                replacement.to_string_lossy().into_owned(),
+                "",
+                "no",
+            ),
+            (
+                "loaded",
+                "enabled",
+                expected.to_string_lossy().into_owned(),
+                "/tmp/codex-helper.service.d/override.conf",
+                "no",
+            ),
+            (
+                "loaded",
+                "enabled",
+                expected.to_string_lossy().into_owned(),
+                "",
+                "yes",
+            ),
+        ] {
+            let error = verify_systemd_registration_snapshot(
+                load_state,
+                unit_file_state,
+                &fragment_path,
+                drop_in_paths,
+                need_daemon_reload,
+                &expected,
+            )
+            .expect_err("a replaced or disabled registration must fail closed");
+            assert!(error.to_string().contains("registration does not match"));
+            assert!(error.to_string().contains("systemctl --user"));
+        }
+
+        std::fs::remove_dir_all(root).expect("remove registration test root");
     }
 
     #[test]
@@ -6466,6 +7736,7 @@ mod tests {
         codex_helper_core::codex_switch::CodexSwitchStatus {
             phase,
             enabled,
+            model_provider: None,
             managed,
             base_url: base_url.map(str::to_string),
             client_patch: None,

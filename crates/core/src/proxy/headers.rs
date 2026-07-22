@@ -1,4 +1,5 @@
 use axum::http::{HeaderMap, HeaderName};
+use zeroize::Zeroizing;
 
 use crate::codex_switch::{CODEX_CLIENT_FACADE_ACTOR_HEADER, CODEX_CLIENT_FACADE_ACTOR_VALUE};
 use crate::config::CODEX_CLIENT_RUNTIME_PATCH_HEADER;
@@ -151,6 +152,37 @@ pub(super) fn header_map_to_entries(headers: &HeaderMap) -> Vec<HeaderEntry> {
         });
     }
     out
+}
+
+/// Captures only sensitive header values for in-memory response-body redaction.
+///
+/// The copies are zeroized when the per-request debug context is dropped and are
+/// never serialized. The bare credential form is included because upstreams
+/// commonly echo a bearer token without its authentication scheme.
+pub(super) fn sensitive_header_values(headers: &HeaderMap) -> Vec<Zeroizing<Vec<u8>>> {
+    let mut values = Vec::new();
+    for (name, value) in headers {
+        let name_lower = name.as_str().to_ascii_lowercase();
+        if !value.is_sensitive() && !is_sensitive_header_name(name_lower.as_str()) {
+            continue;
+        }
+        let value = value.as_bytes();
+        if value.is_empty() {
+            continue;
+        }
+        values.push(Zeroizing::new(value.to_vec()));
+        if let Some(separator) = value.iter().position(|byte| byte.is_ascii_whitespace()) {
+            let bare = value[separator + 1..]
+                .iter()
+                .skip_while(|byte| byte.is_ascii_whitespace())
+                .copied()
+                .collect::<Vec<_>>();
+            if !bare.is_empty() {
+                values.push(Zeroizing::new(bare));
+            }
+        }
+    }
+    values
 }
 
 #[cfg(test)]

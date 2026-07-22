@@ -106,7 +106,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: RelayCommand,
     },
-    /// Manage explicit Codex switch state
+    /// Manage explicit Codex or Claude client switch state
     Switch {
         #[command(subcommand)]
         cmd: SwitchCommand,
@@ -494,19 +494,25 @@ pub(crate) enum NotifyCommand {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum SwitchCommand {
-    /// Switch Codex config to a helper proxy
+    /// Switch Codex or Claude client config to a helper proxy
     On {
-        /// Listen port for local proxy; defaults to 3211
+        /// Listen port for local proxy; defaults to 3211 for Codex and 3210 for Claude
         #[arg(long, conflicts_with = "base_url")]
         port: Option<u16>,
         /// Explicit helper proxy base URL
         #[arg(long, conflicts_with = "port")]
         base_url: Option<String>,
+        /// Target Codex config (default if neither client flag is set)
+        #[arg(long, conflicts_with = "claude")]
+        codex: bool,
+        /// Target Claude settings
+        #[arg(long, conflicts_with = "codex")]
+        claude: bool,
         /// Codex client preset; if omitted, use [codex.client_patch] from helper config
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, conflicts_with = "claude")]
         preset: Option<CodexClientPresetArg>,
         /// Removed legacy spelling; use --preset instead
-        #[arg(long = "mode", hide = true)]
+        #[arg(long = "mode", hide = true, conflicts_with = "claude")]
         legacy_mode: Option<String>,
         /// Override Responses WebSocket transport (`--responses-websocket` means true)
         #[arg(
@@ -514,11 +520,12 @@ pub(crate) enum SwitchCommand {
             action = clap::ArgAction::Set,
             num_args = 0..=1,
             default_missing_value = "true",
-            require_equals = true
+            require_equals = true,
+            conflicts_with = "claude"
         )]
         responses_websocket: Option<bool>,
         /// Override the Codex client compaction strategy
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, conflicts_with = "claude")]
         compaction: Option<CodexCompactionStrategyArg>,
         /// Override OpenAI `/models` translation (`--translate-models` means true)
         #[arg(
@@ -526,17 +533,32 @@ pub(crate) enum SwitchCommand {
             action = clap::ArgAction::Set,
             num_args = 0..=1,
             default_missing_value = "true",
-            require_equals = true
+            require_equals = true,
+            conflicts_with = "claude"
         )]
         translate_models: Option<bool>,
         /// Override hosted image generation handling
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, conflicts_with = "claude")]
         hosted_image_generation: Option<CodexHostedImageGenerationArg>,
     },
-    /// Restore the selector and helper stanza recorded by the explicit switch operation
-    Off,
-    /// Show the helper-owned Codex switch status
-    Status,
+    /// Restore the client config recorded by the explicit switch operation
+    Off {
+        /// Target Codex config (default if neither client flag is set)
+        #[arg(long, conflicts_with = "claude")]
+        codex: bool,
+        /// Target Claude settings
+        #[arg(long, conflicts_with = "codex")]
+        claude: bool,
+    },
+    /// Show the helper-owned client switch status
+    Status {
+        /// Show Codex switch status (both clients are shown if neither flag is set)
+        #[arg(long)]
+        codex: bool,
+        /// Show Claude switch status
+        #[arg(long)]
+        claude: bool,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1467,6 +1489,8 @@ mod tests {
                 SwitchCommand::On {
                     port: None,
                     base_url: Some(base_url),
+                    codex: false,
+                    claude: false,
                     preset: None,
                     legacy_mode: None,
                     responses_websocket: None,
@@ -1586,12 +1610,6 @@ mod tests {
                 "--preset",
                 "official-imagegen-bridge",
             ],
-            vec!["codex-helper", "switch", "on", "--claude"],
-            vec!["codex-helper", "switch", "on", "--codex"],
-            vec!["codex-helper", "switch", "off", "--claude"],
-            vec!["codex-helper", "switch", "off", "--codex"],
-            vec!["codex-helper", "switch", "status", "--codex"],
-            vec!["codex-helper", "switch", "status", "--claude"],
             vec!["codex-helper", "switch", "on", "--client-facade", "openai"],
             vec!["codex-helper", "switch", "remote-control", "enable"],
             vec!["codex-helper", "switch", "remote-control", "status"],
@@ -1600,6 +1618,65 @@ mod tests {
             assert!(
                 Cli::try_parse_from(args.clone()).is_err(),
                 "removed switch surface should be rejected: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_accepts_explicit_codex_and_claude_targets() {
+        for args in [
+            vec!["codex-helper", "switch", "on", "--codex"],
+            vec!["codex-helper", "switch", "off", "--codex"],
+            vec!["codex-helper", "switch", "status", "--codex"],
+            vec!["codex-helper", "switch", "on", "--claude", "--port", "4210"],
+            vec![
+                "codex-helper",
+                "switch",
+                "on",
+                "--claude",
+                "--base-url",
+                "https://claude-relay.example",
+            ],
+            vec!["codex-helper", "switch", "off", "--claude"],
+            vec!["codex-helper", "switch", "status", "--claude"],
+        ] {
+            Cli::try_parse_from(args.clone())
+                .unwrap_or_else(|error| panic!("switch target should parse: {args:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn switch_client_target_flags_are_mutually_exclusive() {
+        for action in ["on", "off"] {
+            assert!(
+                Cli::try_parse_from(["codex-helper", "switch", action, "--codex", "--claude",])
+                    .is_err(),
+                "switch {action} must reject both client flags"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_status_accepts_both_client_flags() {
+        Cli::try_parse_from(["codex-helper", "switch", "status", "--codex", "--claude"])
+            .expect("switch status can show both clients");
+    }
+
+    #[test]
+    fn claude_switch_rejects_every_codex_only_override() {
+        for override_args in [
+            vec!["--preset", "official-imagegen"],
+            vec!["--mode", "official-imagegen-bridge"],
+            vec!["--responses-websocket"],
+            vec!["--compaction", "remote-v2"],
+            vec!["--translate-models=false"],
+            vec!["--hosted-image-generation", "disabled"],
+        ] {
+            let mut args = vec!["codex-helper", "switch", "on", "--claude"];
+            args.extend(override_args);
+            assert!(
+                Cli::try_parse_from(args.clone()).is_err(),
+                "Claude switch must reject Codex-only override: {args:?}"
             );
         }
     }

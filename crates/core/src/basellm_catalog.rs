@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::pricing::basellm_all_json_url;
 use crate::pricing::{ModelPrice, ModelPriceTier, canonical_provider};
@@ -1119,28 +1121,46 @@ pub async fn sync_basellm_catalog(
     runtime_store: Arc<RuntimeStore>,
     options: BasellmCatalogSyncOptions,
 ) -> BasellmCatalogSyncReport {
+    sync_basellm_catalog_inner(runtime_store, options, None)
+        .await
+        .expect("an unconditional BaseLLM catalog sync cannot be cancelled")
+}
+
+pub(crate) async fn sync_basellm_catalog_until_shutdown(
+    runtime_store: Arc<RuntimeStore>,
+    options: BasellmCatalogSyncOptions,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<BasellmCatalogSyncReport> {
+    sync_basellm_catalog_inner(runtime_store, options, Some(shutdown)).await
+}
+
+async fn sync_basellm_catalog_inner(
+    runtime_store: Arc<RuntimeStore>,
+    options: BasellmCatalogSyncOptions,
+    mut shutdown: Option<&mut watch::Receiver<bool>>,
+) -> Option<BasellmCatalogSyncReport> {
     let observed_state = match load_basellm_catalog_runtime_state(runtime_store.as_ref()) {
         Ok(state) => state,
         Err(_) => {
-            return runtime_unpersisted_report(
+            return Some(runtime_unpersisted_report(
                 &options,
                 None,
                 BasellmSyncOutcome::Unavailable,
                 Some(BasellmSyncErrorCategory::Persistence),
                 None,
                 None,
-            );
+            ));
         }
     };
     if let BasellmCatalogLoad::UnsupportedSchema(version) = &observed_state.lkg {
-        return runtime_unpersisted_report(
+        return Some(runtime_unpersisted_report(
             &options,
             None,
             BasellmSyncOutcome::ReadOnly,
             Some(BasellmSyncErrorCategory::UnsupportedSchema),
             Some(*version),
             observed_state.attempt.as_ref(),
-        );
+        ));
     }
     let observed = match &observed_state.lkg {
         BasellmCatalogLoad::Valid(snapshot) => Some(snapshot.clone()),
@@ -1159,33 +1179,37 @@ pub async fn sync_basellm_catalog(
             source
         }
         _ => {
-            return runtime_report_with_state(
-                &options,
-                runtime_store,
-                &observed_state,
-                observed,
-                BasellmSyncOutcome::Unavailable,
-                Some(BasellmSyncErrorCategory::Schema),
-                None,
-                None,
-            )
-            .await;
+            return Some(
+                runtime_report_with_state(
+                    &options,
+                    runtime_store,
+                    &observed_state,
+                    observed,
+                    BasellmSyncOutcome::Unavailable,
+                    Some(BasellmSyncErrorCategory::Schema),
+                    None,
+                    None,
+                )
+                .await,
+            );
         }
     };
     let client = match build_client(&source, &options) {
         Ok(client) => client,
         Err(category) => {
-            return runtime_report_with_state(
-                &options,
-                runtime_store,
-                &observed_state,
-                observed,
-                BasellmSyncOutcome::Unavailable,
-                Some(category),
-                None,
-                None,
-            )
-            .await;
+            return Some(
+                runtime_report_with_state(
+                    &options,
+                    runtime_store,
+                    &observed_state,
+                    observed,
+                    BasellmSyncOutcome::Unavailable,
+                    Some(category),
+                    None,
+                    None,
+                )
+                .await,
+            );
         }
     };
 
@@ -1199,43 +1223,50 @@ pub async fn sync_basellm_catalog(
     let mut attempts = 0;
     loop {
         attempts += 1;
-        let fetch = fetch_once(
-            &client,
-            source.clone(),
-            (!unconditional).then_some(observed.as_deref()).flatten(),
-            options.response_limit,
+        let fetch = await_basellm_sync_step(
+            fetch_once(
+                &client,
+                source.clone(),
+                (!unconditional).then_some(observed.as_deref()).flatten(),
+                options.response_limit,
+            ),
+            shutdown.as_deref_mut(),
         )
-        .await;
+        .await?;
         match fetch {
             FetchResult::NotModified if observed.is_none() && !retried_unconditional_304 => {
                 unconditional = true;
                 retried_unconditional_304 = true;
             }
             FetchResult::NotModified if observed.is_none() || unconditional => {
-                return runtime_report_with_state(
-                    &options,
-                    runtime_store,
-                    &observed_state,
-                    observed,
-                    BasellmSyncOutcome::Unavailable,
-                    Some(BasellmSyncErrorCategory::Semantic),
-                    None,
-                    None,
-                )
-                .await;
+                return Some(
+                    runtime_report_with_state(
+                        &options,
+                        runtime_store,
+                        &observed_state,
+                        observed,
+                        BasellmSyncOutcome::Unavailable,
+                        Some(BasellmSyncErrorCategory::Semantic),
+                        None,
+                        None,
+                    )
+                    .await,
+                );
             }
             FetchResult::NotModified => {
-                return runtime_report_with_state(
-                    &options,
-                    runtime_store,
-                    &observed_state,
-                    observed,
-                    BasellmSyncOutcome::NotModified,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
+                return Some(
+                    runtime_report_with_state(
+                        &options,
+                        runtime_store,
+                        &observed_state,
+                        observed,
+                        BasellmSyncOutcome::NotModified,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await,
+                );
             }
             FetchResult::Body { body, validators } => {
                 let (catalog, warnings) = match parse_basellm_catalog_json(&body) {
@@ -1249,64 +1280,72 @@ pub async fn sync_basellm_catalog(
                             }
                             _ => BasellmSyncErrorCategory::Schema,
                         };
-                        return runtime_report_with_state(
-                            &options,
-                            runtime_store,
-                            &observed_state,
-                            observed,
-                            BasellmSyncOutcome::Unavailable,
-                            Some(category),
-                            None,
-                            None,
-                        )
-                        .await;
+                        return Some(
+                            runtime_report_with_state(
+                                &options,
+                                runtime_store,
+                                &observed_state,
+                                observed,
+                                BasellmSyncOutcome::Unavailable,
+                                Some(category),
+                                None,
+                                None,
+                            )
+                            .await,
+                        );
                     }
                 };
                 let candidate_hash = match content_hash(&catalog) {
                     Ok(hash) => hash,
                     Err(_) => {
-                        return runtime_report_with_state(
+                        return Some(
+                            runtime_report_with_state(
+                                &options,
+                                runtime_store,
+                                &observed_state,
+                                observed,
+                                BasellmSyncOutcome::Unavailable,
+                                Some(BasellmSyncErrorCategory::Schema),
+                                None,
+                                None,
+                            )
+                            .await,
+                        );
+                    }
+                };
+                if suspicious_count_collapse(observed.as_deref(), &catalog) {
+                    return Some(
+                        runtime_report_with_state(
                             &options,
                             runtime_store,
                             &observed_state,
                             observed,
-                            BasellmSyncOutcome::Unavailable,
-                            Some(BasellmSyncErrorCategory::Schema),
-                            None,
+                            BasellmSyncOutcome::Quarantined,
+                            Some(BasellmSyncErrorCategory::Sanity),
+                            Some(candidate_hash),
                             None,
                         )
-                        .await;
-                    }
-                };
-                if suspicious_count_collapse(observed.as_deref(), &catalog) {
-                    return runtime_report_with_state(
-                        &options,
-                        runtime_store,
-                        &observed_state,
-                        observed,
-                        BasellmSyncOutcome::Quarantined,
-                        Some(BasellmSyncErrorCategory::Sanity),
-                        Some(candidate_hash),
-                        None,
-                    )
-                    .await;
+                        .await,
+                    );
                 }
                 if economic_change_requires_quarantine(
                     observed.as_deref(),
                     &catalog,
                     options.approved_economic_change_hash.as_deref(),
                 ) {
-                    return runtime_report_with_state(
-                        &options,
-                        runtime_store,
-                        &observed_state,
-                        observed,
-                        BasellmSyncOutcome::Quarantined,
-                        Some(BasellmSyncErrorCategory::EconomicAnomaly),
-                        Some(candidate_hash),
-                        None,
-                    )
-                    .await;
+                    return Some(
+                        runtime_report_with_state(
+                            &options,
+                            runtime_store,
+                            &observed_state,
+                            observed,
+                            BasellmSyncOutcome::Quarantined,
+                            Some(BasellmSyncErrorCategory::EconomicAnomaly),
+                            Some(candidate_hash),
+                            None,
+                        )
+                        .await,
+                    );
                 }
                 let candidate = match build_lkg(
                     catalog,
@@ -1318,55 +1357,90 @@ pub async fn sync_basellm_catalog(
                 ) {
                     Ok(candidate) => Arc::new(candidate),
                     Err(category) => {
-                        return runtime_report_with_state(
-                            &options,
-                            runtime_store,
-                            &observed_state,
-                            observed,
-                            BasellmSyncOutcome::Unavailable,
-                            Some(category),
-                            None,
-                            None,
-                        )
-                        .await;
+                        return Some(
+                            runtime_report_with_state(
+                                &options,
+                                runtime_store,
+                                &observed_state,
+                                observed,
+                                BasellmSyncOutcome::Unavailable,
+                                Some(category),
+                                None,
+                                None,
+                            )
+                            .await,
+                        );
                     }
                 };
-                return runtime_report_with_state(
-                    &options,
-                    runtime_store,
-                    &observed_state,
-                    Some(candidate),
-                    BasellmSyncOutcome::Updated,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
+                return Some(
+                    runtime_report_with_state(
+                        &options,
+                        runtime_store,
+                        &observed_state,
+                        Some(candidate),
+                        BasellmSyncOutcome::Updated,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await,
+                );
             }
             FetchResult::Failure {
                 category: _,
                 retryable,
                 retry_after,
             } if retryable && attempts < options.max_attempts => {
-                tokio::time::sleep(retry_wait_delay(attempts, retry_after)).await;
+                await_basellm_sync_step(
+                    tokio::time::sleep(retry_wait_delay(attempts, retry_after)),
+                    shutdown.as_deref_mut(),
+                )
+                .await?;
             }
             FetchResult::Failure {
                 category,
                 retry_after,
                 ..
             } => {
-                return runtime_report_with_state(
-                    &options,
-                    runtime_store,
-                    &observed_state,
-                    observed,
-                    BasellmSyncOutcome::Unavailable,
-                    Some(category),
-                    None,
-                    retry_after,
-                )
-                .await;
+                return Some(
+                    runtime_report_with_state(
+                        &options,
+                        runtime_store,
+                        &observed_state,
+                        observed,
+                        BasellmSyncOutcome::Unavailable,
+                        Some(category),
+                        None,
+                        retry_after,
+                    )
+                    .await,
+                );
             }
+        }
+    }
+}
+
+async fn await_basellm_sync_step<T>(
+    task: impl Future<Output = T>,
+    shutdown: Option<&mut watch::Receiver<bool>>,
+) -> Option<T> {
+    let Some(shutdown) = shutdown else {
+        return Some(task.await);
+    };
+    if *shutdown.borrow() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        () = wait_for_basellm_sync_shutdown(shutdown) => None,
+        output = task => Some(output),
+    }
+}
+
+async fn wait_for_basellm_sync_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() || shutdown.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -1983,6 +2057,7 @@ mod tests {
     use axum::http::{HeaderMap as AxumHeaderMap, StatusCode, header};
     use axum::response::{IntoResponse, Redirect, Response};
     use axum::routing::get;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -2590,6 +2665,73 @@ mod tests {
             attempt.retry_after_unix,
             Some(attempt.last_checked_at_unix.saturating_add(300))
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_retry_backoff_without_persisting_an_attempt() {
+        // This is a scheduling deadline, not the shutdown contract itself. The full workspace
+        // suite can launch enough processes that the loopback fixture is not dispatched within
+        // two seconds on a busy host.
+        const ASYNC_TEST_DEADLINE: Duration = Duration::from_secs(10);
+
+        let retry_started = Arc::new(Notify::new());
+        let retry_started_for_handler = Arc::clone(&retry_started);
+        let app = Router::new().route(
+            "/all.json",
+            get(move || {
+                let retry_started = Arc::clone(&retry_started_for_handler);
+                async move {
+                    retry_started.notify_one();
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(header::RETRY_AFTER, "300")],
+                        "retry later",
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind retry fixture");
+        let address = listener.local_addr().expect("retry fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve retry fixture");
+        });
+        let runtime_store = Arc::new(RuntimeStore::open_in_memory().expect("open runtime store"));
+        let options = BasellmCatalogSyncOptions::default()
+            .with_source_url(format!("http://{address}/all.json"))
+            .with_max_attempts(2)
+            .allow_http_for_fixture();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let sync = tokio::spawn({
+            let runtime_store = Arc::clone(&runtime_store);
+            async move {
+                sync_basellm_catalog_until_shutdown(runtime_store, options, &mut shutdown_rx).await
+            }
+        });
+
+        tokio::time::timeout(ASYNC_TEST_DEADLINE, retry_started.notified())
+            .await
+            .expect("retryable response reached the sync task");
+        shutdown_tx
+            .send(true)
+            .expect("request catalog sync shutdown");
+        let result = tokio::time::timeout(ASYNC_TEST_DEADLINE, sync)
+            .await
+            .expect("shutdown must interrupt the retry wait")
+            .expect("join catalog sync task");
+        assert!(result.is_none());
+
+        let state = load_basellm_catalog_runtime_state(runtime_store.as_ref())
+            .expect("read unchanged runtime state");
+        assert!(matches!(state.lkg, BasellmCatalogLoad::Missing));
+        assert!(state.attempt.is_none());
+        assert!(state.document_revision.is_none());
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]

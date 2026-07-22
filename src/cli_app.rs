@@ -7,8 +7,9 @@ use crate::commands;
 #[cfg(test)]
 use crate::config::save_helper_config;
 use crate::config::{
-    CodexClientPatchConfig, CodexClientPatchOverrides, HelperConfig, LoadedConfig,
-    RelayTargetConfig, ServiceKind, load_config, load_config_with_source, mutate_helper_config,
+    CodexClientPatchConfig, CodexClientPatchOverrides, CodexProviderIdentity, HelperConfig,
+    LoadedConfig, RelayTargetConfig, ServiceKind, load_config, load_config_with_source,
+    mutate_helper_config,
 };
 use crate::control_plane_client::{
     ControlPlaneClient, ControlPlaneEndpoint, ControlPlaneError, configured_local_admin_token_env,
@@ -93,6 +94,10 @@ impl ServeRuntimeOptions {
             && !self.supervisor_managed
             && !self.desktop_managed
             && !self.service_managed
+    }
+
+    fn should_auto_manage_claude_switch(self, service_name: &str) -> bool {
+        self.auto_manage_codex_switch && service_name == "claude" && !self.is_resident()
     }
 
     fn local_runtime_shutdown_policy(
@@ -190,6 +195,8 @@ async fn run_codex_cli(entrypoint: CliEntrypoint) -> CliResult<()> {
                 SwitchCommand::On {
                     port,
                     base_url,
+                    codex,
+                    claude,
                     preset,
                     legacy_mode,
                     responses_websocket,
@@ -201,6 +208,8 @@ async fn run_codex_cli(entrypoint: CliEntrypoint) -> CliResult<()> {
                     do_switch_on(
                         port,
                         base_url,
+                        codex,
+                        claude,
                         CodexSwitchClientPatchSelection {
                             overrides: CodexClientPatchOverrides {
                                 preset: preset.map(Into::into),
@@ -213,8 +222,8 @@ async fn run_codex_cli(entrypoint: CliEntrypoint) -> CliResult<()> {
                     )
                     .await?;
                 }
-                SwitchCommand::Off => do_switch_off()?,
-                SwitchCommand::Status => do_switch_status()?,
+                SwitchCommand::Off { codex, claude } => do_switch_off(codex, claude)?,
+                SwitchCommand::Status { codex, claude } => do_switch_status(codex, claude)?,
             }
             return Ok(());
         }
@@ -547,7 +556,7 @@ fn handle_relay_off(auto_manage_codex_switch: bool) -> CliResult<()> {
                 .to_string(),
         ));
     }
-    do_switch_off()
+    do_switch_off(false, false)
 }
 
 fn relay_service_from_flags(codex: bool, claude: bool) -> CliResult<ServiceKind> {
@@ -699,18 +708,8 @@ async fn relay_status(target: Option<String>, json: bool) -> CliResult<()> {
         let targets = relay_target_names(&cfg);
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "targets": targets,
-                "codex": {
-                    "enabled": status.enabled,
-                    "base_url": status.base_url,
-                    "managed": status.managed,
-                    "phase": status.phase.as_str(),
-                    "client_patch": status.client_patch,
-                    "recovery_reason": status.recovery_reason,
-                }
-            }))
-            .unwrap_or_else(|_| "{}".to_string())
+            serde_json::to_string_pretty(&relay_overview_json_payload(targets, status))
+                .unwrap_or_else(|_| "{}".to_string())
         );
         return Ok(());
     }
@@ -719,6 +718,35 @@ async fn relay_status(target: Option<String>, json: bool) -> CliResult<()> {
     println!("targets: {}", relay_target_names(&cfg).join(", "));
     print_codex_switch_status()?;
     Ok(())
+}
+
+fn legacy_client_facade(client_patch: Option<&CodexClientPatchConfig>) -> Option<&'static str> {
+    let compiled = client_patch?.compile().ok()?;
+    match compiled.provider_identity {
+        CodexProviderIdentity::HelperRelay => Some("compatible"),
+        CodexProviderIdentity::OfficialOpenAi if compiled.actor_marker => Some("openai-tools"),
+        CodexProviderIdentity::OfficialOpenAi => Some("openai"),
+    }
+}
+
+fn relay_overview_json_payload(
+    targets: Vec<String>,
+    status: codex_switch::CodexSwitchStatus,
+) -> serde_json::Value {
+    let client_facade = legacy_client_facade(status.client_patch.as_ref());
+    serde_json::json!({
+        "targets": targets,
+        "codex": {
+            "enabled": status.enabled,
+            "base_url": status.base_url,
+            "model_provider": status.model_provider,
+            "managed": status.managed,
+            "phase": status.phase.as_str(),
+            "client_facade": client_facade,
+            "client_patch": status.client_patch,
+            "recovery_reason": status.recovery_reason,
+        }
+    })
 }
 
 async fn print_relay_target_status(target: ResolvedRelayTarget, json: bool) -> CliResult<()> {
@@ -1190,10 +1218,11 @@ fn operator_read_model_is_reachable(model: &OperatorReadModel) -> bool {
 const DAEMON_STATUS_SCHEMA_VERSION: u32 = 1;
 
 fn daemon_status_is_running(status: OperatorReadStatus) -> bool {
-    matches!(
-        status,
-        OperatorReadStatus::Ready | OperatorReadStatus::Stale
-    )
+    daemon_status_is_reachable(status)
+}
+
+fn daemon_status_is_reachable(status: OperatorReadStatus) -> bool {
+    status != OperatorReadStatus::Disconnected
 }
 
 fn daemon_status_error(status: OperatorReadStatus) -> Option<&'static str> {
@@ -1247,6 +1276,14 @@ fn daemon_status_json_payload(
     payload.insert(
         "running".to_string(),
         serde_json::json!(daemon_status_is_running(model.status)),
+    );
+    payload.insert(
+        "reachable".to_string(),
+        serde_json::json!(daemon_status_is_reachable(model.status)),
+    );
+    payload.insert(
+        "authentication_required".to_string(),
+        serde_json::json!(model.status == OperatorReadStatus::AuthRequired),
     );
     payload.insert("owner".to_string(), serde_json::json!(owner));
     payload.insert("operator_read_model".to_string(), serde_json::json!(model));
@@ -1539,6 +1576,10 @@ mod daemon_status_contract_tests {
             daemon_status_json_payload("codex", 3211, None, &down)["running"],
             false
         );
+        assert_eq!(
+            daemon_status_json_payload("codex", 3211, None, &down)["reachable"],
+            false
+        );
         assert!(
             daemon_status_json_payload("codex", 3211, None, &down)["error"]
                 .as_str()
@@ -1550,7 +1591,15 @@ mod daemon_status_contract_tests {
         );
         assert_eq!(
             daemon_status_json_payload("codex", 3211, None, &auth)["running"],
-            false
+            true
+        );
+        assert_eq!(
+            daemon_status_json_payload("codex", 3211, None, &auth)["reachable"],
+            true
+        );
+        assert_eq!(
+            daemon_status_json_payload("codex", 3211, None, &auth)["authentication_required"],
+            true
         );
         assert!(
             daemon_status_json_payload("codex", 3211, None, &auth)["error"]
@@ -1560,6 +1609,10 @@ mod daemon_status_contract_tests {
         assert_eq!(
             daemon_status_json_payload("codex", 3211, None, &stale)["status"],
             "STALE"
+        );
+        assert_eq!(
+            daemon_status_json_payload("codex", 3211, None, &stale)["running"],
+            true
         );
     }
 
@@ -2123,6 +2176,25 @@ const CH_SERVICE_ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 const CH_SERVICE_ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CH_SERVICE_ATTACH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const CH_SERVICE_ATTACH_TCP_TIMEOUT: Duration = Duration::from_millis(200);
+const CH_FOREGROUND_CLIENT_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+struct ForegroundClientRuntimeReady {
+    proxy_addr: SocketAddr,
+}
+
+impl ForegroundClientRuntimeReady {
+    fn proxy_port(self) -> u16 {
+        self.proxy_addr.port()
+    }
+
+    #[cfg(test)]
+    fn for_test(port: u16) -> Self {
+        Self {
+            proxy_addr: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        }
+    }
+}
 
 async fn tcp_endpoint_is_reachable(addr: SocketAddr) -> bool {
     matches!(
@@ -2133,6 +2205,21 @@ async fn tcp_endpoint_is_reachable(addr: SocketAddr) -> bool {
         .await,
         Ok(Ok(_))
     )
+}
+
+async fn wait_for_foreground_client_runtime_readiness(
+    addr: SocketAddr,
+) -> anyhow::Result<ForegroundClientRuntimeReady> {
+    tokio::time::timeout(CH_FOREGROUND_CLIENT_READY_TIMEOUT, async {
+        loop {
+            if tcp_endpoint_is_reachable(addr).await {
+                return ForegroundClientRuntimeReady { proxy_addr: addr };
+            }
+            tokio::time::sleep(CH_SERVICE_ATTACH_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .with_context(|| format!("wait for the foreground proxy at http://{addr} to become ready"))
 }
 
 fn validate_ch_service_attach_receipt(
@@ -2168,17 +2255,9 @@ fn ch_attach_paths_identify_same_location(left: &Path, right: &Path) -> anyhow::
         .with_context(|| format!("resolve path identity for {}", left.display()))?;
     let right = resolve_ch_attach_path_identity(right)
         .with_context(|| format!("resolve path identity for {}", right.display()))?;
-
-    #[cfg(windows)]
-    {
-        Ok(left
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy()))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(left == right)
-    }
+    Ok(codex_helper_core::path_identity::path_identities_equal(
+        &left, &right,
+    ))
 }
 
 fn resolve_ch_attach_path_identity(path: &Path) -> anyhow::Result<PathBuf> {
@@ -2189,39 +2268,8 @@ fn resolve_ch_attach_path_identity(path: &Path) -> anyhow::Result<PathBuf> {
             .with_context(|| format!("resolve current directory for {}", path.display()))?
             .join(path)
     };
-    let mut existing = absolute.as_path();
-    let mut missing = Vec::new();
-    loop {
-        match std::fs::symlink_metadata(existing) {
-            Ok(_) => break,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                let name = existing.file_name().with_context(|| {
-                    format!(
-                        "no existing path ancestor is available for {}",
-                        absolute.display()
-                    )
-                })?;
-                missing.push(name.to_os_string());
-                existing = existing.parent().with_context(|| {
-                    format!(
-                        "no existing path ancestor is available for {}",
-                        absolute.display()
-                    )
-                })?;
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect path identity for {}", existing.display()));
-            }
-        }
-    }
-
-    let mut resolved = std::fs::canonicalize(existing)
-        .with_context(|| format!("canonicalize path identity for {}", existing.display()))?;
-    for component in missing.iter().rev() {
-        resolved.push(component);
-    }
-    Ok(resolved)
+    codex_helper_core::path_identity::resolve_path_identity(&absolute)
+        .with_context(|| format!("resolve path identity for {}", absolute.display()))
 }
 
 fn read_ch_service_owner_marker_advisory(
@@ -2291,13 +2339,14 @@ async fn wait_for_ch_service_runtime(
     let deadline = tokio::time::Instant::now() + CH_SERVICE_ATTACH_TIMEOUT;
 
     loop {
-        let proxy_reachable = tcp_endpoint_is_reachable(proxy_addr).await;
-        let last_error = match tokio::time::timeout(
-            CH_SERVICE_ATTACH_PROBE_TIMEOUT,
-            read_service_runtime_for_receipt(receipt.clone()),
-        )
-        .await
-        {
+        let (proxy_reachable, runtime) = tokio::join!(
+            tcp_endpoint_is_reachable(proxy_addr),
+            tokio::time::timeout(
+                CH_SERVICE_ATTACH_PROBE_TIMEOUT,
+                read_service_runtime_for_receipt(receipt.clone()),
+            ),
+        );
+        let last_error = match runtime {
             Ok(Ok(runtime)) if proxy_reachable => return Ok(runtime),
             Ok(Ok(_)) => format!("the native service proxy at {proxy_addr} is not reachable"),
             Ok(Err(error)) => error.to_string(),
@@ -2505,6 +2554,7 @@ fn log_foreground_codex_restore(
 fn prepare_ch_codex_switch(
     service_name: &str,
     options: ServeRuntimeOptions,
+    runtime_ready: ForegroundClientRuntimeReady,
     runtime_owner: Option<&RuntimeOwnerLease>,
     client_patch: CodexClientPatchConfig,
 ) -> anyhow::Result<Option<ForegroundCodexSwitchGuard>> {
@@ -2514,6 +2564,10 @@ fn prepare_ch_codex_switch(
 
     let runtime_owner =
         runtime_owner.context("the foreground ch proxy is missing its runtime ownership lease")?;
+    anyhow::ensure!(
+        runtime_ready.proxy_port() == runtime_owner.proxy_port(),
+        "the ready foreground proxy does not match the Codex switch owner"
+    );
     let outcome = if options.is_resident() {
         codex_switch::apply_with_client_patch(
             CodexSwitchIntent::On {
@@ -2542,6 +2596,69 @@ fn prepare_ch_codex_switch(
                 restore_lease: Some(restore_lease),
             }))
     }
+}
+
+struct ForegroundClaudeSwitchGuard {
+    restore_lease: Option<codex_integration::ClaudeSwitchRestoreLease>,
+}
+
+impl ForegroundClaudeSwitchGuard {
+    fn finalize(&mut self) -> anyhow::Result<()> {
+        let Some(restore_lease) = self.restore_lease.take() else {
+            return Ok(());
+        };
+        log_foreground_claude_restore(
+            codex_integration::restore_claude_switch_if_owned_with_retry(&restore_lease),
+        )
+    }
+}
+
+impl Drop for ForegroundClaudeSwitchGuard {
+    fn drop(&mut self) {
+        let Some(restore_lease) = self.restore_lease.take() else {
+            return;
+        };
+        if let Err(error) = log_foreground_claude_restore(
+            codex_integration::restore_claude_switch_if_owned(&restore_lease),
+        ) {
+            tracing::warn!("ch could not restore Claude settings from its drop fallback: {error}");
+        }
+    }
+}
+
+fn log_foreground_claude_restore(result: anyhow::Result<bool>) -> anyhow::Result<()> {
+    match result {
+        Ok(true) => {
+            tracing::info!("ch restored Claude settings after the foreground proxy stopped");
+            Ok(())
+        }
+        Ok(false) => {
+            tracing::info!(
+                "ch left Claude settings unchanged because its generation is no longer owned by this foreground proxy"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            Err(error.context("restore Claude settings after the foreground ch proxy stopped"))
+        }
+    }
+}
+
+fn prepare_ch_claude_switch(
+    service_name: &str,
+    options: ServeRuntimeOptions,
+    runtime_ready: ForegroundClientRuntimeReady,
+) -> anyhow::Result<Option<ForegroundClaudeSwitchGuard>> {
+    if !options.should_auto_manage_claude_switch(service_name) {
+        return Ok(None);
+    }
+    let port = runtime_ready.proxy_port();
+    let restore_lease = codex_integration::acquire_ephemeral_local_claude(port)
+        .context("automatically switch Claude to the ready local ch proxy")?;
+    tracing::info!(port, "ch switched Claude to the ready local proxy");
+    Ok(Some(ForegroundClaudeSwitchGuard {
+        restore_lease: Some(restore_lease),
+    }))
 }
 
 async fn resolve_serve_tui_language(loaded: &LoadedConfig) -> tui::Language {
@@ -2698,8 +2815,6 @@ async fn run_server(
         );
         preflight_owned_local_runtime_switch(&runtime.proxy).await?;
     }
-    let mut codex_switch_guard =
-        prepare_ch_codex_switch(service_name, options, owner_lease.as_ref(), client_patch)?;
     let addr: SocketAddr = SocketAddr::from((host, port));
     let admin_addr = runtime.admin_addr;
     let cfg = runtime.config.clone();
@@ -2735,6 +2850,62 @@ async fn run_server(
     }
 
     let mut running_runtime = runtime.start();
+    let auto_manage_client_switch = options.should_auto_manage_codex_switch(service_name)
+        || options.should_auto_manage_claude_switch(service_name);
+    let client_runtime_ready = if auto_manage_client_switch {
+        match wait_for_foreground_client_runtime_readiness(addr).await {
+            Ok(ready) => Some(ready),
+            Err(readiness_error) => {
+                let shutdown_result = running_runtime.abort_and_wait().await;
+                return match shutdown_result {
+                    Ok(()) => Err(readiness_error),
+                    Err(shutdown_error) => Err(anyhow::anyhow!(
+                        "foreground proxy runtime readiness failed: {readiness_error:#}; runtime shutdown also failed: {shutdown_error:#}"
+                    )),
+                };
+            }
+        }
+    } else {
+        None
+    };
+    let mut codex_switch_guard = if let Some(runtime_ready) = client_runtime_ready {
+        match prepare_ch_codex_switch(
+            service_name,
+            options,
+            runtime_ready,
+            owner_lease.as_ref(),
+            client_patch,
+        ) {
+            Ok(guard) => guard,
+            Err(switch_error) => {
+                let shutdown_result = running_runtime.abort_and_wait().await;
+                return match shutdown_result {
+                    Ok(()) => Err(switch_error),
+                    Err(shutdown_error) => Err(anyhow::anyhow!(
+                        "Codex auto-switch failed after the runtime became ready: {switch_error:#}; runtime shutdown also failed: {shutdown_error:#}"
+                    )),
+                };
+            }
+        }
+    } else {
+        None
+    };
+    let mut claude_switch_guard = if let Some(runtime_ready) = client_runtime_ready {
+        match prepare_ch_claude_switch(service_name, options, runtime_ready) {
+            Ok(guard) => guard,
+            Err(switch_error) => {
+                let shutdown_result = running_runtime.abort_and_wait().await;
+                return match shutdown_result {
+                    Ok(()) => Err(switch_error),
+                    Err(shutdown_error) => Err(anyhow::anyhow!(
+                        "Claude auto-switch failed after the runtime became ready: {switch_error:#}; runtime shutdown also failed: {shutdown_error:#}"
+                    )),
+                };
+            }
+        }
+    } else {
+        None
+    };
     if options.supervisor_managed {
         publish_supervisor_child_ready(service_name, port, admin_addr.port())?;
     }
@@ -2789,14 +2960,17 @@ async fn run_server(
         Some(guard) => guard
             .finalize()
             .context("restore Codex client configuration after foreground proxy shutdown"),
-        None => Ok(()),
+        None => match claude_switch_guard.as_mut() {
+            Some(guard) => guard.finalize(),
+            None => Ok(()),
+        },
     };
     match (result, restore_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(runtime_error), Ok(())) => Err(runtime_error),
         (Ok(()), Err(restore_error)) => Err(restore_error),
         (Err(runtime_error), Err(restore_error)) => Err(anyhow::anyhow!(
-            "proxy runtime failed: {runtime_error:#}; Codex client restore also failed: {restore_error:#}"
+            "proxy runtime failed: {runtime_error:#}; client configuration restore also failed: {restore_error:#}"
         )),
     }
 }
@@ -2820,6 +2994,17 @@ pub(crate) async fn run_service_managed_server(
     .map_err(|error| CliError::Other(error.to_string()))
 }
 
+fn require_service_install_generation(
+    generation: Option<codex_helper_core::service_target::ServiceInstallGeneration>,
+) -> anyhow::Result<codex_helper_core::service_target::ServiceInstallGeneration> {
+    generation.ok_or_else(|| {
+        anyhow::anyhow!(
+            "service-managed runtime requires {}",
+            codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR
+        )
+    })
+}
+
 async fn build_local_proxy_runtime(
     service_name: &'static str,
     host: IpAddr,
@@ -2830,8 +3015,10 @@ async fn build_local_proxy_runtime(
 ) -> anyhow::Result<ProxyRuntime> {
     let admin_addr = admin_loopback_addr_for_proxy_port(port);
     let service_install_generation = if service_managed {
-        codex_helper_core::service_target::ServiceInstallGeneration::from_process_env()
-            .context("read service install generation from process environment")?
+        Some(require_service_install_generation(
+            codex_helper_core::service_target::ServiceInstallGeneration::from_process_env()
+                .context("read service install generation from process environment")?,
+        )?)
     } else {
         None
     };
@@ -3208,6 +3395,25 @@ struct CodexSwitchClientPatchSelection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchClient {
+    Codex,
+    Claude,
+}
+
+fn resolve_switch_client(codex: bool, claude: bool) -> CliResult<SwitchClient> {
+    if codex && claude {
+        return Err(CliError::Other(
+            "Please specify at most one of --codex / --claude".to_string(),
+        ));
+    }
+    Ok(if claude {
+        SwitchClient::Claude
+    } else {
+        SwitchClient::Codex
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexSwitchCredentialReadiness {
     Ready,
     Degraded,
@@ -3427,8 +3633,29 @@ fn apply_codex_switch(
 async fn do_switch_on(
     port: Option<u16>,
     base_url: Option<String>,
+    codex: bool,
+    claude: bool,
     selection: CodexSwitchClientPatchSelection,
 ) -> CliResult<()> {
+    if resolve_switch_client(codex, claude)? == SwitchClient::Claude {
+        if !selection.overrides.is_empty() {
+            return Err(CliError::Other(
+                "Codex client patch overrides are not supported for Claude switch on".to_string(),
+            ));
+        }
+        codex_integration::guard_claude_settings_before_switch_on_interactive()
+            .map_err(|error| CliError::CodexConfig(error.to_string()))?;
+        match base_url {
+            Some(base_url) => codex_integration::claude_switch_on_base_url(&base_url),
+            None => codex_integration::claude_switch_on(
+                port.unwrap_or_else(|| default_proxy_port_for_service_kind(ServiceKind::Claude)),
+            ),
+        }
+        .map_err(|error| CliError::CodexConfig(error.to_string()))?;
+        print_claude_switch_status()?;
+        return Ok(());
+    }
+
     let validated_base_url = match base_url {
         Some(base_url) => ValidatedCodexBaseUrl::parse(base_url),
         None => Ok(ValidatedCodexBaseUrl::local(port.unwrap_or_else(|| {
@@ -3484,7 +3711,13 @@ fn print_codex_client_patch(client_patch: &CodexClientPatchConfig) {
     );
 }
 
-fn do_switch_off() -> CliResult<()> {
+fn do_switch_off(codex: bool, claude: bool) -> CliResult<()> {
+    if resolve_switch_client(codex, claude)? == SwitchClient::Claude {
+        codex_integration::claude_switch_off()
+            .map_err(|error| CliError::CodexConfig(error.to_string()))?;
+        print_claude_switch_status()?;
+        return Ok(());
+    }
     let outcome = codex_switch::apply(CodexSwitchIntent::Off)
         .map_err(|error| CliError::CodexConfig(error.to_string()))?;
     println!(
@@ -3495,8 +3728,21 @@ fn do_switch_off() -> CliResult<()> {
     Ok(())
 }
 
-fn do_switch_status() -> CliResult<()> {
-    print_codex_switch_status()
+fn do_switch_status(codex: bool, claude: bool) -> CliResult<()> {
+    let both_unspecified = !codex && !claude;
+    let show_codex = codex || both_unspecified;
+    let show_claude = claude || both_unspecified;
+
+    if show_codex {
+        print_codex_switch_status()?;
+        if show_claude {
+            println!();
+        }
+    }
+    if show_claude {
+        print_claude_switch_status()?;
+    }
+    Ok(())
 }
 
 async fn handle_default_cmd(codex: bool, claude: bool) -> CliResult<()> {
@@ -3557,6 +3803,23 @@ fn print_codex_switch_status() -> CliResult<()> {
     Ok(())
 }
 
+fn print_claude_switch_status() -> CliResult<()> {
+    let status = codex_integration::claude_switch_status()
+        .map_err(|error| CliError::CodexConfig(error.to_string()))?;
+    println!("{}", "Claude switch status (experimental)".bold());
+    println!("  enabled: {}", status.enabled);
+    println!("  managed: {}", status.has_backup);
+    println!("  settings: {:?}", status.settings_path);
+    println!(
+        "  base_url: {}",
+        status.base_url.as_deref().unwrap_or("<unset>")
+    );
+    if let Some(reason) = status.recovery_reason.as_deref() {
+        println!("  recovery: {}", reason.yellow());
+    }
+    Ok(())
+}
+
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -3586,17 +3849,19 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod switch_client_patch_tests {
     use super::{
-        CodexSwitchClientPatchSelection, CodexSwitchCredentialReadiness,
+        CodexSwitchClientPatchSelection, CodexSwitchCredentialReadiness, SwitchClient,
         classify_switch_credential_readiness, configured_codex_relay_target_for_switch,
         configured_relay_readiness_probe_error, ensure_switch_credential_readiness,
-        preflight_configured_relay_switch_target, relay_target_has_authenticated_admin,
-        relay_target_list_line, resolve_codex_switch_client_patch,
-        resolve_relay_codex_client_patch,
+        legacy_client_facade, preflight_configured_relay_switch_target,
+        relay_overview_json_payload, relay_target_has_authenticated_admin, relay_target_list_line,
+        resolve_codex_switch_client_patch, resolve_relay_codex_client_patch, resolve_switch_client,
     };
     use axum::Router;
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::get;
-    use codex_helper_core::codex_switch::ValidatedCodexBaseUrl;
+    use codex_helper_core::codex_switch::{
+        CodexSwitchPhase, CodexSwitchStatus, ValidatedCodexBaseUrl,
+    };
     use codex_helper_core::config::{
         CodexClientPatchConfig, CodexClientPatchOverrides, CodexClientPreset,
         CodexCompactionStrategy, CodexHostedImageGenerationMode, HelperConfig, RelayTargetConfig,
@@ -3646,6 +3911,23 @@ mod switch_client_patch_tests {
     }
 
     #[test]
+    fn switch_client_defaults_to_codex_and_rejects_ambiguous_flags() {
+        assert_eq!(
+            resolve_switch_client(false, false).expect("resolve default switch client"),
+            SwitchClient::Codex
+        );
+        assert_eq!(
+            resolve_switch_client(true, false).expect("resolve explicit Codex switch client"),
+            SwitchClient::Codex
+        );
+        assert_eq!(
+            resolve_switch_client(false, true).expect("resolve explicit Claude switch client"),
+            SwitchClient::Claude
+        );
+        assert!(resolve_switch_client(true, true).is_err());
+    }
+
+    #[test]
     fn switch_without_overrides_uses_the_complete_configured_patch() {
         let configured = configured_patch();
         let resolved = resolve_codex_switch_client_patch(
@@ -3654,6 +3936,59 @@ mod switch_client_patch_tests {
         );
 
         assert_eq!(resolved, configured);
+    }
+
+    #[test]
+    fn relay_status_projects_the_legacy_client_facade_from_the_compiled_patch() {
+        assert_eq!(
+            legacy_client_facade(Some(&CodexClientPatchConfig::default())),
+            Some("compatible")
+        );
+        assert_eq!(
+            legacy_client_facade(Some(&CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialRelay,
+                ..CodexClientPatchConfig::default()
+            })),
+            Some("openai")
+        );
+        assert_eq!(
+            legacy_client_facade(Some(&CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialImagegen,
+                ..CodexClientPatchConfig::default()
+            })),
+            Some("openai-tools")
+        );
+        assert_eq!(
+            legacy_client_facade(Some(&CodexClientPatchConfig {
+                preset: CodexClientPreset::OfficialImagegen,
+                hosted_image_generation: CodexHostedImageGenerationMode::Disabled,
+                ..CodexClientPatchConfig::default()
+            })),
+            Some("openai")
+        );
+        assert_eq!(legacy_client_facade(None), None);
+    }
+
+    #[test]
+    fn relay_status_json_keeps_the_legacy_facade_alongside_the_richer_client_patch() {
+        let payload = relay_overview_json_payload(
+            vec!["default".to_string()],
+            CodexSwitchStatus {
+                phase: CodexSwitchPhase::Off,
+                enabled: false,
+                model_provider: Some("external".to_string()),
+                managed: false,
+                base_url: None,
+                client_patch: Some(CodexClientPatchConfig::default()),
+                recovery_reason: None,
+                config_path: "/tmp/codex/config.toml".into(),
+                state_path: "/tmp/helper/state/codex-switch.json".into(),
+            },
+        );
+
+        assert_eq!(payload["codex"]["model_provider"], "external");
+        assert_eq!(payload["codex"]["client_facade"], "compatible");
+        assert_eq!(payload["codex"]["client_patch"]["preset"], "default");
     }
 
     #[test]
@@ -4307,6 +4642,11 @@ mod serve_startup_tests {
             self.saved.push((key.to_string(), std::env::var(key).ok()));
             unsafe { std::env::set_var(key, value) };
         }
+
+        unsafe fn remove(&mut self, key: &str) {
+            self.saved.push((key.to_string(), std::env::var(key).ok()));
+            unsafe { std::env::remove_var(key) };
+        }
     }
 
     impl Drop for ScopedEnv {
@@ -4335,6 +4675,70 @@ mod serve_startup_tests {
             std::fs::create_dir_all(parent).expect("create test directory");
         }
         std::fs::write(path, contents).expect("write test file");
+    }
+
+    #[test]
+    fn service_managed_runtime_requires_an_install_generation() {
+        let missing = require_service_install_generation(None)
+            .expect_err("service-managed runtime must reject a missing install generation");
+        assert!(
+            missing
+                .to_string()
+                .contains(codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR)
+        );
+
+        let generation = codex_helper_core::service_target::ServiceInstallGeneration::generate();
+        let accepted = require_service_install_generation(Some(generation.clone()))
+            .expect("service-managed runtime accepts a canonical install generation");
+        assert_eq!(accepted, generation);
+    }
+
+    #[test]
+    fn service_managed_runtime_rejects_missing_install_generation_before_binding() {
+        let _lock = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-generation-required-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set_path("CODEX_HELPER_HOME", &helper_home);
+            env.remove(codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR);
+        }
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve occupied service proxy address");
+        let addr = occupied
+            .local_addr()
+            .expect("read occupied service proxy address");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build Tokio runtime");
+
+        let result = runtime.block_on(build_local_proxy_runtime(
+            "codex",
+            addr.ip(),
+            addr.port(),
+            true,
+            codex_helper_core::local_operator::LocalRuntimeShutdownPolicy::SystemService,
+            empty_loaded_test_config(),
+        ));
+        let error = match result {
+            Ok(_) => {
+                panic!("service-managed runtime must fail before attempting its listener bind")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(codex_helper_core::service_target::SERVICE_INSTALL_GENERATION_ENV_VAR)
+        );
+
+        drop(occupied);
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4408,6 +4812,40 @@ mod serve_startup_tests {
         })
     }
 
+    fn seed_read_only_basellm_catalog_for_service_attach_test(helper_home: &Path) {
+        let runtime_store =
+            codex_helper_core::runtime_store::RuntimeStore::open_in_home(helper_home)
+                .expect("open runtime store for service attach test");
+        runtime_store
+            .write_runtime_documents(&[codex_helper_core::runtime_store::RuntimeDocumentWrite {
+                kind: codex_helper_core::runtime_store::RuntimeDocumentKind::BasellmCatalog,
+                schema_version: codex_helper_core::basellm_catalog::BASELLM_CATALOG_SCHEMA_VERSION
+                    + 1,
+                payload_json: r#"{"opaque":"future-state"}"#,
+            }])
+            .expect("seed read-only BaseLLM catalog for service attach test");
+    }
+
+    fn loaded_claude_runtime_test_config() -> LoadedConfig {
+        let provider_id = "test".to_string();
+        loaded_test_config(crate::config::HelperConfig {
+            claude: crate::config::ServiceRouteConfig {
+                providers: std::collections::BTreeMap::from([(
+                    provider_id.clone(),
+                    crate::config::ProviderConfig {
+                        base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                        ..crate::config::ProviderConfig::default()
+                    },
+                )]),
+                routing: Some(crate::config::RouteGraphConfig::ordered_failover(vec![
+                    provider_id,
+                ])),
+                ..crate::config::ServiceRouteConfig::default()
+            },
+            ..crate::config::HelperConfig::default()
+        })
+    }
+
     fn empty_loaded_test_config() -> LoadedConfig {
         loaded_test_config(crate::config::HelperConfig::default())
     }
@@ -4424,6 +4862,22 @@ mod serve_startup_tests {
             }
         }
         panic!("reserve a free proxy port with an occupiable admin port");
+    }
+
+    fn reserve_free_runtime_port() -> u16 {
+        for _ in 0..100 {
+            let proxy = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("reserve candidate proxy address");
+            let proxy_port = proxy.local_addr().expect("candidate proxy address").port();
+            if let Ok(admin) =
+                std::net::TcpListener::bind(admin_loopback_addr_for_proxy_port(proxy_port))
+            {
+                drop(admin);
+                drop(proxy);
+                return proxy_port;
+            }
+        }
+        panic!("reserve free proxy and admin ports");
     }
 
     #[derive(Clone, Copy)]
@@ -4487,6 +4941,7 @@ mod serve_startup_tests {
                 .expect("persist helper config for ch switch");
             codex_helper_core::local_operator::ensure_local_operator_token()
                 .expect("create local operator token");
+            seed_read_only_basellm_catalog_for_service_attach_test(&helper_home);
 
             let (port, admin_reservation) = reserve_admin_for_free_proxy_port();
             drop(admin_reservation);
@@ -4676,13 +5131,14 @@ mod serve_startup_tests {
     }
 
     #[test]
-    fn ch_auto_switch_is_limited_to_user_owned_codex_servers() {
+    fn ch_auto_switch_is_limited_to_user_owned_client_servers() {
         let foreground = ServeRuntimeOptions {
             auto_manage_codex_switch: true,
             ..ServeRuntimeOptions::default()
         };
         assert!(foreground.should_auto_manage_codex_switch("codex"));
-        assert!(!foreground.should_auto_manage_codex_switch("claude"));
+        assert!(foreground.should_auto_manage_claude_switch("claude"));
+        assert!(!foreground.should_auto_manage_claude_switch("codex"));
 
         for managed in [
             ServeRuntimeOptions {
@@ -4699,7 +5155,15 @@ mod serve_startup_tests {
             },
         ] {
             assert!(!managed.should_auto_manage_codex_switch("codex"));
+            assert!(!managed.should_auto_manage_claude_switch("claude"));
         }
+
+        let resident = ServeRuntimeOptions {
+            resident: true,
+            ..foreground
+        };
+        assert!(resident.should_auto_manage_codex_switch("codex"));
+        assert!(!resident.should_auto_manage_claude_switch("claude"));
     }
 
     #[test]
@@ -4919,7 +5383,22 @@ env_key = "EXTERNAL_API_KEY"
 "#;
         write_file(&codex_config_path, original);
 
-        let owner_marker = RuntimeOwnerMarker::new(RuntimeOwnerKind::ManualCli, "codex", 33211)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind ready foreground proxy test listener");
+        let port = listener
+            .local_addr()
+            .expect("read ready foreground proxy test listener")
+            .port();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build Tokio runtime");
+        let runtime_ready = runtime
+            .block_on(wait_for_foreground_client_runtime_readiness(
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            ))
+            .expect("test foreground proxy listener becomes reachable");
+        let owner_marker = RuntimeOwnerMarker::new(RuntimeOwnerKind::ManualCli, "codex", port)
             .with_lifecycle_mode(ProxyLifecycleMode::EphemeralConsole);
         let owner_lease =
             RuntimeOwnerLease::acquire(&owner_marker).expect("acquire foreground runtime owner");
@@ -4931,6 +5410,7 @@ env_key = "EXTERNAL_API_KEY"
                 auto_manage_codex_switch: true,
                 ..ServeRuntimeOptions::default()
             },
+            runtime_ready,
             Some(&owner_lease),
             CodexClientPatchConfig::default(),
         )
@@ -4940,7 +5420,10 @@ env_key = "EXTERNAL_API_KEY"
         let status = codex_switch::inspect().expect("inspect applied switch");
         assert_eq!(status.phase, CodexSwitchPhase::Applied);
         assert!(status.enabled);
-        assert_eq!(status.base_url.as_deref(), Some("http://127.0.0.1:33211"));
+        assert_eq!(
+            status.base_url.as_deref(),
+            Some(format!("http://127.0.0.1:{port}").as_str())
+        );
 
         drop(guard);
 
@@ -4952,6 +5435,227 @@ env_key = "EXTERNAL_API_KEY"
             original
         );
 
+        drop(listener);
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_claude_switch_uses_claude_default_port_and_restores() {
+        let _lock = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-explicit-claude-switch-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let claude_home = root.join("claude");
+        std::fs::create_dir_all(&claude_home).expect("create Claude home");
+        let settings_path = claude_home.join("settings.json");
+        let original = r#"{"permissions":{"allow":["Read"]}}"#;
+        write_file(&settings_path, original);
+        let mut env = ScopedEnv::new();
+        unsafe { env.set_path("CLAUDE_HOME", &claude_home) };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        runtime
+            .block_on(do_switch_on(
+                None,
+                None,
+                false,
+                true,
+                CodexSwitchClientPatchSelection::default(),
+            ))
+            .expect("explicitly switch Claude on");
+        let status = codex_integration::claude_switch_status().expect("inspect Claude switch");
+        assert!(status.enabled);
+        assert_eq!(status.base_url.as_deref(), Some("http://127.0.0.1:3210"));
+
+        do_switch_off(false, true).expect("explicitly switch Claude off");
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).expect("read restored settings"),
+            original
+        );
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ch_claude_switch_starts_after_runtime_readiness_and_restores_on_exit() {
+        let _lock = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-ch-claude-ready-switch-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let claude_home = root.join("claude");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&claude_home).expect("create Claude home");
+        let settings_path = claude_home.join("settings.json");
+        let original = r#"{"permissions":{"allow":["Read"]}}"#;
+        write_file(&settings_path, original);
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set_path("CODEX_HELPER_HOME", &helper_home);
+            env.set_path("CLAUDE_HOME", &claude_home);
+        }
+        let port = reserve_free_runtime_port();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build Tokio runtime");
+        runtime.block_on(async {
+            let proxy_runtime = build_local_proxy_runtime(
+                "claude",
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+                false,
+                codex_helper_core::local_operator::LocalRuntimeShutdownPolicy::ForegroundProcess,
+                loaded_claude_runtime_test_config(),
+            )
+            .await
+            .expect("build Claude runtime");
+            assert_eq!(
+                std::fs::read_to_string(&settings_path).expect("read settings before start"),
+                original,
+                "building and binding the runtime must not patch Claude"
+            );
+
+            let mut running = proxy_runtime.start();
+            let proxy_addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+            let runtime_ready = wait_for_foreground_client_runtime_readiness(proxy_addr)
+                .await
+                .expect("Claude runtime becomes reachable before client patch");
+
+            let options = ServeRuntimeOptions {
+                enable_tui: false,
+                auto_manage_codex_switch: true,
+                ..ServeRuntimeOptions::default()
+            };
+            let mut guard = prepare_ch_claude_switch("claude", options, runtime_ready)
+                .expect("switch Claude after runtime readiness")
+                .expect("foreground ch owns a Claude restore guard");
+            let switched =
+                codex_integration::claude_switch_status().expect("inspect switched Claude");
+            assert!(switched.enabled);
+            let expected_base_url = format!("http://127.0.0.1:{port}");
+            assert_eq!(
+                switched.base_url.as_deref(),
+                Some(expected_base_url.as_str())
+            );
+
+            running.abort_and_wait().await.expect("stop Claude runtime");
+            guard.finalize().expect("restore Claude after runtime exit");
+            assert_eq!(
+                std::fs::read_to_string(&settings_path).expect("read restored Claude settings"),
+                original
+            );
+        });
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn older_ch_claude_guard_does_not_restore_a_newer_foreground_switch() {
+        let _lock = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-ch-claude-generation-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let claude_home = root.join("claude");
+        std::fs::create_dir_all(&claude_home).expect("create Claude home");
+        let settings_path = claude_home.join("settings.json");
+        let original = r#"{"permissions":{"allow":["Read"]}}"#;
+        write_file(&settings_path, original);
+        let mut env = ScopedEnv::new();
+        unsafe { env.set_path("CLAUDE_HOME", &claude_home) };
+        let options = ServeRuntimeOptions {
+            enable_tui: false,
+            auto_manage_codex_switch: true,
+            ..ServeRuntimeOptions::default()
+        };
+
+        let mut first = prepare_ch_claude_switch(
+            "claude",
+            options,
+            ForegroundClientRuntimeReady::for_test(3210),
+        )
+        .expect("switch Claude for first foreground proxy")
+        .expect("first foreground proxy owns a restore guard");
+        let mut second = prepare_ch_claude_switch(
+            "claude",
+            options,
+            ForegroundClientRuntimeReady::for_test(4210),
+        )
+        .expect("switch Claude for second foreground proxy")
+        .expect("second foreground proxy owns a restore guard");
+
+        first
+            .finalize()
+            .expect("older foreground guard must not restore newer settings");
+        let active = codex_integration::claude_switch_status().expect("inspect newer settings");
+        assert!(active.enabled);
+        assert_eq!(active.base_url.as_deref(), Some("http://127.0.0.1:4210"));
+
+        second
+            .finalize()
+            .expect("newest foreground guard restores its own settings");
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).expect("read restored Claude settings"),
+            original
+        );
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ch_claude_startup_failure_never_patches_settings() {
+        let _lock = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-ch-claude-start-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let claude_home = root.join("claude");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&claude_home).expect("create Claude home");
+        let settings_path = claude_home.join("settings.json");
+        let backup_path = claude_home.join("settings.json.codex-helper-backup");
+        let original = r#"{"permissions":{"allow":["Read"]}}"#;
+        write_file(&settings_path, original);
+        let mut env = ScopedEnv::new();
+        unsafe {
+            env.set_path("CODEX_HELPER_HOME", &helper_home);
+            env.set_path("CLAUDE_HOME", &claude_home);
+        }
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve occupied Claude proxy address");
+        let addr = occupied.local_addr().expect("read occupied address");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build Tokio runtime");
+        let result = runtime.block_on(build_local_proxy_runtime(
+            "claude",
+            addr.ip(),
+            addr.port(),
+            false,
+            codex_helper_core::local_operator::LocalRuntimeShutdownPolicy::ForegroundProcess,
+            loaded_claude_runtime_test_config(),
+        ));
+        assert!(result.is_err(), "occupied listener must fail startup");
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).expect("read unchanged Claude settings"),
+            original
+        );
+        assert!(!backup_path.exists());
+
+        drop(occupied);
         drop(env);
         let _ = std::fs::remove_dir_all(root);
     }

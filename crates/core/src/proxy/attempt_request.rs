@@ -14,7 +14,8 @@ use crate::logging::{BodyPreview, HeaderEntry, upstream_origin, upstream_uri_for
 use crate::provider_catalog::AccountFingerprint;
 
 use super::headers::{
-    filter_request_headers, header_map_to_entries, strip_codex_client_facade_marker,
+    filter_request_headers, header_map_to_entries, sensitive_header_values,
+    strip_codex_client_facade_marker,
 };
 use super::http_debug::HttpDebugBase;
 use super::request_preparation::codex_path_is_responses_compact;
@@ -350,6 +351,8 @@ fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBas
         upstream_request_body_warn,
     } = params;
 
+    let _ = (client_body_warn, upstream_request_body_warn);
+
     if debug_max == 0 && warn_max == 0 {
         return None;
     }
@@ -367,11 +370,10 @@ fn build_http_debug_base(params: HttpDebugBaseParams<'_>) -> Option<HttpDebugBas
             .get_or_init(|| header_map_to_entries(client_headers))
             .clone(),
         upstream_request_headers: header_map_to_entries(upstream_request_headers),
+        body_redactions: sensitive_header_values(upstream_request_headers),
         auth_resolution: None,
         client_body_debug: client_body_debug.cloned(),
         upstream_request_body_debug: upstream_request_body_debug.cloned(),
-        client_body_warn: client_body_warn.cloned(),
-        upstream_request_body_warn: upstream_request_body_warn.cloned(),
     })
 }
 
@@ -449,6 +451,44 @@ mod tests {
         );
         assert_ne!(setup.account_fingerprint, AccountFingerprint::unscoped());
         assert!(setup.debug_base.is_none());
+    }
+
+    #[test]
+    fn debug_context_captures_injected_upstream_credentials_for_redaction() {
+        let cache = OnceLock::new();
+        let setup = prepare_attempt_request(AttemptRequestSetupParams {
+            service_name: "codex",
+            auth: &UpstreamAuth {
+                auth_token: Some("server-token".to_string().into()),
+                api_key: Some("server-key".to_string().into()),
+                ..UpstreamAuth::default()
+            },
+            client_headers: &HeaderMap::new(),
+            client_headers_entries_cache: &cache,
+            request_body_len: 12,
+            upstream_request_body_len: 12,
+            debug_max: 1024,
+            warn_max: 0,
+            client_uri: "/v1/responses",
+            target_url: "https://example.com/v1/responses",
+            client_body_debug: None,
+            upstream_request_body_debug: None,
+            client_body_warn: None,
+            upstream_request_body_warn: None,
+        })
+        .expect("prepare attempt request");
+
+        let redactions = &setup.debug_base.expect("debug context").body_redactions;
+        for expected in [
+            b"Bearer server-token".as_slice(),
+            b"server-token",
+            b"server-key",
+        ] {
+            assert!(
+                redactions.iter().any(|value| value.as_slice() == expected),
+                "missing redaction for {expected:?}"
+            );
+        }
     }
 
     #[test]

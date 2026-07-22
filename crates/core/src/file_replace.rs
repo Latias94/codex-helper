@@ -175,7 +175,29 @@ impl ManagedFileTransaction {
         &self.current
     }
 
+    /// Verifies that the managed path still matches this transaction's latest snapshot.
+    ///
+    /// Callers that coordinate multiple managed files use this before committing a
+    /// dependent mutation, so a concurrent edit is reported before another file is
+    /// changed.
+    pub fn verify_current(&self) -> Result<(), ManagedFileTransactionError> {
+        self.ensure_current()
+    }
+
     pub fn replace(&mut self, data: &[u8]) -> Result<(), ManagedFileTransactionError> {
+        self.replace_with_staging_policy(data, false)
+    }
+
+    /// Replaces a recovery file while preserving the transaction's compare-and-swap guard.
+    pub fn replace_private(&mut self, data: &[u8]) -> Result<(), ManagedFileTransactionError> {
+        self.replace_with_staging_policy(data, true)
+    }
+
+    fn replace_with_staging_policy(
+        &mut self,
+        data: &[u8],
+        private: bool,
+    ) -> Result<(), ManagedFileTransactionError> {
         if data.len() > self.max_bytes {
             return Err(managed_file_io(
                 &self.path,
@@ -191,19 +213,37 @@ impl ManagedFileTransaction {
         let expected = self.current.clone();
         let path = self.path.clone();
         let max_bytes = self.max_bytes;
-        let result = write_bytes_file_validated_with_permissions_and_before_replace(
-            &self.path,
-            data,
-            None,
-            |_| Ok(()),
-            move |_staged_path, destination| {
-                let actual = read_managed_file_snapshot_io(destination, max_bytes)?;
-                if actual != expected {
-                    return Err(io::Error::other(ConcurrentManagedFileChange));
-                }
-                Ok(())
-            },
-        );
+        let before_replace = move |_staged_path: &Path, destination: &Path| {
+            let actual = read_managed_file_snapshot_io(destination, max_bytes)?;
+            if actual != expected {
+                return Err(io::Error::other(ConcurrentManagedFileChange));
+            }
+            Ok(())
+        };
+        let result = if private {
+            write_bytes_file_with_operations_and_prepare_staged(
+                &self.path,
+                data,
+                private_file_permissions(),
+                |_| Ok(()),
+                secure_private_staged_file,
+                AtomicWriteOperations {
+                    write_staged: write_staged_file,
+                    sync_staged: flush_and_sync_staged_file,
+                    before_replace,
+                    replace: replace_existing_file,
+                    sync_parent: sync_parent_directory,
+                },
+            )
+        } else {
+            write_bytes_file_validated_with_permissions_and_before_replace(
+                &self.path,
+                data,
+                None,
+                |_| Ok(()),
+                before_replace,
+            )
+        };
         match result {
             Ok(()) => {
                 match read_managed_file_snapshot_io(&self.path, self.max_bytes) {
@@ -621,6 +661,33 @@ fn before_replace_noop(_staged_path: &Path, _destination: &Path) -> io::Result<(
     Ok(())
 }
 
+fn prepare_staged_file_noop(_staged_path: &Path, _staged_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn private_file_permissions() -> Option<fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+
+    Some(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn private_file_permissions() -> Option<fs::Permissions> {
+    None
+}
+
+#[cfg(windows)]
+fn secure_private_staged_file(path: &Path, _staged_file: &File) -> io::Result<()> {
+    crate::local_operator::secure_private_windows_path(path, false)
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn secure_private_staged_file(_path: &Path, _staged_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(windows)]
 fn replace_existing_file(
     staged_file: &File,
@@ -885,6 +952,33 @@ where
     R: FnOnce(&File, &Path, &Path) -> io::Result<()>,
     D: FnOnce(&Path) -> io::Result<()>,
 {
+    write_bytes_file_with_operations_and_prepare_staged(
+        path,
+        data,
+        explicit_permissions,
+        validate,
+        prepare_staged_file_noop,
+        operations,
+    )
+}
+
+fn write_bytes_file_with_operations_and_prepare_staged<V, P, W, S, B, R, D>(
+    path: &Path,
+    data: &[u8],
+    explicit_permissions: Option<fs::Permissions>,
+    validate: V,
+    prepare_staged_file: P,
+    operations: AtomicWriteOperations<W, S, B, R, D>,
+) -> std::result::Result<(), AtomicWriteError>
+where
+    V: FnOnce(&[u8]) -> io::Result<()>,
+    P: FnOnce(&Path, &File) -> io::Result<()>,
+    W: FnOnce(&mut File, &[u8]) -> io::Result<()>,
+    S: FnOnce(&mut File) -> io::Result<()>,
+    B: FnOnce(&Path, &Path) -> io::Result<()>,
+    R: FnOnce(&File, &Path, &Path) -> io::Result<()>,
+    D: FnOnce(&Path) -> io::Result<()>,
+{
     let AtomicWriteOperations {
         write_staged,
         sync_staged,
@@ -907,6 +1001,8 @@ where
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     apply_staged_permissions(path, &staged_file, explicit_permissions)
         .map_err(|err| AtomicWriteError::before_commit(path, "apply permissions", err))?;
+    prepare_staged_file(staged_guard.path(), &staged_file)
+        .map_err(|err| AtomicWriteError::before_commit(path, "prepare staging file", err))?;
     write_staged(&mut staged_file, data)
         .map_err(|err| AtomicWriteError::before_commit(path, "write staging file", err))?;
     sync_staged(&mut staged_file)
@@ -1011,6 +1107,25 @@ where
 
 pub fn write_text_file(path: &Path, data: &str) -> Result<()> {
     write_bytes_file(path, data.as_bytes()).with_context(|| format!("atomically write {:?}", path))
+}
+
+#[cfg(test)]
+pub(crate) fn write_text_private_file(path: &Path, data: &str) -> Result<()> {
+    write_bytes_file_with_operations_and_prepare_staged(
+        path,
+        data.as_bytes(),
+        private_file_permissions(),
+        |_| Ok(()),
+        secure_private_staged_file,
+        AtomicWriteOperations {
+            write_staged: write_staged_file,
+            sync_staged: flush_and_sync_staged_file,
+            before_replace: before_replace_noop,
+            replace: replace_existing_file,
+            sync_parent: sync_parent_directory,
+        },
+    )
+    .with_context(|| format!("atomically write private file {:?}", path))
 }
 
 pub async fn write_bytes_file_async(
@@ -1215,6 +1330,30 @@ mod tests {
         assert!(managed_temp_files(&directory.0).is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_text_private_file_restricts_the_destination_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDir::new();
+        let path = directory.join("recovery.json");
+        fs::write(&path, "old").expect("write old file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("relax destination mode");
+
+        write_text_private_file(&path, "secret").expect("write private recovery material");
+
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("read private destination metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "secret");
+    }
+
     #[test]
     fn replacement_keeps_existing_reader_on_old_file_and_new_reads_on_new_file() {
         let directory = TestDir::new();
@@ -1257,6 +1396,26 @@ mod tests {
             read_managed_file_snapshot(&path, 3),
             Err(ManagedFileTransactionError::Io { .. })
         ));
+    }
+
+    #[test]
+    fn managed_file_transaction_verifies_its_latest_snapshot() {
+        let directory = TestDir::new();
+        let path = directory.join("receipt.json");
+        fs::write(&path, b"initial").expect("write initial payload");
+        let transaction =
+            ManagedFileTransaction::begin(&path, 1024).expect("begin managed transaction");
+
+        transaction
+            .verify_current()
+            .expect("unchanged snapshot must verify");
+        fs::write(&path, b"external").expect("simulate external replacement");
+
+        assert!(matches!(
+            transaction.verify_current(),
+            Err(ManagedFileTransactionError::ConcurrentChange { .. })
+        ));
+        assert_eq!(fs::read(&path).expect("read external payload"), b"external");
     }
 
     #[cfg(unix)]

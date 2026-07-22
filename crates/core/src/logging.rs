@@ -214,7 +214,8 @@ pub fn http_debug_options() -> HttpDebugOptions {
 pub fn http_warn_options() -> HttpWarnOptions {
     static OPT: OnceLock<HttpWarnOptions> = OnceLock::new();
     *OPT.get_or_init(|| {
-        // Default ON: for non-2xx, record a small header/body preview to help debug upstream errors.
+        // Default ON: for non-2xx, record header-only diagnostics without request or response
+        // bodies. The retained limit keeps the existing configuration contract stable.
         // Set CODEX_HELPER_HTTP_WARN=0 to disable.
         let enabled = env_bool_default("CODEX_HELPER_HTTP_WARN", true);
         let all = env_bool_default("CODEX_HELPER_HTTP_WARN_ALL", false);

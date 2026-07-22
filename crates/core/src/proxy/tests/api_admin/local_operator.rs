@@ -1237,6 +1237,84 @@ async fn signed_local_operator_routing_mutations_enforce_cas_and_update_read_mod
 }
 
 #[tokio::test]
+async fn signed_local_operator_session_affinity_bind_initializes_an_unbound_session_once() {
+    let _env_guard = env_lock().await;
+    let home = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", &home);
+        scoped.set(ADMIN_TOKEN_ENV_VAR, "");
+    }
+    let token =
+        crate::local_operator::ensure_local_operator_token().expect("create operator token");
+    let proxy = proxy_service(routing_proxy_config());
+    let raw_session_id = "session-affinity-bind-secret";
+    observe_idle_session(&proxy, raw_session_id).await;
+
+    let server = spawn_admin_listener(proxy);
+    let endpoint = ControlPlaneEndpoint::new(format!("http://{}", server.addr), None::<String>)
+        .expect("loopback endpoint");
+    let operator = LocalOperatorClient::new(endpoint, &token).expect("local operator client");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build local client");
+    let initial = read_operator_model(&client, &server).await;
+    let session = initial
+        .data
+        .as_ref()
+        .expect("initial operator data")
+        .summary
+        .sessions
+        .iter()
+        .find(|session| session.route_affinity.is_none())
+        .expect("unbound observed session");
+
+    let bound = operator
+        .mutate_operator_session_affinity(&OperatorSessionAffinityMutationRequest {
+            session_key: session.session_key.clone(),
+            expected_affinity_revision: None,
+            command: OperatorSessionAffinityCommand::Bind {
+                provider_id: "ciii".to_string(),
+                endpoint_id: "default".to_string(),
+            },
+        })
+        .await
+        .expect("bind idle session affinity");
+    assert_eq!(bound.status, OperatorSessionAffinityMutationStatus::Applied);
+    let bound_affinity = bound.route_affinity.as_ref().expect("bound affinity");
+    assert_eq!(bound_affinity.provider_id, "ciii");
+    assert_eq!(bound_affinity.change_reason, "operator_bind");
+
+    let competing_bind = operator
+        .mutate_operator_session_affinity(&OperatorSessionAffinityMutationRequest {
+            session_key: session.session_key.clone(),
+            expected_affinity_revision: None,
+            command: OperatorSessionAffinityCommand::Bind {
+                provider_id: "input".to_string(),
+                endpoint_id: "default".to_string(),
+            },
+        })
+        .await
+        .expect("competing bind response");
+    assert_eq!(
+        competing_bind.status,
+        OperatorSessionAffinityMutationStatus::Conflict
+    );
+    assert_eq!(
+        competing_bind
+            .route_affinity
+            .as_ref()
+            .map(|affinity| affinity.provider_id.as_str()),
+        Some("ciii")
+    );
+
+    drop(server);
+    drop(scoped);
+    std::fs::remove_dir_all(home).expect("remove helper home");
+}
+
+#[tokio::test]
 async fn signed_local_operator_session_affinity_mutations_enforce_cas_and_update_read_model() {
     let _env_guard = env_lock().await;
     let home = make_temp_test_dir();

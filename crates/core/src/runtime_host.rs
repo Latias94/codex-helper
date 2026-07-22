@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::basellm_catalog::{
     BasellmCatalogSyncOptions, install_basellm_catalog_runtime_state,
-    load_basellm_catalog_runtime_state, sync_basellm_catalog,
+    load_basellm_catalog_runtime_state, sync_basellm_catalog_until_shutdown,
 };
 use crate::config::{HelperConfig, LoadedConfig, ServiceKind, load_config_with_source};
 use crate::credentials::CredentialSourceCapabilities;
@@ -552,20 +553,16 @@ fn spawn_basellm_catalog_sync(
             if *shutdown_rx.borrow() {
                 return;
             }
-            let sync = sync_basellm_catalog(
+            let Some(report) = sync_basellm_catalog_until_shutdown(
                 Arc::clone(&runtime_store),
                 BasellmCatalogSyncOptions::default(),
-            );
-            let (sync_result, shutdown_observed) =
-                join_in_flight_on_shutdown(sync, wait_for_runtime_shutdown(&mut shutdown_rx)).await;
-            let report = match sync_result {
-                Ok(report) => report,
-                Err(error) => {
-                    tracing::warn!(%error, "BaseLLM catalog sync task failed to join");
-                    return;
-                }
+                &mut shutdown_rx,
+            )
+            .await
+            else {
+                return;
             };
-            if shutdown_observed || *shutdown_rx.borrow() {
+            if *shutdown_rx.borrow() {
                 return;
             }
             if let Err(error) = proxy.publish_operator_pricing_catalog().await {
@@ -588,6 +585,7 @@ fn spawn_basellm_catalog_sync(
     })
 }
 
+#[cfg(test)]
 async fn join_in_flight_on_shutdown<T>(
     task: impl Future<Output = T> + Send + 'static,
     shutdown: impl Future<Output = ()>,

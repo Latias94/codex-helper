@@ -9,6 +9,7 @@ use crate::runtime_store::RuntimeStoreError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRouteAffinityControlCommand {
     Clear,
+    Bind(SessionRouteAffinityTarget),
     Rebind(SessionRouteAffinityTarget),
 }
 
@@ -141,6 +142,31 @@ impl ProxyState {
                     (SessionRouteAffinityControlStatus::Applied, None)
                 }
             },
+            SessionRouteAffinityControlCommand::Bind(target) => {
+                if current.is_some() {
+                    return Ok(SessionRouteAffinityControlCommit {
+                        status: SessionRouteAffinityControlStatus::Conflict,
+                        affinity: current,
+                    });
+                }
+                let affinity = SessionRouteAffinity {
+                    route_graph_key: target.route_graph_key,
+                    session_identity_source: target.session_identity_source,
+                    provider_endpoint: target.provider_endpoint,
+                    upstream_base_url: target.upstream_base_url,
+                    route_path: target.route_path,
+                    last_selected_at_ms: now_ms,
+                    last_changed_at_ms: now_ms,
+                    change_reason: "operator_bind".to_string(),
+                };
+                self.with_runtime_store_blocking(|runtime_store| {
+                    runtime_store.upsert_session_affinity(
+                        super::session_affinity_record(session_id, &affinity),
+                        super::session_affinity_limit(self.session_route_affinity_max_entries),
+                    )
+                })?;
+                (SessionRouteAffinityControlStatus::Applied, Some(affinity))
+            }
             SessionRouteAffinityControlCommand::Rebind(target) => {
                 let Some(current) = current else {
                     return Ok(SessionRouteAffinityControlCommit {
@@ -237,6 +263,46 @@ mod tests {
                 started_at_ms,
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn affinity_control_binds_an_unbound_idle_session_once() {
+        let state = ProxyState::new();
+
+        let bound = state
+            .compare_and_mutate_session_route_affinity(
+                "session-operator-bind",
+                None,
+                SessionRouteAffinityControlCommand::Bind(target("input")),
+                100,
+            )
+            .await
+            .expect("bind initial affinity");
+        assert_eq!(bound.status, SessionRouteAffinityControlStatus::Applied);
+        let bound_affinity = bound.affinity.expect("bound affinity");
+        assert_eq!(bound_affinity.provider_endpoint.provider_id, "input");
+        assert_eq!(bound_affinity.change_reason, "operator_bind");
+
+        let concurrent_bind = state
+            .compare_and_mutate_session_route_affinity(
+                "session-operator-bind",
+                None,
+                SessionRouteAffinityControlCommand::Bind(target("ciii")),
+                200,
+            )
+            .await
+            .expect("reject competing bind");
+        assert_eq!(
+            concurrent_bind.status,
+            SessionRouteAffinityControlStatus::Conflict
+        );
+        assert_eq!(
+            concurrent_bind
+                .affinity
+                .as_ref()
+                .map(|affinity| affinity.provider_endpoint.provider_id.as_str()),
+            Some("input")
+        );
     }
 
     #[tokio::test]

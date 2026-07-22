@@ -21,6 +21,7 @@ pub mod local_operator;
 pub mod logging;
 pub mod model_routing;
 pub mod notify;
+pub mod path_identity;
 pub mod policy_actions;
 pub mod pricing;
 pub mod provider_catalog;
