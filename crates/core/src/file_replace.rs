@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -10,6 +12,12 @@ use thiserror::Error;
 const TEMP_FILE_PREFIX: &str = ".codex-helper-tmp-v1-";
 const TEMP_FILE_CREATE_ATTEMPTS: usize = 16;
 const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+type ReplaceCommitMutex = Mutex<()>;
+type ReplaceCommitLockRegistry = Mutex<HashMap<PathBuf, Weak<ReplaceCommitMutex>>>;
+// Keep permission inheritance, validation/CAS, rename, and closing the renamed handle in one
+// directory-scoped critical section. Overlapping Windows POSIX replacements can otherwise make
+// the destination name transiently fail to open even though every individual payload is atomic.
+static REPLACE_COMMIT_LOCKS: OnceLock<ReplaceCommitLockRegistry> = OnceLock::new();
 #[cfg(windows)]
 const WINDOWS_REPLACE_ATTEMPTS: usize = 10;
 #[cfg(windows)]
@@ -483,6 +491,22 @@ fn destination_parent(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+fn replace_commit_lock(parent: &Path) -> io::Result<Arc<ReplaceCommitMutex>> {
+    let key = fs::canonicalize(parent)?;
+    let locks = REPLACE_COMMIT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
 fn create_staged_file(parent: &Path) -> io::Result<(File, StagedFileGuard)> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -876,6 +900,11 @@ where
 
     let (mut staged_file, mut staged_guard) = create_staged_file(&parent)
         .map_err(|err| AtomicWriteError::before_commit(path, "create staging file", err))?;
+    let commit_lock = replace_commit_lock(&parent)
+        .map_err(|err| AtomicWriteError::before_commit(path, "resolve commit lock", err))?;
+    let commit_guard = commit_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     apply_staged_permissions(path, &staged_file, explicit_permissions)
         .map_err(|err| AtomicWriteError::before_commit(path, "apply permissions", err))?;
     write_staged(&mut staged_file, data)
@@ -901,6 +930,8 @@ where
 
     if let Err(err) = replace(&staged_file, staged_guard.path(), path) {
         let staged_file_still_exists = matches!(staged_guard.path().try_exists(), Ok(true));
+        drop(staged_file);
+        drop(commit_guard);
         return Err(if staged_file_still_exists {
             AtomicWriteError::before_commit(path, "replace destination", err)
         } else {
@@ -908,6 +939,8 @@ where
         });
     }
     staged_guard.disarm();
+    drop(staged_file);
+    drop(commit_guard);
 
     sync_parent(&parent)
         .map_err(|err| AtomicWriteError::commit_state_unknown(path, "sync parent", err))?;
@@ -1130,6 +1163,44 @@ mod tests {
 
     fn fail_parent_sync(_parent: &Path) -> io::Result<()> {
         Err(io::Error::other("injected parent sync failure"))
+    }
+
+    #[test]
+    fn atomic_write_holds_directory_commit_lock_before_staging_bytes() {
+        let directory = TestDir::new();
+        let path = directory.join("state.json");
+        let parent = directory.0.clone();
+
+        write_bytes_file_with_operations(
+            &path,
+            b"new",
+            None,
+            |_| Ok(()),
+            AtomicWriteOperations {
+                write_staged: move |file: &mut File, data: &[u8]| -> io::Result<()> {
+                    let lock = replace_commit_lock(&parent)?;
+                    match lock.try_lock() {
+                        Err(std::sync::TryLockError::WouldBlock) => {}
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            return Err(io::Error::other("directory commit lock is poisoned"));
+                        }
+                        Ok(_) => {
+                            return Err(io::Error::other(
+                                "directory commit lock was not held before staging bytes",
+                            ));
+                        }
+                    }
+                    write_staged_file(file, data)
+                },
+                sync_staged: flush_and_sync_staged_file,
+                before_replace: before_replace_noop,
+                replace: replace_existing_file,
+                sync_parent: sync_parent_directory,
+            },
+        )
+        .expect("hold the directory commit lock throughout replacement preparation");
+
+        assert_eq!(fs::read(&path).expect("read committed payload"), b"new");
     }
 
     #[test]

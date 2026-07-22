@@ -45,6 +45,8 @@ pub(crate) struct ServiceReceipt {
     service: ServiceKind,
     helper_home: PathBuf,
     client_home: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daemon_executable: Option<PathBuf>,
     admin_base_url: String,
     platform_backend: ServicePlatformBackend,
     install_generation: ServiceInstallGeneration,
@@ -67,6 +69,7 @@ impl ServiceReceipt {
             service,
             helper_home,
             client_home,
+            daemon_executable: None,
             admin_base_url,
             platform_backend,
             install_generation,
@@ -86,6 +89,20 @@ impl ServiceReceipt {
     #[allow(dead_code)]
     pub(crate) fn client_home(&self) -> &Path {
         &self.client_home
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn daemon_executable(&self) -> Option<&Path> {
+        self.daemon_executable.as_deref()
+    }
+
+    pub(crate) fn with_daemon_executable(
+        mut self,
+        daemon_executable: PathBuf,
+    ) -> Result<Self, ServiceReceiptError> {
+        self.daemon_executable = Some(daemon_executable);
+        self.validate_fields()?;
+        Ok(self)
     }
 
     pub(crate) fn admin_base_url(&self) -> &str {
@@ -112,6 +129,9 @@ impl ServiceReceipt {
         validate_schema_version(Some(u64::from(self.schema_version)))?;
         validate_absolute_home(&self.helper_home, "helper_home")?;
         validate_absolute_home(&self.client_home, "client_home")?;
+        if let Some(daemon_executable) = self.daemon_executable.as_deref() {
+            validate_absolute_home(daemon_executable, "daemon_executable")?;
+        }
         let normalized = normalize_receipt_admin_url(&self.admin_base_url)?;
         if normalized != self.admin_base_url {
             return Err(ServiceReceiptError::Invalid {
@@ -391,6 +411,51 @@ mod tests {
             read_service_receipt(&home.0).expect("read restored receipt"),
             first
         );
+    }
+
+    #[test]
+    fn schema_one_receipts_accept_optional_canonical_daemon_executable() {
+        let home = TestHome::new();
+        let compatibility = receipt(&home, ServiceInstallGeneration::generate());
+        let compatibility_json =
+            serde_json::to_value(&compatibility).expect("serialize compatibility receipt");
+        assert!(compatibility_json.get("daemon_executable").is_none());
+
+        let daemon_executable = home.0.join("bin").join("codex-helper");
+        let current = receipt(&home, ServiceInstallGeneration::generate())
+            .with_daemon_executable(daemon_executable.clone())
+            .expect("record canonical daemon executable");
+        let mut transaction =
+            ServiceReceiptTransaction::begin(home.0.clone()).expect("begin receipt transaction");
+        transaction
+            .replace(&compatibility)
+            .expect("publish compatibility receipt");
+        assert_eq!(
+            transaction
+                .current()
+                .expect("read compatibility receipt")
+                .and_then(|receipt| receipt.daemon_executable().map(Path::to_path_buf)),
+            None
+        );
+        transaction
+            .replace(&current)
+            .expect("publish current receipt");
+        assert_eq!(
+            transaction
+                .current()
+                .expect("read current receipt")
+                .and_then(|receipt| receipt.daemon_executable().map(Path::to_path_buf)),
+            Some(daemon_executable)
+        );
+    }
+
+    #[test]
+    fn receipt_rejects_relative_daemon_executable() {
+        let home = TestHome::new();
+        let error = receipt(&home, ServiceInstallGeneration::generate())
+            .with_daemon_executable(PathBuf::from("codex-helper"))
+            .expect_err("daemon executable must be absolute");
+        assert!(matches!(error, ServiceReceiptError::Invalid { .. }));
     }
 
     #[test]

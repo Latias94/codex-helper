@@ -442,7 +442,11 @@ mod tests {
         }
 
         fn day_dir(&self) -> PathBuf {
-            self.root.join("sessions/2026/07/20")
+            self.root
+                .join("sessions")
+                .join("2026")
+                .join("07")
+                .join("20")
         }
     }
 
@@ -959,7 +963,7 @@ mod tests {
     #[test]
     fn opaque_operator_session_key_resolves_real_codex_session_metadata() {
         let home = TestCodexHome::new();
-        let cwd = home.root.join("workspace/project");
+        let cwd = home.root.join("workspace").join("project");
         std::fs::create_dir_all(&cwd).expect("create fixture cwd");
         let transcript_path = write_real_session_fixture(&home, &cwd);
         let client_name = format!("codex-cli/{SECRET_CANARY}");
@@ -976,10 +980,10 @@ mod tests {
             .get(OPAQUE_SESSION_KEY)
             .expect("opaque operator session should remain the lookup key");
         assert_eq!(session.raw_session_id, RAW_SESSION_ID);
-        assert_eq!(session.cwd.as_deref(), cwd.to_str());
+        assert_eq!(session.cwd.as_deref().map(Path::new), Some(cwd.as_path()));
         assert_eq!(
-            session.host_local_transcript_path.as_deref(),
-            transcript_path.to_str()
+            session.host_local_transcript_path.as_deref().map(Path::new),
+            Some(transcript_path.as_path())
         );
         assert_eq!(
             session.last_client_name.as_deref(),
@@ -997,7 +1001,7 @@ mod tests {
     #[test]
     fn real_codex_session_cwd_reaches_snapshot_and_dashboard() {
         let home = TestCodexHome::new();
-        let cwd = home.root.join("workspace/project");
+        let cwd = home.root.join("workspace").join("project");
         std::fs::create_dir_all(&cwd).expect("create fixture cwd");
         write_real_session_fixture(&home, &cwd);
         let source = HashMap::from([(
@@ -1011,7 +1015,7 @@ mod tests {
 
         let row = snapshot.rows.first().expect("projected session row");
         assert_eq!(row.local_session_id.as_deref(), Some(RAW_SESSION_ID));
-        assert_eq!(row.cwd.as_deref(), cwd.to_str());
+        assert_eq!(row.cwd.as_deref().map(Path::new), Some(cwd.as_path()));
         assert_eq!(
             row.observation_scope,
             crate::state::SessionObservationScope::HostLocalEnriched
@@ -1047,7 +1051,7 @@ mod tests {
     #[test]
     fn remote_observer_without_local_operator_metadata_does_not_discover_host_sessions() {
         let home = TestCodexHome::new();
-        let cwd = home.root.join("workspace/remote-must-not-read");
+        let cwd = home.root.join("workspace").join("remote-must-not-read");
         std::fs::create_dir_all(&cwd).expect("create remote fixture cwd");
         write_real_session_fixture(&home, &cwd);
         let mut cache = LocalSessionEnrichmentCache::default();

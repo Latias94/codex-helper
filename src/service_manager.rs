@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -533,15 +535,28 @@ fn windows_path_text<'a>(path: &'a Path, description: &str) -> CliResult<&'a str
     })
 }
 
-#[cfg(any(windows, test))]
 fn windows_paths_equal(left: &str, right: &str) -> bool {
     let normalize = |value: &str| {
-        value
-            .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
+        let normalized = value.replace('/', "\\").to_ascii_lowercase();
+        let mut normalized = if let Some(path) = normalized.strip_prefix(r"\\?\unc\") {
+            format!(r"\\{path}")
+        } else if let Some(path) = normalized.strip_prefix(r"\\?\") {
+            path.to_string()
+        } else {
+            normalized
+        };
+        while normalized.ends_with('\\') && !windows_path_is_root(&normalized) {
+            normalized.pop();
+        }
+        normalized
     };
     normalize(left) == normalize(right)
+}
+
+fn windows_path_is_root(path: &str) -> bool {
+    path == r"\"
+        || path == r"\\"
+        || matches!(path.as_bytes(), [drive, b':', b'\\'] if drive.is_ascii_alphabetic())
 }
 
 #[cfg(any(windows, test))]
@@ -864,20 +879,80 @@ fn verify_windows_task_record(
 }
 
 #[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsDaemonExecutableAuthority {
+    Receipt,
+    CurrentExecutableCompatibility,
+}
+
+#[cfg(any(windows, test))]
+fn installed_windows_daemon_executable(
+    receipt: &ServiceReceipt,
+    current_executable: &Path,
+) -> (PathBuf, WindowsDaemonExecutableAuthority) {
+    match receipt.daemon_executable() {
+        Some(executable) => (
+            executable.to_path_buf(),
+            WindowsDaemonExecutableAuthority::Receipt,
+        ),
+        None => (
+            current_executable.to_path_buf(),
+            WindowsDaemonExecutableAuthority::CurrentExecutableCompatibility,
+        ),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn verify_installed_windows_task_record(
+    record: &WindowsTaskRecord,
+    task_name: &str,
+    user_sid: &str,
+    receipt: &ServiceReceipt,
+    current_executable: &Path,
+    installed_options: &ServiceInstallOptions,
+) -> CliResult<()> {
+    let (executable, authority) = installed_windows_daemon_executable(receipt, current_executable);
+    verify_windows_task_record(
+        record,
+        task_name,
+        user_sid,
+        &executable,
+        installed_options,
+    )
+    .map_err(|error| match authority {
+        WindowsDaemonExecutableAuthority::Receipt => error,
+        WindowsDaemonExecutableAuthority::CurrentExecutableCompatibility => CliError::Other(
+            format!(
+                "{error}; this schema-1 compatibility receipt has no daemon_executable, so verification is intentionally limited to the current CLI executable {}. Retry with the binary path that installed the task, then run `codex-helper service install` to refresh the receipt",
+                current_executable.display()
+            ),
+        ),
+    })
+}
+
+#[cfg(any(windows, test))]
 fn verify_existing_windows_task_for_replacement(
     record: &WindowsTaskRecord,
     task_name: &str,
     user_sid: &str,
-    executable: &Path,
-    installed_options: Option<&ServiceInstallOptions>,
+    current_executable: &Path,
+    installed_receipt: Option<&ServiceReceipt>,
 ) -> CliResult<()> {
-    let installed_options = installed_options.ok_or_else(|| {
+    let installed_receipt = installed_receipt.ok_or_else(|| {
         CliError::Other(
             "refusing to replace an existing SID-scoped Windows task without a current receipt proving its complete canonical definition"
                 .to_string(),
         )
     })?;
-    verify_windows_task_record(record, task_name, user_sid, executable, installed_options)
+    let installed_options = service_install_options_from_receipt(installed_receipt, false)?;
+    verify_installed_windows_task_record(
+        record,
+        task_name,
+        user_sid,
+        installed_receipt,
+        current_executable,
+        &installed_options,
+    )
 }
 
 #[cfg(any(windows, test))]
@@ -1478,7 +1553,20 @@ fn service_receipt(options: &ServiceInstallOptions) -> CliResult<ServiceReceipt>
     .map_err(|error| CliError::Other(format!("build service install receipt: {error}")))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn service_receipt_with_daemon_executable(
+    options: &ServiceInstallOptions,
+    daemon_executable: &Path,
+) -> CliResult<ServiceReceipt> {
+    service_receipt(options)?
+        .with_daemon_executable(daemon_executable.to_path_buf())
+        .map_err(|error| {
+            CliError::Other(format!(
+                "record canonical daemon executable in service install receipt: {error}"
+            ))
+        })
+}
+
+#[derive(Debug, Clone)]
 struct CanonicalServiceInstallIdentity {
     service: codex_helper_core::config::ServiceKind,
     proxy_target: codex_helper_core::codex_switch::ValidatedCodexBaseUrl,
@@ -1496,6 +1584,17 @@ impl CanonicalServiceInstallIdentity {
         })
     }
 
+    fn matches(&self, other: &Self) -> CliResult<bool> {
+        // The platform transaction authorizes and migrates the daemon executable separately.
+        if self.service != other.service
+            || self.proxy_target != other.proxy_target
+            || self.platform_backend != other.platform_backend
+        {
+            return Ok(false);
+        }
+        service_paths_identify_same_location(&self.client_home, &other.client_home)
+    }
+
     fn describe(&self) -> String {
         format!(
             "service={}, proxy_target={}, client_home={}, platform={:?}",
@@ -1507,7 +1606,80 @@ impl CanonicalServiceInstallIdentity {
     }
 }
 
-#[cfg(windows)]
+fn service_paths_identify_same_location(left: &Path, right: &Path) -> CliResult<bool> {
+    let left = resolve_service_path_identity(left)?;
+    let right = resolve_service_path_identity(right)?;
+    Ok(service_path_identities_equal_with_windows_semantics(
+        &left,
+        &right,
+        cfg!(windows),
+    ))
+}
+
+fn resolve_service_path_identity(path: &Path) -> CliResult<PathBuf> {
+    if !path.is_absolute() {
+        return Err(CliError::Other(format!(
+            "service path identity must be absolute: {}",
+            path.display()
+        )));
+    }
+
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    CliError::Other(format!(
+                        "no existing ancestor is available for service path {}",
+                        path.display()
+                    ))
+                })?;
+                missing.push(name.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    CliError::Other(format!(
+                        "no existing ancestor is available for service path {}",
+                        path.display()
+                    ))
+                })?;
+            }
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "inspect service path identity {}: {error}",
+                    existing.display()
+                )));
+            }
+        }
+    }
+
+    let mut resolved = std::fs::canonicalize(existing).map_err(|error| {
+        CliError::Other(format!(
+            "canonicalize service path identity {}: {error}",
+            existing.display()
+        ))
+    })?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn service_path_identities_equal_with_windows_semantics(
+    left: &Path,
+    right: &Path,
+    windows_semantics: bool,
+) -> bool {
+    if windows_semantics {
+        return left
+            .to_str()
+            .zip(right.to_str())
+            .is_some_and(|(left, right)| windows_paths_equal(left, right));
+    }
+    left == right
+}
+
+#[cfg(any(windows, test))]
 fn service_install_options_from_receipt(
     receipt: &ServiceReceipt,
     start: bool,
@@ -1603,7 +1775,7 @@ fn preflight_service_install_identity(
     })?;
     let installed = CanonicalServiceInstallIdentity::from_receipt(&installed_receipt)?;
     let candidate = CanonicalServiceInstallIdentity::from_receipt(candidate_receipt)?;
-    if installed == candidate {
+    if installed.matches(&candidate)? {
         return Ok(ServiceInstallPreflight {
             installed_receipt: Some(installed_receipt),
             platform_state: platform_status.state,
@@ -1617,18 +1789,24 @@ fn preflight_service_install_identity(
     )))
 }
 
-fn begin_service_receipt_transaction(
+fn begin_service_receipt_transaction_with_daemon_executable(
     options: &ServiceInstallOptions,
+    daemon_executable: &Path,
 ) -> CliResult<(
     ServiceReceiptTransaction,
     ServiceReceipt,
     ServiceInstallPreflight,
 )> {
-    begin_service_receipt_transaction_with_status(options, status)
+    begin_service_receipt_transaction_with_daemon_executable_and_status(
+        options,
+        daemon_executable,
+        status,
+    )
 }
 
-fn begin_service_receipt_transaction_with_status<F>(
+fn begin_service_receipt_transaction_with_daemon_executable_and_status<F>(
     options: &ServiceInstallOptions,
+    daemon_executable: &Path,
     read_platform_status: F,
 ) -> CliResult<(
     ServiceReceiptTransaction,
@@ -1638,7 +1816,26 @@ fn begin_service_receipt_transaction_with_status<F>(
 where
     F: FnOnce() -> CliResult<ServiceStatus>,
 {
-    let receipt = service_receipt(options)?;
+    let receipt = service_receipt_with_daemon_executable(options, daemon_executable)?;
+    begin_service_receipt_transaction_with_candidate_and_status(
+        options,
+        receipt,
+        read_platform_status,
+    )
+}
+
+fn begin_service_receipt_transaction_with_candidate_and_status<F>(
+    options: &ServiceInstallOptions,
+    receipt: ServiceReceipt,
+    read_platform_status: F,
+) -> CliResult<(
+    ServiceReceiptTransaction,
+    ServiceReceipt,
+    ServiceInstallPreflight,
+)>
+where
+    F: FnOnce() -> CliResult<ServiceStatus>,
+{
     let transaction = ServiceReceiptTransaction::begin_install_replacement(
         options.helper_home.clone(),
     )
@@ -1913,6 +2110,139 @@ fn service_log_dir() -> PathBuf {
 fn current_executable() -> CliResult<PathBuf> {
     std::env::current_exe()
         .map_err(|error| CliError::Other(format!("resolve current executable: {error}")))
+}
+
+fn canonical_daemon_executable(path: &Path) -> CliResult<PathBuf> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        CliError::Other(format!(
+            "resolve canonical daemon executable {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(windows)]
+    let canonical = without_windows_verbatim_prefix(&canonical);
+    if !canonical.is_absolute() {
+        return Err(CliError::Other(format!(
+            "the canonical daemon executable is not absolute: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn without_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    if !windows_path_is_legacy_safe(path) {
+        return path.to_path_buf();
+    }
+
+    path.to_str()
+        .and_then(|path| path.get(4..))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn windows_path_is_legacy_safe(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return false;
+    };
+    if !matches!(prefix.kind(), Prefix::VerbatimDisk(_)) {
+        return false;
+    }
+
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(file_name) => {
+                if !windows_legacy_filename_is_valid(file_name)
+                    || windows_filename_is_reserved(file_name)
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    path.as_os_str().encode_wide().count() < 260
+}
+
+#[cfg(windows)]
+fn windows_legacy_filename_is_valid(file_name: &OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    if file_name.encode_wide().count() > 255 {
+        return false;
+    }
+    let Some(file_name) = file_name.to_str() else {
+        return false;
+    };
+    let bytes = file_name.as_bytes();
+    !bytes.is_empty()
+        && !bytes.iter().any(|&byte| {
+            matches!(
+                byte,
+                0..=31 | b'<' | b'>' | b':' | b'"' | b'/' | b'\\' | b'|' | b'?' | b'*'
+            )
+        })
+        && !matches!(bytes.last(), Some(b' ' | b'.'))
+}
+
+#[cfg(windows)]
+fn windows_filename_is_reserved(file_name: &OsStr) -> bool {
+    const RESERVED_NAMES: [&str; 28] = [
+        "AUX", "NUL", "PRN", "CON", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "COM¹",
+        "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
+    ];
+
+    Path::new(file_name)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .map(|stem| stem.trim_end_matches([' ', '.']))
+        .is_some_and(|stem| {
+            RESERVED_NAMES
+                .iter()
+                .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        })
+}
+
+fn select_service_executable_candidate_with<F>(current: &Path, is_file: F) -> PathBuf
+where
+    F: FnOnce(&Path) -> bool,
+{
+    let sibling_name = current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| {
+            if name.eq_ignore_ascii_case("ch.exe") {
+                Some("codex-helper.exe")
+            } else if name.eq_ignore_ascii_case("ch") {
+                Some("codex-helper")
+            } else {
+                None
+            }
+        });
+    let Some(sibling_name) = sibling_name else {
+        return current.to_path_buf();
+    };
+    let sibling = current.with_file_name(sibling_name);
+    if is_file(&sibling) {
+        sibling
+    } else {
+        current.to_path_buf()
+    }
+}
+
+fn service_executable(current: &Path) -> CliResult<PathBuf> {
+    let selected =
+        select_service_executable_candidate_with(current, |candidate| candidate.is_file());
+    canonical_daemon_executable(&selected)
 }
 
 fn ensure_service_log_dir() -> CliResult<PathBuf> {
@@ -2298,7 +2628,8 @@ mod windows {
     impl WindowsInstallTransactionBackend for NativeWindowsInstallBackend {
         fn preflight(&mut self) -> CliResult<()> {
             ensure_service_log_dir()?;
-            let executable = current_executable()?;
+            let current_executable = current_executable()?;
+            let executable = service_executable(&current_executable)?;
             validate_windows_install_paths(&executable, &self.options)?;
             preflight_windows_commands(&executable)?;
             let user_sid = codex_helper_core::local_operator::current_windows_user_sid_string()
@@ -2310,12 +2641,10 @@ mod windows {
             let definition_document =
                 render_windows_task_definition(&executable, &self.options, &user_sid).into_bytes();
             let (receipt_transaction, receipt, install_preflight) =
-                begin_service_receipt_transaction(&self.options)?;
-            let installed_options = install_preflight
-                .installed_receipt
-                .as_ref()
-                .map(|receipt| service_install_options_from_receipt(receipt, false))
-                .transpose()?;
+                begin_service_receipt_transaction_with_daemon_executable(
+                    &self.options,
+                    &executable,
+                )?;
 
             let (scoped_snapshot, scoped_requires_end) =
                 match query_scheduled_task(&scoped_task_name)? {
@@ -2324,8 +2653,8 @@ mod windows {
                             &record,
                             &scoped_task_name,
                             &user_sid,
-                            &executable,
-                            installed_options.as_ref(),
+                            &current_executable,
+                            install_preflight.installed_receipt.as_ref(),
                         )?;
                         let requires_end = scheduled_task_requires_end(&record)?;
                         (Some(snapshot_owned_task(record)?), requires_end)
@@ -2334,8 +2663,11 @@ mod windows {
                 };
             let fixed_snapshot = match query_scheduled_task(WINDOWS_TASK_BASENAME)? {
                 Some(record) if windows_task_owner_matches(&record, &user_sid) => {
-                    let invocation =
-                        verify_legacy_fixed_windows_task_record(&record, &user_sid, &executable)?;
+                    let invocation = verify_legacy_fixed_windows_task_record(
+                        &record,
+                        &user_sid,
+                        &current_executable,
+                    )?;
                     if invocation.matches_install(&self.options) {
                         let _ = scheduled_task_requires_end(&record)?;
                         Some(snapshot_owned_task(record)?)
@@ -2352,7 +2684,7 @@ mod windows {
             };
             let legacy_scm = probe_legacy_scm(
                 "preflight the legacy LocalSystem SCM service for migration",
-                &executable,
+                &current_executable,
             )?
             .map(|snapshot| {
                 if snapshot.invocation.matches_install(&self.options) {
@@ -2817,10 +3149,11 @@ mod windows {
             let (user_sid, scoped_task_name) = current_task_identity()?;
             let scoped_snapshot = match query_scheduled_task(&scoped_task_name)? {
                 Some(record) => {
-                    verify_windows_task_record(
+                    verify_installed_windows_task_record(
                         &record,
                         &scoped_task_name,
                         &user_sid,
+                        &installed_receipt,
                         &executable,
                         &options,
                     )?;
@@ -3147,24 +3480,27 @@ mod windows {
         run_windows_uninstall_transaction(&mut NativeWindowsUninstallBackend::new()?, stop_first)
     }
 
-    fn installed_service_options() -> CliResult<ServiceInstallOptions> {
+    fn installed_service_registration() -> CliResult<(ServiceReceipt, ServiceInstallOptions)> {
         let receipt = validate_service_receipt_for_uninstall(
             read_service_receipt(proxy_home_dir()),
             Some(ServicePlatformBackend::WindowsScheduledTask),
         )?;
-        service_install_options_from_receipt(&receipt, false)
+        let options = service_install_options_from_receipt(&receipt, false)?;
+        Ok((receipt, options))
     }
 
     fn matching_installed_task_snapshot(
+        receipt: &ServiceReceipt,
         options: &ServiceInstallOptions,
     ) -> CliResult<Option<OwnedTaskSnapshot>> {
         let (user_sid, scoped_task_name) = current_task_identity()?;
         let executable = current_executable()?;
         if let Some(record) = query_scheduled_task(&scoped_task_name)? {
-            verify_windows_task_record(
+            verify_installed_windows_task_record(
                 &record,
                 &scoped_task_name,
                 &user_sid,
+                receipt,
                 &executable,
                 options,
             )?;
@@ -3187,8 +3523,8 @@ mod windows {
     }
 
     pub(super) fn start() -> CliResult<()> {
-        let options = installed_service_options()?;
-        if let Some(snapshot) = matching_installed_task_snapshot(&options)? {
+        let (receipt, options) = installed_service_registration()?;
+        if let Some(snapshot) = matching_installed_task_snapshot(&receipt, &options)? {
             return run_unchanged_scheduled_task(&snapshot, "installed");
         }
         Err(CliError::Other(
@@ -3198,8 +3534,8 @@ mod windows {
     }
 
     pub(super) fn stop() -> CliResult<()> {
-        let options = installed_service_options()?;
-        if let Some(snapshot) = matching_installed_task_snapshot(&options)? {
+        let (receipt, options) = installed_service_registration()?;
+        if let Some(snapshot) = matching_installed_task_snapshot(&receipt, &options)? {
             return if scheduled_task_requires_end(&snapshot.record)? {
                 end_unchanged_scheduled_task(&snapshot, "installed")
             } else {
@@ -3235,17 +3571,20 @@ mod windows {
             let validation = read_service_receipt(proxy_home_dir())
                 .map_err(|error| error.to_string())
                 .and_then(|receipt| {
-                    service_install_options_from_receipt(&receipt, false)
-                        .map_err(|error| error.to_string())
-                })
-                .and_then(|options| {
-                    verify_windows_task_record(
+                    let has_receipt_executable_authority = receipt.daemon_executable().is_some();
+                    let options = service_install_options_from_receipt(&receipt, false)
+                        .map_err(|error| error.to_string())?;
+                    let current_executable =
+                        current_executable().map_err(|error| error.to_string())?;
+                    verify_installed_windows_task_record(
                         &record,
                         &scoped_task_name,
                         &user_sid,
-                        &current_executable().map_err(|error| error.to_string())?,
+                        &receipt,
+                        &current_executable,
                         &options,
                     )
+                    .map(|()| has_receipt_executable_authority)
                     .map_err(|error| error.to_string())
                 });
             let verified = validation.is_ok();
@@ -3260,16 +3599,19 @@ mod windows {
             );
             status.service_name.clone_from(&record.task_name);
             status.service_definition = Some(task_definition_path(&proxy_home_dir()));
-            status.detail = Some(if let Err(error) = validation {
-                format!(
+            status.detail = Some(match validation {
+                Err(error) => format!(
                     "the SID-scoped task is not proven to match the signed service receipt and will not be mutated; task_state_code={}; verification_error={error}",
                     record.state,
-                )
-            } else {
-                format!(
+                ),
+                Ok(false) => format!(
+                    "SID-scoped per-user scheduled task (interactive token, least privilege); task_state_code={}; the schema-1 compatibility receipt has no daemon_executable, so verification is limited to the current CLI executable; run `codex-helper service install` from that executable to refresh the receipt",
+                    record.state
+                ),
+                Ok(true) => format!(
                     "SID-scoped per-user scheduled task (interactive token, least privilege); task_state_code={}",
                     record.state
-                )
+                ),
             });
             return Ok(status);
         }
@@ -4309,7 +4651,7 @@ mod macos {
 
     impl NativeMacosInstallBackend {
         fn new(options: ServiceInstallOptions) -> CliResult<Self> {
-            let executable = current_executable()?;
+            let executable = service_executable(&current_executable()?)?;
             let log_dir = ensure_service_log_dir()?;
             let path = launch_agent_path()?;
             let document = render_launch_agent(&executable, &log_dir, &options);
@@ -4323,7 +4665,7 @@ mod macos {
             .map_err(|error| CliError::Other(format!("begin LaunchAgent transaction: {error}")))?;
             let original_definition_exists = definition.current().bytes().is_some();
             let (receipt_transaction, receipt, install_preflight) =
-                begin_service_receipt_transaction(&options)?;
+                begin_service_receipt_transaction_with_daemon_executable(&options, &executable)?;
             prepare_service_switch_for_install(&options, &install_preflight)?;
             Ok(Self {
                 path,
@@ -4888,7 +5230,7 @@ mod linux {
 
     impl NativeLinuxInstallBackend {
         fn new(options: ServiceInstallOptions) -> CliResult<Self> {
-            let executable = current_executable()?;
+            let executable = service_executable(&current_executable()?)?;
             ensure_service_log_dir()?;
             systemctl(&["show-environment"])?;
             let path = user_unit_path()?;
@@ -4905,7 +5247,7 @@ mod linux {
             )
             .map_err(|error| CliError::Other(format!("begin systemd unit transaction: {error}")))?;
             let (receipt_transaction, receipt, install_preflight) =
-                begin_service_receipt_transaction(&options)?;
+                begin_service_receipt_transaction_with_daemon_executable(&options, &executable)?;
             prepare_service_switch_for_install(&options, &install_preflight)?;
             Ok(Self {
                 was_active,
@@ -5582,6 +5924,106 @@ mod tests {
         .expect("same canonical identity must allow a binary update");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn service_install_identity_resolves_client_home_alias_with_missing_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-install-client-alias-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let real_client_parent = root.join("real-client-parent");
+        let client_alias = root.join("client-alias");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&real_client_parent).expect("create real client parent");
+        std::os::unix::fs::symlink(&real_client_parent, &client_alias)
+            .expect("create client home alias");
+        let installed_client_home = real_client_parent.join("missing").join("nested");
+        let requested_client_home = client_alias.join("missing").join("nested");
+        let installed = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &installed_client_home,
+        );
+        let candidate = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &requested_client_home,
+        );
+
+        preflight_service_install_identity(
+            Ok(installed),
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::Running,
+                true,
+            )),
+            &candidate,
+        )
+        .expect("the same client home through an alias must preserve service identity");
+
+        std::fs::remove_dir_all(root).expect("remove client alias test root");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_install_identity_resolves_windows_case_alias_with_missing_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-install-client-case-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_parent = root.join("ClientParent");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&client_parent).expect("create client parent");
+        let installed_client_home = root.join("CLIENTPARENT").join("Missing").join("Nested");
+        let requested_client_home = root.join("clientparent").join("missing").join("nested");
+        let installed = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &installed_client_home,
+        );
+        let candidate = test_service_identity_receipt(
+            codex_helper_core::config::ServiceKind::Codex,
+            3211,
+            &helper_home,
+            &requested_client_home,
+        );
+
+        preflight_service_install_identity(
+            Ok(installed),
+            Ok(test_install_platform_status(
+                ServiceRuntimeState::Running,
+                true,
+            )),
+            &candidate,
+        )
+        .expect("Windows client-home case aliases must preserve service identity");
+
+        std::fs::remove_dir_all(root).expect("remove client case test root");
+    }
+
+    #[test]
+    fn service_client_home_windows_identity_is_case_and_separator_insensitive() {
+        assert!(service_path_identities_equal_with_windows_semantics(
+            Path::new(r"\\?\C:\Users\Operator\.Codex\missing"),
+            Path::new("c:/users/operator/.codex/MISSING"),
+            true,
+        ));
+        assert!(service_path_identities_equal_with_windows_semantics(
+            Path::new(r"\\?\UNC\Server\Share\Codex"),
+            Path::new(r"\\server\share\codex"),
+            true,
+        ));
+        assert!(!service_path_identities_equal_with_windows_semantics(
+            Path::new(r"C:\Users\Operator\.codex"),
+            Path::new(r"C:\Users\Operator\.claude"),
+            true,
+        ));
+    }
+
     #[test]
     fn service_install_identity_rejects_proxy_port_change() {
         let root = std::env::temp_dir().join(format!(
@@ -5837,16 +6279,83 @@ mod tests {
                 codex_helper_core::service_target::ServiceInstallGeneration::generate(),
         };
 
-        let error = begin_service_receipt_transaction_with_status(&options, || {
-            Ok(test_install_platform_status(
-                ServiceRuntimeState::Stopped,
-                true,
-            ))
-        })
+        let daemon_executable = root.join("bin").join("codex-helper");
+        let error = begin_service_receipt_transaction_with_daemon_executable_and_status(
+            &options,
+            &daemon_executable,
+            || {
+                Ok(test_install_platform_status(
+                    ServiceRuntimeState::Stopped,
+                    true,
+                ))
+            },
+        )
         .expect_err("the transaction-local registration check must reject a missing receipt");
         assert!(error.to_string().contains("registration"));
 
         std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn service_install_transaction_allows_verified_daemon_relocation() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-helper-service-install-relocation-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let helper_home = root.join("helper");
+        let client_home = root.join("client");
+        std::fs::create_dir_all(&helper_home).expect("create helper home");
+        std::fs::create_dir_all(&client_home).expect("create client home");
+        let mut options = ServiceInstallOptions {
+            service_name: "codex",
+            host: IpAddr::from([127, 0, 0, 1]),
+            port: 3211,
+            start: true,
+            helper_home: helper_home.clone(),
+            client_home,
+            install_generation:
+                codex_helper_core::service_target::ServiceInstallGeneration::generate(),
+        };
+        let old_executable = root.join("old-bin").join("codex-helper");
+        let new_executable = root.join("new-bin").join("codex-helper");
+        let installed = service_receipt_with_daemon_executable(&options, &old_executable)
+            .expect("build installed receipt");
+        {
+            let mut transaction = ServiceReceiptTransaction::begin(&helper_home)
+                .expect("begin installed receipt transaction");
+            transaction
+                .replace(&installed)
+                .expect("publish installed receipt");
+        }
+        options.install_generation =
+            codex_helper_core::service_target::ServiceInstallGeneration::generate();
+
+        let (transaction, candidate, preflight) =
+            begin_service_receipt_transaction_with_daemon_executable_and_status(
+                &options,
+                &new_executable,
+                || {
+                    Ok(test_install_platform_status(
+                        ServiceRuntimeState::Running,
+                        true,
+                    ))
+                },
+            )
+            .expect("verified daemon relocation must preserve service identity");
+        assert_eq!(
+            candidate.daemon_executable(),
+            Some(new_executable.as_path())
+        );
+        assert_eq!(
+            preflight
+                .installed_receipt
+                .as_ref()
+                .and_then(ServiceReceipt::daemon_executable),
+            Some(old_executable.as_path())
+        );
+
+        drop(transaction);
+        std::fs::remove_dir_all(root).expect("remove relocation test root");
     }
 
     #[test]
@@ -6518,6 +7027,69 @@ mod tests {
     }
 
     #[test]
+    fn service_executable_prefers_only_an_existing_ch_sibling() {
+        let ch = Path::new("C:/tools/ch.exe");
+        let expected = PathBuf::from("C:/tools/codex-helper.exe");
+        let selected =
+            select_service_executable_candidate_with(ch, |candidate| candidate == expected);
+        assert_eq!(selected, expected);
+
+        let missing = select_service_executable_candidate_with(ch, |_| false);
+        assert_eq!(missing, ch);
+
+        let unix_ch = Path::new("/tools/ch");
+        let unix_expected = PathBuf::from("/tools/codex-helper");
+        let unix_selected = select_service_executable_candidate_with(unix_ch, |candidate| {
+            candidate == unix_expected
+        });
+        assert_eq!(unix_selected, unix_expected);
+
+        let canonical = Path::new("C:/tools/codex-helper.exe");
+        let unchanged = select_service_executable_candidate_with(canonical, |_| {
+            panic!("a canonical entrypoint must not probe a basename-derived sibling")
+        });
+        assert_eq!(unchanged, canonical);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_windows_service_executable_only_simplifies_legacy_safe_disk_paths() {
+        use std::os::windows::ffi::OsStrExt;
+
+        assert_eq!(
+            without_windows_verbatim_prefix(Path::new(
+                r"\\?\C:\Users\Operator\bin\codex-helper.exe"
+            )),
+            PathBuf::from(r"C:\Users\Operator\bin\codex-helper.exe")
+        );
+
+        let verbatim_unc = Path::new(r"\\?\UNC\Server\Share\bin\codex-helper.exe");
+        assert_eq!(without_windows_verbatim_prefix(verbatim_unc), verbatim_unc);
+
+        let reserved = Path::new(r"\\?\C:\Users\CON\bin\codex-helper.exe");
+        assert_eq!(without_windows_verbatim_prefix(reserved), reserved);
+        let superscript_reserved = Path::new(r"\\?\C:\Users\COM¹.txt\codex-helper.exe");
+        assert_eq!(
+            without_windows_verbatim_prefix(superscript_reserved),
+            superscript_reserved
+        );
+
+        let long_component = "a".repeat(240);
+        let long_path = PathBuf::from(format!(
+            r"\\?\C:\Users\{long_component}\bin\codex-helper.exe"
+        ));
+        assert!(long_path.as_os_str().encode_wide().count() > 260);
+        assert_eq!(without_windows_verbatim_prefix(&long_path), long_path);
+
+        let prefix = r"\\?\C:\";
+        let suffix = r"\codex-helper.exe";
+        let exact_limit_component = "a".repeat(260 - prefix.len() - suffix.len());
+        let exact_limit = PathBuf::from(format!(r"{prefix}{exact_limit_component}{suffix}"));
+        assert_eq!(exact_limit.as_os_str().encode_wide().count(), 260);
+        assert_eq!(without_windows_verbatim_prefix(&exact_limit), exact_limit);
+    }
+
+    #[test]
     fn windows_task_definition_runs_as_current_user_at_least_privilege() {
         let options = ServiceInstallOptions {
             service_name: "codex",
@@ -6551,6 +7123,14 @@ mod tests {
         assert_eq!(quote_windows_argument("plain"), "plain");
         assert_eq!(quote_windows_argument("two words"), r#""two words""#);
         assert_eq!(quote_windows_argument(r#"a\"b\"#), r#""a\\\"b\\""#);
+    }
+
+    #[test]
+    fn windows_path_comparison_preserves_drive_root_semantics() {
+        assert!(windows_paths_equal(r"C:\", "c:/"));
+        assert!(windows_paths_equal(r"\\?\C:\", "c:/"));
+        assert!(!windows_paths_equal(r"C:\", "C:"));
+        assert!(windows_paths_equal(r"\\server\share\", r"\\SERVER\SHARE"));
     }
 
     #[test]
@@ -6591,14 +7171,15 @@ mod tests {
     fn scheduled_task_readback_rejects_foreign_owner_and_changed_action() {
         let sid = "S-1-5-21-100-200-300-400";
         let task_name = windows_task_name_for_sid(sid).unwrap();
-        let executable = Path::new("C:/Users/test/.cargo/bin/codex-helper.exe");
+        let root = std::env::temp_dir().join("codex-helper-windows-task-record-test");
+        let executable = root.join("bin").join("codex-helper.exe");
         let options = ServiceInstallOptions {
             service_name: "codex",
             host: IpAddr::from([127, 0, 0, 1]),
             port: 3211,
             start: true,
-            helper_home: PathBuf::from("C:/Users/test/.codex-helper"),
-            client_home: PathBuf::from("C:/Users/test/.codex"),
+            helper_home: root.join("helper"),
+            client_home: root.join("client"),
             install_generation:
                 codex_helper_core::service_target::ServiceInstallGeneration::generate(),
         };
@@ -6635,7 +7216,11 @@ mod tests {
             action_count: 1,
             execute: executable.display().to_string(),
             arguments,
-            working_directory: "C:/Users/test/.cargo/bin".to_string(),
+            working_directory: executable
+                .parent()
+                .expect("daemon executable parent")
+                .display()
+                .to_string(),
             logon_type: "Interactive".to_string(),
             run_level: "Limited".to_string(),
             trigger_count: 1,
@@ -6643,11 +7228,33 @@ mod tests {
             trigger_type: "MSFT_TaskLogonTrigger".to_string(),
             trigger_user_sid: sid.to_string(),
         };
+        let receipt_for_options = |options: &ServiceInstallOptions| {
+            ServiceReceipt::new(
+                codex_helper_core::config::ServiceKind::Codex,
+                options.helper_home.clone(),
+                options.client_home.clone(),
+                codex_helper_core::proxy::local_admin_base_url_for_proxy_port(options.port),
+                ServicePlatformBackend::WindowsScheduledTask,
+                options.install_generation.clone(),
+            )
+            .expect("build Windows task receipt")
+        };
+        let compatibility_receipt = receipt_for_options(&options);
+        let installed_receipt = receipt_for_options(&options)
+            .with_daemon_executable(executable.clone())
+            .expect("record installed daemon executable");
+        let relocated_cli = root.join("new-release").join("ch.exe");
 
-        assert!(verify_windows_task_record(&record, &task_name, sid, executable, &options).is_ok());
+        assert!(
+            verify_windows_task_record(&record, &task_name, sid, &executable, &options).is_ok()
+        );
         assert!(
             verify_existing_windows_task_for_replacement(
-                &record, &task_name, sid, executable, None,
+                &record,
+                &task_name,
+                sid,
+                &executable,
+                None,
             )
             .is_err()
         );
@@ -6656,48 +7263,79 @@ mod tests {
                 &record,
                 &task_name,
                 sid,
-                executable,
-                Some(&options),
+                &relocated_cli,
+                Some(&installed_receipt),
             )
             .is_ok()
+        );
+        assert!(
+            verify_existing_windows_task_for_replacement(
+                &record,
+                &task_name,
+                sid,
+                &executable,
+                Some(&compatibility_receipt),
+            )
+            .is_ok()
+        );
+        let compatibility_error = verify_existing_windows_task_for_replacement(
+            &record,
+            &task_name,
+            sid,
+            &relocated_cli,
+            Some(&compatibility_receipt),
+        )
+        .expect_err("a receipt without executable authority keeps the current-path boundary");
+        assert!(
+            compatibility_error
+                .to_string()
+                .contains("no daemon_executable")
+        );
+        assert!(
+            compatibility_error
+                .to_string()
+                .contains("current CLI executable")
         );
         let mut foreign = record.clone();
         foreign.owner_sid = "S-1-5-21-100-200-300-999".to_string();
         assert!(!windows_task_owner_matches(&foreign, sid));
         assert!(
-            verify_windows_task_record(&foreign, &task_name, sid, executable, &options).is_err()
+            verify_windows_task_record(&foreign, &task_name, sid, &executable, &options).is_err()
         );
         let mut changed_action = record.clone();
         changed_action.execute = "C:/Windows/System32/cmd.exe".to_string();
         assert!(
-            verify_windows_task_record(&changed_action, &task_name, sid, executable, &options)
+            verify_windows_task_record(&changed_action, &task_name, sid, &executable, &options)
                 .is_err()
         );
 
         let mut changed_settings = record.clone();
         changed_settings.hidden = true;
         assert!(
-            verify_windows_task_record(&changed_settings, &task_name, sid, executable, &options,)
+            verify_windows_task_record(&changed_settings, &task_name, sid, &executable, &options,)
                 .is_err()
         );
 
         let mut changed_context = record.clone();
         changed_context.actions_context = "OtherPrincipal".to_string();
         assert!(
-            verify_windows_task_record(&changed_context, &task_name, sid, executable, &options,)
+            verify_windows_task_record(&changed_context, &task_name, sid, &executable, &options,)
                 .is_err()
         );
 
         let mut replacement_options = options.clone();
         replacement_options.install_generation =
             codex_helper_core::service_target::ServiceInstallGeneration::generate();
+        let replacement_receipt = receipt_for_options(&replacement_options)
+            .with_daemon_executable(executable.clone())
+            .expect("record replacement receipt daemon executable");
         assert!(
             verify_existing_windows_task_for_replacement(
                 &record,
                 &task_name,
                 sid,
-                executable,
-                Some(&replacement_options),
+                &relocated_cli,
+                Some(&replacement_receipt),
             )
             .is_err()
         );
