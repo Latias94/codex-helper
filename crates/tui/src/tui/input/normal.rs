@@ -206,7 +206,7 @@ pub(in crate::tui) fn handle_routing_operator_key(
             let _ = queue_balance_refresh(ui, true, true);
             true
         }
-        KeyCode::Enter | KeyCode::Char('m') => {
+        KeyCode::Enter | KeyCode::Char('m') | KeyCode::Char('s') => {
             if !ui.can_mutate_routing() {
                 notify_read_only_operator_action(ui);
                 return true;
@@ -233,10 +233,19 @@ pub(in crate::tui) fn handle_routing_operator_key(
                 ));
                 return true;
             };
-            let _ = routing;
-            let _ = candidate;
-            ui.routing_action_selected_idx = if code == KeyCode::Char('m') { 2 } else { 0 };
-            ui.overlay = Overlay::RoutingActions;
+            if code == KeyCode::Char('s') {
+                ui.routing_confirmation = Some(routing_mutation_request(
+                    routing,
+                    OperatorRoutingCommand::SetNewSessionPreference {
+                        provider_id: candidate.provider_id.clone(),
+                        endpoint_id: candidate.endpoint_id.clone(),
+                    },
+                ));
+                ui.overlay = Overlay::RoutingConfirmation;
+            } else {
+                ui.routing_action_selected_idx = if code == KeyCode::Char('m') { 2 } else { 0 };
+                ui.overlay = Overlay::RoutingActions;
+            }
             true
         }
         KeyCode::Char('a') | KeyCode::Backspace | KeyCode::Delete => {

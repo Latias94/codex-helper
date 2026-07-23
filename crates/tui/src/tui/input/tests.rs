@@ -647,6 +647,34 @@ async fn routing_enter_requires_action_and_confirmation_before_setting_preferenc
 }
 
 #[tokio::test]
+async fn routing_s_shortcut_requires_confirmation_before_setting_preference() {
+    let mut ui = UiState {
+        page: Page::Routing,
+        ..UiState::default()
+    };
+    let snapshot = routing_snapshot();
+
+    assert!(press(&mut ui, &snapshot, KeyCode::Char('s')).await);
+    assert_eq!(ui.overlay, Overlay::RoutingConfirmation);
+    assert!(ui.pending_operator_action.is_none());
+    assert!(press(&mut ui, &snapshot, KeyCode::Enter).await);
+    let Some(PendingOperatorAction::MutateRouting(request)) = ui.pending_operator_action.as_ref()
+    else {
+        panic!("new-session preference was not queued");
+    };
+    assert_eq!(request.expected_route_graph_key, "routing:sha256:test");
+    assert_eq!(request.expected_control_revision, 7);
+    assert_eq!(request.expected_policy_revision, 11);
+    assert_eq!(
+        request.command,
+        OperatorRoutingCommand::SetNewSessionPreference {
+            provider_id: "input".to_string(),
+            endpoint_id: "primary".to_string(),
+        }
+    );
+}
+
+#[tokio::test]
 async fn routing_backspace_requires_confirmation_before_clearing_with_revision_cas() {
     let mut ui = UiState {
         page: Page::Routing,
@@ -829,6 +857,7 @@ async fn remote_routing_rejects_every_mutating_and_refresh_shortcut() {
         KeyCode::Backspace,
         KeyCode::Delete,
         KeyCode::Char('m'),
+        KeyCode::Char('s'),
     ] {
         let mut ui = UiState {
             page: Page::Routing,

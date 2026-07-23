@@ -438,16 +438,16 @@ fn footer_help_text(ui: &UiState) -> String {
             ui.can_refresh_provider_balances(),
         ) {
             (crate::tui::Language::Zh, true, true) => {
-                "1-9/0 页面  q 退出  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助"
+                "1-9/0 页面  q 退出  ↑/↓/Pg 端点  s 首选  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助"
             }
             (crate::tui::Language::En, true, true) => {
-                "1-9/0 pages  q quit  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  g refresh  i details  ? help"
+                "1-9/0 pages  q quit  ↑/↓/Pg endpoint  s prefer  Enter actions  a auto  m mode  g refresh  i details  ? help"
             }
             (crate::tui::Language::Zh, true, false) => {
-                "1-9/0 页面  q 退出  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  i 详情  ? 帮助"
+                "1-9/0 页面  q 退出  ↑/↓/Pg 端点  s 首选  Enter 操作  a 自动  m 模式  i 详情  ? 帮助"
             }
             (crate::tui::Language::En, true, false) => {
-                "1-9/0 pages  q quit  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  i details  ? help"
+                "1-9/0 pages  q quit  ↑/↓/Pg endpoint  s prefer  Enter actions  a auto  m mode  i details  ? help"
             }
             (crate::tui::Language::Zh, false, true) => {
                 "1-9/0 页面  q 退出  ↑/↓/Pg 端点  g 刷新  i 详情  ? 帮助"
@@ -475,16 +475,16 @@ fn footer_help_text(ui: &UiState) -> String {
             ui.can_bridge_runtime_sessions_to_local_codex(),
         ) {
             (crate::tui::Language::Zh, Page::Routing, true, true, _, _) => {
-                "q 只退出控制台  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助"
+                "q 只退出控制台  ↑/↓/Pg 端点  s 首选  Enter 操作  a 自动  m 模式  g 刷新  i 详情  ? 帮助"
             }
             (crate::tui::Language::En, Page::Routing, true, true, _, _) => {
-                "q exit console only  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  g refresh  i details  ? help"
+                "q exit console only  ↑/↓/Pg endpoint  s prefer  Enter actions  a auto  m mode  g refresh  i details  ? help"
             }
             (crate::tui::Language::Zh, Page::Routing, true, false, _, _) => {
-                "q 只退出控制台  ↑/↓/Pg 端点  Enter 操作  a 自动  m 模式  i 详情  ? 帮助"
+                "q 只退出控制台  ↑/↓/Pg 端点  s 首选  Enter 操作  a 自动  m 模式  i 详情  ? 帮助"
             }
             (crate::tui::Language::En, Page::Routing, true, false, _, _) => {
-                "q exit console only  ↑/↓/Pg endpoint  Enter actions  a auto  m mode  i details  ? help"
+                "q exit console only  ↑/↓/Pg endpoint  s prefer  Enter actions  a auto  m mode  i details  ? help"
             }
             (crate::tui::Language::Zh, Page::Routing, false, true, _, _) => {
                 "q 只退出控制台  ↑/↓/Pg 端点  g 刷新  i 详情  ? 帮助"
@@ -1192,6 +1192,7 @@ mod tests {
         let text = footer_help_text(&ui);
 
         assert!(text.contains("endpoint"), "{text}");
+        assert!(text.contains("s prefer"), "{text}");
         assert!(text.contains("i details"), "{text}");
         assert!(text.contains("Enter actions"), "{text}");
         assert!(text.contains("a auto"), "{text}");
@@ -1329,6 +1330,7 @@ mod tests {
         let text = footer_help_text(&ui);
 
         assert!(text.contains("Enter actions"), "{text}");
+        assert!(text.contains("s prefer"), "{text}");
         assert!(text.contains("a auto"), "{text}");
         assert!(text.contains("g refresh"), "{text}");
         assert!(!text.contains("read-only"), "{text}");

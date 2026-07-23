@@ -676,7 +676,7 @@ mod tests {
             "Routing policy",
             "Selected endpoint",
             "new-session preference",
-            "preference / endpoint state menu",
+            "s prefer; Enter/m state menu",
             "a/Backspace",
             "priority=3",
             "3/20",
@@ -707,7 +707,7 @@ mod tests {
             for expected in [
                 "balance/quota refresh in progress",
                 "Routing controls",
-                "preference / endpoint state menu",
+                "s prefer; Enter/m state menu",
                 "a/Backspace",
                 "force-refresh all balances/quotas",
             ] {

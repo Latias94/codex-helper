@@ -141,6 +141,7 @@ pub(super) fn current_page_help_lines(ui: &UiState, p: Palette) -> Vec<Line<'sta
             }
             if ui.can_mutate_routing() {
                 entries.extend([
+                    "  s          将选中端点设为新会话首选（仍需确认）",
                     "  Enter      打开新会话偏好与端点状态菜单",
                     "  a/Backspace 清除新会话偏好并恢复自动调度",
                     "  m          打开端点 Enabled/Draining/Disabled 菜单",
@@ -276,6 +277,7 @@ pub(super) fn current_page_help_lines(ui: &UiState, p: Palette) -> Vec<Line<'sta
             }
             if ui.can_mutate_routing() {
                 entries.extend([
+                    "  s          prefer the selected endpoint for new sessions (confirmation required)",
                     "  Enter      open new-session preference and endpoint actions",
                     "  a/Backspace clear the new-session preference and restore auto",
                     "  m          open endpoint Enabled/Draining/Disabled actions",

@@ -575,11 +575,11 @@ fn candidate_table_title(ui: &UiState, routing: &OperatorRoutingSummary) -> Stri
     let selected = selected_candidate_number(ui, routing);
     match ui.language {
         Language::Zh => format!(
-            " 候选端点 {selected}/{}  (p 新会话首选) ",
+            " 候选端点 {selected}/{}  (p 定位首选) ",
             routing.candidates.len()
         ),
         Language::En => format!(
-            " Endpoint candidates {selected}/{}  (p new-session preference) ",
+            " Endpoint candidates {selected}/{}  (p locate preference) ",
             routing.candidates.len()
         ),
     }
@@ -654,11 +654,11 @@ fn push_routing_action_lines(lines: &mut Vec<Line<'static>>, p: Palette, ui: &Ui
     if ui.can_mutate_routing() {
         lines.extend(match ui.language {
             Language::Zh => [
-                Line::from("Enter/m      首选与端点状态菜单"),
+                Line::from("s 首选；Enter/m 状态菜单"),
                 Line::from("a/Backspace  新会话恢复自动分配"),
             ],
             Language::En => [
-                Line::from("Enter/m      preference / endpoint state menu"),
+                Line::from("s prefer; Enter/m state menu"),
                 Line::from("a/Backspace  restore automatic allocation"),
             ],
         });
@@ -1273,6 +1273,21 @@ mod tests {
                 RoutingTableLayout::Tiny
             );
         }
+    }
+
+    #[test]
+    fn candidate_title_describes_p_as_a_location_shortcut() {
+        let ui = UiState {
+            language: Language::En,
+            ..UiState::default()
+        };
+        let routing = routing_summary(None, None);
+
+        assert!(
+            candidate_table_title(&ui, &routing).contains("p locate preference"),
+            "{}",
+            candidate_table_title(&ui, &routing)
+        );
     }
 
     #[test]

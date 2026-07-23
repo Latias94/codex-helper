@@ -26,6 +26,10 @@ fn local_routing_help_advertises_refresh_preference_and_clear() {
 
     assert!(text.contains("Current page: Routing"), "{text}");
     assert!(text.contains("endpoint candidate"), "{text}");
+    assert!(
+        text.contains("s          prefer the selected endpoint"),
+        "{text}"
+    );
     assert!(text.contains("Enter"), "{text}");
     assert!(text.contains("new-session preference"), "{text}");
     assert!(text.contains("Backspace"), "{text}");
