@@ -613,7 +613,7 @@ mod tests {
                         "{text}"
                     );
                     assert!(
-                        text.contains("Remote Quota") || compact_text.contains("远端额度"),
+                        text.contains("Upstream Quota Pool") || compact_text.contains("上游额度池"),
                         "{text}"
                     );
                     if width >= 100 {
@@ -930,6 +930,195 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_details_surface_upstream_usage_telemetry_and_windows() {
+        let mut snapshot = sample_snapshot();
+        let balance = snapshot
+            .provider_balances
+            .get_mut("input-light")
+            .and_then(|balances| balances.first_mut())
+            .expect("input-light balance");
+        balance.source = "usage_provider:sub2api_usage".to_string();
+        balance.usage_rate = Some(codex_helper_core::balance::ProviderUsageRateSnapshot {
+            average_duration_ms: Some("842.7".to_string()),
+            rpm: Some("0.7".to_string()),
+            tpm: Some("85.3".to_string()),
+        });
+        balance.usage_windows = vec![codex_helper_core::balance::ProviderUsageWindow {
+            period: "daily".to_string(),
+            used_usd: Some("95".to_string()),
+            limit_usd: Some("100".to_string()),
+            remaining_usd: Some("5".to_string()),
+            unlimited: Some(false),
+        }];
+        let providers = sample_providers();
+
+        let mut routing_ui = UiState {
+            page: Page::Routing,
+            selected_routing_candidate_idx: 3,
+            language: Language::En,
+            ..UiState::default()
+        };
+        let routing_text =
+            render_app_text_with_providers(132, 64, &mut routing_ui, &snapshot, &providers);
+        let mut provider_ui = UiState {
+            page: Page::Routing,
+            overlay: Overlay::ProviderInfo,
+            selected_provider_idx: 3,
+            provider_info_endpoint_id: Some("default".to_string()),
+            language: Language::En,
+            ..UiState::default()
+        };
+        let provider_text =
+            render_app_text_with_providers(120, 64, &mut provider_ui, &snapshot, &providers);
+
+        for (surface, text) in [("routing", routing_text), ("provider info", provider_text)] {
+            for expected in [
+                "Upstream usage report",
+                "Sub2API usage API",
+                "RPM 0.7",
+                "daily used $95.00 left $5.00 / $100.00",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "{surface} is missing {expected:?}\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_details_hide_retained_usage_after_refresh_error() {
+        let mut snapshot = sample_snapshot();
+        let balance = snapshot
+            .provider_balances
+            .get_mut("input-light")
+            .and_then(|balances| balances.first_mut())
+            .expect("input-light balance");
+        balance.source = "usage_provider:sub2api_usage".to_string();
+        balance.status = BalanceSnapshotStatus::Error;
+        balance.error = Some("connection failed".to_string());
+        balance.usage_rate = Some(codex_helper_core::balance::ProviderUsageRateSnapshot {
+            rpm: Some("0.7".to_string()),
+            ..Default::default()
+        });
+        balance.usage_windows = vec![codex_helper_core::balance::ProviderUsageWindow {
+            period: "daily".to_string(),
+            used_usd: Some("95".to_string()),
+            limit_usd: Some("100".to_string()),
+            remaining_usd: Some("5".to_string()),
+            unlimited: Some(false),
+        }];
+        let providers = sample_providers();
+
+        let mut routing_ui = UiState {
+            page: Page::Routing,
+            selected_routing_candidate_idx: 3,
+            language: Language::En,
+            ..UiState::default()
+        };
+        let routing_text =
+            render_app_text_with_providers(132, 64, &mut routing_ui, &snapshot, &providers);
+        let mut provider_ui = UiState {
+            page: Page::Routing,
+            overlay: Overlay::ProviderInfo,
+            selected_provider_idx: 3,
+            provider_info_endpoint_id: Some("default".to_string()),
+            language: Language::En,
+            ..UiState::default()
+        };
+        let provider_text =
+            render_app_text_with_providers(120, 64, &mut provider_ui, &snapshot, &providers);
+
+        for (surface, text) in [("routing", routing_text), ("provider info", provider_text)] {
+            assert!(
+                !text.contains("Upstream usage report"),
+                "{surface} must not present retained telemetry as a fresh report:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_details_hide_ambiguous_multi_observer_usage_reports() {
+        let mut snapshot = sample_snapshot();
+        let reports = snapshot
+            .provider_balances
+            .get_mut("input-light")
+            .expect("input-light balances");
+        let balance = reports.first_mut().expect("input-light balance");
+        balance.source = "usage_provider:sub2api_usage".to_string();
+        balance.usage_rate = Some(codex_helper_core::balance::ProviderUsageRateSnapshot {
+            rpm: Some("0.7".to_string()),
+            ..Default::default()
+        });
+        let mut competing = balance.clone();
+        competing.observation_provider_id = "second-usage-observer".to_string();
+        competing.source = "usage_provider:new_api_token_usage".to_string();
+        reports.push(competing);
+
+        let providers = sample_providers();
+        let mut routing_ui = UiState {
+            page: Page::Routing,
+            selected_routing_candidate_idx: 3,
+            language: Language::En,
+            ..UiState::default()
+        };
+        let routing_text =
+            render_app_text_with_providers(132, 64, &mut routing_ui, &snapshot, &providers);
+        let mut provider_ui = UiState {
+            page: Page::Routing,
+            overlay: Overlay::ProviderInfo,
+            selected_provider_idx: 3,
+            provider_info_endpoint_id: Some("default".to_string()),
+            language: Language::En,
+            ..UiState::default()
+        };
+        let provider_text =
+            render_app_text_with_providers(120, 64, &mut provider_ui, &snapshot, &providers);
+
+        for (surface, text) in [("routing", routing_text), ("provider info", provider_text)] {
+            assert!(
+                !text.contains("Upstream usage report"),
+                "{surface} must not select one of multiple current upstream reports:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_narrow_layout_hides_retained_balance_after_refresh_error() {
+        let mut snapshot = sample_snapshot();
+        let balance = snapshot
+            .provider_balances
+            .get_mut("input-light")
+            .and_then(|balances| balances.first_mut())
+            .expect("input-light balance");
+        balance.status = BalanceSnapshotStatus::Error;
+        balance.error = Some("connection failed".to_string());
+        balance.quota_period = Some("daily".to_string());
+        balance.quota_remaining_usd = Some("5".to_string());
+        balance.quota_limit_usd = Some("100".to_string());
+        let providers = sample_providers();
+
+        for width in [80, 60] {
+            let mut ui = UiState {
+                page: Page::Routing,
+                selected_routing_candidate_idx: 3,
+                language: Language::En,
+                ..UiState::default()
+            };
+            let text = render_app_text_with_providers(width, 30, &mut ui, &snapshot, &providers);
+
+            assert!(
+                text.contains("error"),
+                "missing error at {width} cols:\n{text}"
+            );
+            assert!(
+                !text.contains("$5/$100") && !text.contains("left $5.00"),
+                "retained amount leaked at {width} cols:\n{text}"
+            );
+        }
+    }
+
+    #[test]
     fn startup_alert_modal_renders_issue_and_close_hint() {
         let snapshot = sample_snapshot();
         let mut ui = UiState {
@@ -1128,6 +1317,26 @@ mod tests {
 
         assert!(compact_text.contains("未知"), "{text}");
         assert!(text.contains("RUN"), "{text}");
+    }
+
+    #[test]
+    fn observed_only_session_explains_unavailable_host_directory() {
+        let mut snapshot = sample_snapshot();
+        snapshot.rows = vec![unknown_session_row()];
+
+        for page in [Page::Dashboard, Page::Sessions] {
+            let mut ui = UiState {
+                page,
+                language: Language::En,
+                ..UiState::default()
+            };
+            let text = render_app_text(132, 40, &mut ui, &snapshot);
+
+            assert!(
+                text.contains("unavailable (proxy-observed only)"),
+                "{page:?} must explain why the host directory is unavailable:\n{text}"
+            );
+        }
     }
 
     #[test]

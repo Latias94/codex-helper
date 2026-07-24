@@ -13,9 +13,11 @@ use crate::dashboard_core::{
 };
 use crate::state::{BalanceSnapshotStatus, ProviderBalanceSnapshot, RuntimeConfigState};
 use crate::tui::model::{
-    Palette, Snapshot, format_age, latest_provider_balance_fetched_at_ms, now_ms,
-    provider_balance_brief_lang, provider_balance_compact_lang, provider_endpoint_balance_snapshot,
-    shorten_middle,
+    Palette, Snapshot, format_age, has_current_upstream_usage_report,
+    latest_provider_balance_fetched_at_ms, now_ms, provider_balance_brief_lang,
+    provider_balance_compact_lang, provider_endpoint_balance_snapshot,
+    provider_endpoint_current_usage_report_snapshot, provider_usage_rate_summary_lang,
+    provider_usage_source_label_lang, provider_usage_window_summary_lang, shorten_middle,
 };
 use crate::tui::operator_actions::{PendingOperatorAction, balance_refresh_summary_has_warning};
 use crate::tui::state::UiState;
@@ -227,6 +229,17 @@ fn balance_for_candidate<'a>(
     )
 }
 
+fn usage_report_for_candidate<'a>(
+    snapshot: &'a Snapshot,
+    candidate: &OperatorRouteCandidateSummary,
+) -> Option<&'a ProviderBalanceSnapshot> {
+    provider_endpoint_current_usage_report_snapshot(
+        &snapshot.provider_balances,
+        candidate.provider_id.as_str(),
+        candidate.endpoint_id.as_str(),
+    )
+}
+
 fn capacity_label(capacity: Option<&OperatorProviderCapacity>) -> String {
     let Some(capacity) = capacity else {
         return "-".to_string();
@@ -332,7 +345,15 @@ fn candidate_style(
 ) -> Style {
     let style = if endpoint.is_none_or(|endpoint| !endpoint.effective_enabled) {
         Style::default().fg(p.muted)
-    } else if endpoint.is_some_and(|endpoint| endpoint.capacity.saturated || !endpoint.routable) {
+    } else if endpoint.is_some_and(|endpoint| endpoint.capacity.saturated || !endpoint.routable)
+        || balance.is_some_and(|balance| {
+            balance.stale_at(now_ms())
+                || matches!(
+                    balance.status,
+                    BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Stale
+                )
+        })
+    {
         Style::default().fg(p.warn)
     } else if balance.is_some_and(|balance| {
         balance.status == BalanceSnapshotStatus::Exhausted && !balance.routing_ignored_exhaustion()
@@ -799,6 +820,7 @@ fn selected_candidate_detail_lines(
     };
     let endpoint = endpoint_for_candidate(providers, candidate);
     let balance = balance_for_candidate(snapshot, candidate);
+    let usage_report = usage_report_for_candidate(snapshot, candidate);
     let target = format!("{}.{}", candidate.provider_id, candidate.endpoint_id);
     let new_session_preferred = candidate_is_new_session_preference(routing, candidate);
     lines.push(Line::from(Span::styled(
@@ -975,6 +997,57 @@ fn selected_candidate_detail_lines(
         ),
         Style::default().fg(p.muted),
     )));
+    if let Some(balance) = usage_report
+        && has_current_upstream_usage_report(balance)
+    {
+        lines.push(Line::from(""));
+        lines.push(detail_heading(
+            match ui.language {
+                Language::Zh => "上游用量报告",
+                Language::En => "Upstream usage report",
+            },
+            p,
+        ));
+        lines.push(Line::from(Span::styled(
+            shorten_middle(
+                &match ui.language {
+                    Language::Zh => format!(
+                        "来源={}  样本={}",
+                        provider_usage_source_label_lang(&balance.source, ui.language),
+                        format_age(now_ms(), Some(balance.fetched_at_ms))
+                    ),
+                    Language::En => format!(
+                        "source={}  age={}",
+                        provider_usage_source_label_lang(&balance.source, ui.language),
+                        format_age(now_ms(), Some(balance.fetched_at_ms))
+                    ),
+                },
+                max_width,
+            ),
+            Style::default().fg(p.muted),
+        )));
+        if let Some(rate) = provider_usage_rate_summary_lang(balance, ui.language) {
+            lines.push(Line::from(Span::styled(
+                shorten_middle(
+                    &match ui.language {
+                        Language::Zh => format!("接口遥测={rate}"),
+                        Language::En => format!("telemetry={rate}"),
+                    },
+                    max_width,
+                ),
+                Style::default().fg(p.text),
+            )));
+        }
+        for window in balance.usage_windows.iter().take(3) {
+            lines.push(Line::from(Span::styled(
+                shorten_middle(
+                    &provider_usage_window_summary_lang(window, ui.language),
+                    max_width,
+                ),
+                Style::default().fg(p.text),
+            )));
+        }
+    }
     lines
 }
 

@@ -2654,6 +2654,31 @@ impl ProxyState {
         Ok(RoutingOperatorControlCommit { status, snapshot })
     }
 
+    pub async fn compare_and_set_new_session_preference_for_policy(
+        &self,
+        service_name: &str,
+        route_graph_key: &str,
+        expected_control_revision: u64,
+        expected_policy_revision: u64,
+        target: Option<ProviderEndpointKey>,
+    ) -> Result<RoutingOperatorControlCommit, RoutingOperatorControlError> {
+        let _update_guard = self.provider_policy_updates.lock().await;
+        let policy_revision = self.provider_policy_snapshot.read().await.policy_revision;
+        if policy_revision != expected_policy_revision {
+            return Ok(RoutingOperatorControlCommit {
+                status: RoutingOperatorControlUpdate::Conflict,
+                snapshot: self.routing_operator_control.read().await.clone(),
+            });
+        }
+        self.compare_and_set_new_session_preference(
+            service_name,
+            route_graph_key,
+            expected_control_revision,
+            target,
+        )
+        .await
+    }
+
     pub(crate) async fn commit_runtime_reload<T>(
         &self,
         route_graphs: &[PreparedRoutingOperatorRouteGraph],
@@ -3740,7 +3765,11 @@ impl ProxyState {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut candidate = registry.clone();
-        candidate.record_snapshot(&provider_endpoint, &context, &snapshot);
+        let registry_update = candidate.record_snapshot(&provider_endpoint, &context, &snapshot);
+        if let Some(pool) = registry_update.pool {
+            snapshot.quota_pool_key = Some(pool.key);
+            snapshot.quota_pool_revision = Some(pool.revision);
+        }
         let checkpoint = candidate.checkpoint();
         let expected_revision = self.quota_registry_document_revision();
         let committed_revision = self.with_runtime_store_blocking(|runtime_store| {
@@ -3851,7 +3880,12 @@ impl ProxyState {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut candidate = registry.clone();
-            candidate.record_snapshot(&snapshot.provider_endpoint, &context, &snapshot);
+            let registry_update =
+                candidate.record_snapshot(&snapshot.provider_endpoint, &context, &snapshot);
+            if let Some(pool) = registry_update.pool {
+                snapshot.quota_pool_key = Some(pool.key);
+                snapshot.quota_pool_revision = Some(pool.revision);
+            }
             let checkpoint = candidate.checkpoint();
             let expected_revision = self.quota_registry_document_revision();
             let payload_json = serialize_quota_registry_checkpoint(&checkpoint)?;
@@ -10391,6 +10425,39 @@ confidence = "exact"
             .next()
             .expect("quota pool");
         assert_eq!(pool.last_attempt_at_ms, Some(fetched_at_ms));
+    }
+
+    #[tokio::test]
+    async fn published_balance_carries_its_canonical_quota_pool_identity() {
+        let state = ProxyState::new();
+        let endpoint = ProviderEndpointKey::new("codex", "identity-link", "default");
+        let fetched_at_ms = unix_now_ms();
+        let snapshot = healthy_quota_snapshot(&endpoint, fetched_at_ms);
+
+        state
+            .try_record_provider_balance_snapshot_with_quota_context(
+                snapshot.clone(),
+                explicit_quota_context(&snapshot, "identity-link-pool"),
+            )
+            .await
+            .expect("publish balance");
+
+        let membership = state
+            .quota_pool_membership(&endpoint)
+            .await
+            .expect("quota pool membership");
+        let balance = state
+            .get_provider_balance_view("codex")
+            .await
+            .into_iter()
+            .next()
+            .expect("published balance");
+
+        assert_eq!(
+            balance.quota_pool_key.as_deref(),
+            Some(membership.pool.key.as_str())
+        );
+        assert_eq!(balance.quota_pool_revision, Some(membership.pool.revision));
     }
 
     #[test]

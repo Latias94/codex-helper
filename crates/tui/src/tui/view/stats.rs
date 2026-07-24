@@ -5,20 +5,30 @@ use ratatui::prelude::{Color, Line, Modifier, Span, Style, Text};
 use ratatui::widgets::{
     Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Sparkline, Table, Wrap,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::quota_analytics::{
     PoolQuotaAnalytics, QuotaAnalyticsSupport, QuotaFreshnessStatus, QuotaPaceStatus,
     QuotaRateStatus, QuotaReconciliationStatus,
 };
 use crate::quota_pool::{IdentityConfidence, QuotaQuantity, QuotaUnit, QuotaWindowKind};
-use crate::state::{UsageBucket, UsageDayDimensionRow, UsageDayView};
+use crate::state::{ProviderBalanceSnapshot, UsageBucket, UsageDayDimensionRow, UsageDayView};
 use crate::tui::Language;
 use crate::tui::ProviderOption;
 use crate::tui::model::{
-    Palette, Snapshot, duration_short, format_age, now_ms, shorten, tokens_short,
+    Palette, Snapshot, duration_short, format_age, now_ms, provider_usage_rate_summary_lang,
+    provider_usage_report_is_current, provider_usage_source_label_lang,
+    provider_usage_window_brief_lang, provider_usage_window_summary_lang, shorten, tokens_short,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::StatsFocus;
+
+#[derive(Default)]
+struct SelectedQuotaUsage<'a> {
+    pool: Option<&'a PoolQuotaAnalytics>,
+    provider_usage: Option<&'a ProviderBalanceSnapshot>,
+    provider_usage_rate: Option<String>,
+}
 
 pub(super) fn render_stats_page(
     f: &mut Frame<'_>,
@@ -28,18 +38,37 @@ pub(super) fn render_stats_page(
     _providers: &[ProviderOption],
     area: Rect,
 ) {
-    let compact = area.width < 100 || area.height < 18;
+    let compact = area.width < 100 || area.height < 19;
+    let selected_pool = ui.selected_quota_pool(snapshot);
+    let provider_usage =
+        selected_pool.and_then(|pool| provider_usage_snapshot_for_pool(snapshot, pool));
+    let provider_usage_rate =
+        provider_usage.and_then(|usage| provider_usage_rate_summary_lang(usage, ui.language));
+    let selected_usage = SelectedQuotaUsage {
+        pool: selected_pool,
+        provider_usage,
+        provider_usage_rate,
+    };
+    let desired_quota_row_height = if compact {
+        compact_quota_kpi_height(&selected_usage)
+    } else if area.height >= 30 {
+        8
+    } else {
+        7
+    };
+    let quota_row_height = desired_quota_row_height.min(area.height);
+    let compact_local_usage_height = area.height.saturating_sub(quota_row_height).min(6);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(if compact {
             vec![
-                Constraint::Length(6),
-                Constraint::Length(6),
+                Constraint::Length(quota_row_height),
+                Constraint::Length(compact_local_usage_height),
                 Constraint::Min(0),
             ]
         } else {
             vec![
-                Constraint::Length(7),
+                Constraint::Length(quota_row_height),
                 Constraint::Length(6),
                 Constraint::Length(5),
                 Constraint::Min(0),
@@ -47,7 +76,7 @@ pub(super) fn render_stats_page(
         })
         .split(area);
 
-    render_quota_kpi_row(f, p, ui, snapshot, rows[0], compact);
+    render_quota_kpi_row(f, p, ui, snapshot, &selected_usage, rows[0], compact);
     render_local_usage_row(f, p, ui.language, &snapshot.usage_day, rows[1]);
     if compact {
         render_dimension_area(f, p, ui, snapshot, rows[2], true);
@@ -62,16 +91,24 @@ fn render_quota_kpi_row(
     p: Palette,
     ui: &UiState,
     snapshot: &Snapshot,
+    selected_usage: &SelectedQuotaUsage<'_>,
     area: Rect,
     compact: bool,
 ) {
     let lang = ui.language;
     let usage = &snapshot.usage_day;
     let quota = &snapshot.quota_analytics;
-    let selected = ui.selected_quota_pool(snapshot);
 
     if compact {
-        let (title, lines) = quota_summary_lines(p, lang, ui, quota.support, selected, usage);
+        let (title, lines) = quota_summary_lines(
+            p,
+            lang,
+            ui,
+            quota.support,
+            usage,
+            selected_usage,
+            usize::from(area.width.saturating_sub(16).max(1)),
+        );
         render_info_block(f, p, title, lines, area);
         return;
     }
@@ -86,8 +123,9 @@ fn render_quota_kpi_row(
         ])
         .split(area);
 
-    let Some(pool) = selected else {
-        let (title, lines) = quota_summary_lines(p, lang, ui, quota.support, None, usage);
+    let Some(pool) = selected_usage.pool else {
+        let (title, lines) =
+            quota_summary_lines(p, lang, ui, quota.support, usage, selected_usage, 80);
         render_info_block(f, p, title, lines, area);
         return;
     };
@@ -100,8 +138,14 @@ fn render_quota_kpi_row(
             Language::En => format!("Quota Pool {}", ui.selected_stats_pool_idx + 1),
         },
         vec![
-            kv_line(p, "source", &shorten(&pool.source, 24), p.text),
-            kv_line(
+            panel_kv_line(
+                p,
+                "source",
+                &shorten(provider_usage_source_label_lang(&pool.source, lang), 24),
+                p.text,
+                cols[0],
+            ),
+            panel_kv_line(
                 p,
                 "scope",
                 &format!(
@@ -110,87 +154,133 @@ fn render_quota_kpi_row(
                     identity_confidence(pool)
                 ),
                 identity_color(p, pool),
+                cols[0],
             ),
-            kv_line(
+            panel_kv_line(
                 p,
                 "state",
                 &pool_state_label(pool, ui, lang),
                 pool_state_color(p, pool, ui),
+                cols[0],
             ),
-            kv_line(p, "age", &pool_age(pool), p.muted),
+            panel_kv_line(p, "age", &pool_age(pool), p.muted, cols[0]),
         ],
         cols[0],
     );
 
     let remote_usage = remote_usage_display(pool, lang);
+    let provider_usage_window = selected_usage
+        .provider_usage
+        .and_then(|snapshot| snapshot.usage_windows.first());
     render_info_block(
         f,
         p,
         match lang {
-            Language::Zh => "远端额度",
-            Language::En => "Remote Quota",
+            Language::Zh => "上游额度池",
+            Language::En => "Upstream Quota Pool",
         },
         vec![
-            kv_line(
+            panel_kv_line(
                 p,
                 &remote_usage.label,
                 &quantity_text(remote_usage.quantity),
                 p.accent,
+                cols[1],
             ),
-            kv_line(
+            panel_kv_line(
                 p,
                 "remaining",
                 &quantity_text(pool.remote_remaining.as_ref()),
                 p.text,
+                cols[1],
             ),
-            kv_line(
+            panel_kv_line(
                 p,
                 "limit",
                 &quantity_text(pool.remote_limit.as_ref()),
                 p.muted,
+                cols[1],
             ),
-            kv_line(p, "unit", pool.unit.as_str(), unit_color(p, pool.unit)),
+            panel_kv_line(
+                p,
+                "unit",
+                pool.unit.as_str(),
+                unit_color(p, pool.unit),
+                cols[1],
+            ),
+            panel_kv_line(
+                p,
+                "win",
+                &provider_usage_window
+                    .map(|window| provider_usage_window_brief_lang(window, lang))
+                    .unwrap_or_else(|| "-".to_string()),
+                provider_usage_window.map_or(p.muted, |_| p.text),
+                cols[1],
+            ),
         ],
         cols[1],
     );
 
+    let mut observed_rate_lines = vec![
+        panel_kv_line(
+            p,
+            "15m",
+            &rate_text(&pool.rate_15m, lang),
+            rate_color(p, pool.rate_15m.status),
+            cols[2],
+        ),
+        panel_kv_line(
+            p,
+            "60m",
+            &rate_text(&pool.rate_60m, lang),
+            rate_color(p, pool.rate_60m.status),
+            cols[2],
+        ),
+        panel_kv_line(
+            p,
+            "API rate",
+            &provider_usage_rpm_tpm_text(selected_usage.provider_usage),
+            selected_usage.provider_usage.map_or(p.muted, |_| p.accent),
+            cols[2],
+        ),
+    ];
+    if area.height >= 8 {
+        observed_rate_lines.push(panel_kv_line(
+            p,
+            "API avg",
+            &provider_usage_average_duration_text(selected_usage.provider_usage),
+            selected_usage.provider_usage.map_or(p.muted, |_| p.text),
+            cols[2],
+        ));
+    }
+    observed_rate_lines.extend([
+        panel_kv_line(
+            p,
+            "required",
+            &hourly_quantity_text(pool.pacing.required_rate_per_hour.as_ref()),
+            p.muted,
+            cols[2],
+        ),
+        panel_kv_line(
+            p,
+            "ETA",
+            &pool
+                .pacing
+                .exhaustion_eta_ms
+                .map(duration_short)
+                .unwrap_or_else(|| "-".to_string()),
+            p.text,
+            cols[2],
+        ),
+    ]);
     render_info_block(
         f,
         p,
         match lang {
-            Language::Zh => "消耗速率",
-            Language::En => "Burn Rate",
+            Language::Zh => "上游观测速率",
+            Language::En => "Upstream Observed Rate",
         },
-        vec![
-            kv_line(
-                p,
-                "15m",
-                &rate_text(&pool.rate_15m, lang),
-                rate_color(p, pool.rate_15m.status),
-            ),
-            kv_line(
-                p,
-                "60m",
-                &rate_text(&pool.rate_60m, lang),
-                rate_color(p, pool.rate_60m.status),
-            ),
-            kv_line(
-                p,
-                "required",
-                &hourly_quantity_text(pool.pacing.required_rate_per_hour.as_ref()),
-                p.muted,
-            ),
-            kv_line(
-                p,
-                "ETA",
-                &pool
-                    .pacing
-                    .exhaustion_eta_ms
-                    .map(duration_short)
-                    .unwrap_or_else(|| "-".to_string()),
-                p.text,
-            ),
-        ],
+        observed_rate_lines,
         cols[2],
     );
 
@@ -199,23 +289,37 @@ fn render_quota_kpi_row(
         f,
         p,
         match lang {
-            Language::Zh => "节奏 / 本机今日",
-            Language::En => "Pace / Local Today",
+            Language::Zh => "上游节奏 / 本机今日",
+            Language::En => "Upstream Pace / Local Today",
         },
         vec![
-            kv_line(
+            panel_kv_line(
                 p,
                 "pace",
                 &pace_label(pool.pacing.status, lang),
                 pace_color(p, pool.pacing.status),
+                cols[3],
             ),
-            kv_line(p, "reset", &reset_text(pool, now_ms(), lang), p.muted),
-            kv_line(p, "local cost", &summary.cost.display_total(), p.text),
-            kv_line(
+            panel_kv_line(
+                p,
+                "reset",
+                &reset_text(pool, now_ms(), lang),
+                p.muted,
+                cols[3],
+            ),
+            panel_kv_line(
+                p,
+                "local cost",
+                &summary.cost.display_total(),
+                p.text,
+                cols[3],
+            ),
+            panel_kv_line(
                 p,
                 "local tokens",
                 &tokens_short(summary.usage.total_tokens),
                 p.accent,
+                cols[3],
             ),
         ],
         cols[3],
@@ -969,6 +1073,14 @@ fn kv_line(p: Palette, key: &str, value: &str, color: Color) -> Line<'static> {
     ])
 }
 
+fn panel_kv_line(p: Palette, key: &str, value: &str, color: Color, area: Rect) -> Line<'static> {
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let value_width = inner_width
+        .saturating_sub(UnicodeWidthStr::width(key))
+        .saturating_sub(1);
+    compact_kv_line(p, key, value, color, value_width)
+}
+
 fn muted(p: Palette, value: &str) -> Span<'static> {
     Span::styled(value.to_string(), Style::default().fg(p.muted))
 }
@@ -978,14 +1090,15 @@ fn quota_summary_lines(
     lang: Language,
     ui: &UiState,
     support: QuotaAnalyticsSupport,
-    pool: Option<&PoolQuotaAnalytics>,
     usage: &UsageDayView,
+    selected_usage: &SelectedQuotaUsage<'_>,
+    max_value_width: usize,
 ) -> (String, Vec<Line<'static>>) {
     if support == QuotaAnalyticsSupport::Unsupported {
         return (
             match lang {
-                Language::Zh => "远端额度（不支持）".to_string(),
-                Language::En => "Remote Quota (unsupported)".to_string(),
+                Language::Zh => "上游额度池（不支持）".to_string(),
+                Language::En => "Upstream Quota Pool (unsupported)".to_string(),
             },
             vec![
                 kv_line(
@@ -1007,11 +1120,11 @@ fn quota_summary_lines(
             ],
         );
     }
-    let Some(pool) = pool else {
+    let Some(pool) = selected_usage.pool else {
         return (
             match lang {
-                Language::Zh => "远端额度".to_string(),
-                Language::En => "Remote Quota".to_string(),
+                Language::Zh => "上游额度池".to_string(),
+                Language::En => "Upstream Quota Pool".to_string(),
             },
             vec![
                 kv_line(
@@ -1046,90 +1159,178 @@ fn quota_summary_lines(
     };
 
     let remote_usage = remote_usage_display(pool, lang);
+    let remaining_label = match (lang, max_value_width < 42) {
+        (Language::Zh, _) => "剩余",
+        (Language::En, true) => "left",
+        (Language::En, false) => "remaining",
+    };
+    let quota_text = format!(
+        "{} {}  {remaining_label} {}",
+        remote_usage.label,
+        quantity_text(remote_usage.quantity),
+        quantity_text(pool.remote_remaining.as_ref())
+    );
+    let mut lines = vec![compact_kv_line(
+        p,
+        "quota",
+        &quota_text,
+        p.accent,
+        max_value_width,
+    )];
+    lines.push(compact_kv_line(
+        p,
+        "state",
+        &pool_state_label(pool, ui, lang),
+        pool_state_color(p, pool, ui),
+        max_value_width,
+    ));
+    if let Some(summary) = selected_usage.provider_usage_rate.as_deref() {
+        lines.push(compact_kv_line(
+            p,
+            "upstream API",
+            summary,
+            p.accent,
+            max_value_width,
+        ));
+    }
+    if let Some(window) = selected_usage
+        .provider_usage
+        .and_then(|snapshot| snapshot.usage_windows.first())
+    {
+        let window_text = if max_value_width < 42 {
+            provider_usage_window_brief_lang(window, lang)
+        } else {
+            provider_usage_window_summary_lang(window, lang)
+        };
+        lines.push(compact_kv_line(
+            p,
+            "API window",
+            &window_text,
+            p.text,
+            max_value_width,
+        ));
+    }
+    lines.extend([
+        compact_kv_line(
+            p,
+            "rates",
+            &format!(
+                "15m {}  60m {}  required {}",
+                rate_text(&pool.rate_15m, lang),
+                rate_text(&pool.rate_60m, lang),
+                hourly_quantity_text(pool.pacing.required_rate_per_hour.as_ref())
+            ),
+            rate_color(p, pool.rate_15m.status),
+            max_value_width,
+        ),
+        compact_kv_line(
+            p,
+            "pace",
+            &format!(
+                "{}  ETA {}  reset {}",
+                pace_label(pool.pacing.status, lang),
+                pool.pacing
+                    .exhaustion_eta_ms
+                    .map(duration_short)
+                    .unwrap_or_else(|| "-".to_string()),
+                reset_text(pool, now_ms(), lang)
+            ),
+            pace_color(p, pool.pacing.status),
+            max_value_width,
+        ),
+        compact_kv_line(
+            p,
+            "source",
+            &format!(
+                "{}  scope {}  confidence {}",
+                provider_usage_source_label_lang(&pool.source, lang),
+                pool.identity.scope.as_key(),
+                identity_confidence(pool)
+            ),
+            identity_color(p, pool),
+            max_value_width,
+        ),
+    ]);
+
     (
         match lang {
-            Language::Zh => format!("远端额度 · {}", pool_name(pool)),
-            Language::En => format!("Remote Quota · {}", pool_name(pool)),
+            Language::Zh => format!("上游额度池 · {}", pool_name(pool)),
+            Language::En => format!("Upstream Quota Pool · {}", pool_name(pool)),
         },
-        vec![
-            Line::from(vec![
-                muted(p, &format!("{} ", remote_usage.label)),
-                Span::styled(
-                    quantity_text(remote_usage.quantity),
-                    Style::default().fg(p.accent),
-                ),
-                Span::raw("  "),
-                muted(p, "remaining "),
-                Span::styled(
-                    quantity_text(pool.remote_remaining.as_ref()),
-                    Style::default().fg(p.text),
-                ),
-                Span::raw("  "),
-                muted(p, "state "),
-                Span::styled(
-                    pool_state_label(pool, ui, lang),
-                    Style::default().fg(pool_state_color(p, pool, ui)),
-                ),
-            ]),
-            Line::from(vec![
-                muted(p, "15m "),
-                Span::styled(
-                    rate_text(&pool.rate_15m, lang),
-                    Style::default().fg(rate_color(p, pool.rate_15m.status)),
-                ),
-                Span::raw("  "),
-                muted(p, "60m "),
-                Span::styled(
-                    rate_text(&pool.rate_60m, lang),
-                    Style::default().fg(rate_color(p, pool.rate_60m.status)),
-                ),
-                Span::raw("  "),
-                muted(p, "required "),
-                Span::styled(
-                    hourly_quantity_text(pool.pacing.required_rate_per_hour.as_ref()),
-                    Style::default().fg(p.muted),
-                ),
-            ]),
-            Line::from(vec![
-                muted(p, "pace "),
-                Span::styled(
-                    pace_label(pool.pacing.status, lang),
-                    Style::default().fg(pace_color(p, pool.pacing.status)),
-                ),
-                Span::raw("  "),
-                muted(p, "ETA "),
-                Span::styled(
-                    pool.pacing
-                        .exhaustion_eta_ms
-                        .map(duration_short)
-                        .unwrap_or_else(|| "-".to_string()),
-                    Style::default().fg(p.text),
-                ),
-                Span::raw("  "),
-                muted(p, "reset "),
-                Span::styled(
-                    reset_text(pool, now_ms(), lang),
-                    Style::default().fg(p.muted),
-                ),
-            ]),
-            Line::from(vec![
-                muted(p, "source "),
-                Span::styled(shorten(&pool.source, 12), Style::default().fg(p.text)),
-                Span::raw("  "),
-                muted(p, "scope "),
-                Span::styled(
-                    pool.identity.scope.as_key(),
-                    Style::default().fg(identity_color(p, pool)),
-                ),
-                Span::raw("  "),
-                muted(p, "confidence "),
-                Span::styled(
-                    identity_confidence(pool),
-                    Style::default().fg(identity_color(p, pool)),
-                ),
-            ]),
-        ],
+        lines,
     )
+}
+
+fn compact_kv_line(
+    p: Palette,
+    key: &str,
+    value: &str,
+    color: Color,
+    max_value_width: usize,
+) -> Line<'static> {
+    kv_line(p, key, &shorten(value, max_value_width), color)
+}
+
+fn compact_quota_kpi_height(selected_usage: &SelectedQuotaUsage<'_>) -> u16 {
+    let extra_lines = usize::from(selected_usage.provider_usage_rate.is_some())
+        + usize::from(
+            selected_usage
+                .provider_usage
+                .is_some_and(|usage| !usage.usage_windows.is_empty()),
+        );
+    7_u16.saturating_add(extra_lines as u16)
+}
+
+fn provider_usage_snapshot_for_pool<'a>(
+    snapshot: &'a Snapshot,
+    pool: &PoolQuotaAnalytics,
+) -> Option<&'a ProviderBalanceSnapshot> {
+    let endpoint = pool.endpoint.as_ref()?;
+    let observation_provider_id = pool.observation_provider_id.trim();
+    let source = pool.source.trim();
+    if observation_provider_id.is_empty() || source.is_empty() {
+        return None;
+    }
+    snapshot
+        .provider_balances
+        .get(&endpoint.provider_id)?
+        .iter()
+        .find(|balance| {
+            balance.provider_endpoint == *endpoint
+                && balance.observation_provider_id == observation_provider_id
+                && balance.source == source
+                && balance.quota_pool_key.as_deref() == Some(pool.identity.key.as_str())
+                && balance.quota_pool_revision == Some(pool.identity.revision)
+                && provider_usage_report_is_current(balance)
+        })
+}
+
+fn provider_usage_rpm_tpm_text(provider_usage: Option<&ProviderBalanceSnapshot>) -> String {
+    let Some(rate) = provider_usage.and_then(|snapshot| snapshot.usage_rate.as_ref()) else {
+        return "-".to_string();
+    };
+    let rpm = rate
+        .rpm
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("-");
+    let tpm = rate
+        .tpm
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("-");
+    format!("RPM {rpm} / TPM {tpm}")
+}
+
+fn provider_usage_average_duration_text(
+    provider_usage: Option<&ProviderBalanceSnapshot>,
+) -> String {
+    provider_usage
+        .and_then(|snapshot| snapshot.usage_rate.as_ref())
+        .and_then(|rate| rate.average_duration_ms.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 struct RemoteUsageDisplay<'a> {
@@ -1552,10 +1753,11 @@ mod tests {
         IdentityEvidence, PoolIdentity, QuotaCapabilities, QuotaResetKind, QuotaScope,
         QuotaWindowSemantics,
     };
+    use crate::runtime_identity::ProviderEndpointKey;
     use crate::sessions::{ProjectIdentity, ProjectIdentityKind};
     use crate::state::{
-        UsageDayCoverage, UsageDayDimensionRow, UsageDayHourRow, UsageDayView,
-        UsageRetryGateReasonRow, UsageRetryGateSummary,
+        BalanceSnapshotStatus, ProviderBalanceSnapshot, UsageDayCoverage, UsageDayDimensionRow,
+        UsageDayHourRow, UsageDayView, UsageRetryGateReasonRow, UsageRetryGateSummary,
     };
     use crate::tui::model::Snapshot;
     use crate::tui::state::UiState;
@@ -1770,12 +1972,281 @@ mod tests {
 
         let text = render_text(128, 26, &mut ui, &snapshot);
 
-        assert!(text.contains("Remote Quota"));
+        assert!(text.contains("Upstream Quota Pool"));
         assert!(text.contains("relay.example"));
         assert!(text.contains("on pace"));
         assert!(text.contains("$100"));
         assert!(text.contains("Retry Gate"));
         assert!(text.contains("Coverage"));
+    }
+
+    #[test]
+    fn stats_render_surfaces_exact_matching_upstream_usage_report() {
+        let mut snapshot = sample_snapshot();
+        let endpoint = ProviderEndpointKey::new("codex", "input", "default");
+        let (quota_pool_key, quota_pool_revision) = {
+            let pool = snapshot
+                .quota_analytics
+                .pools
+                .first_mut()
+                .expect("sample quota pool");
+            pool.endpoint = Some(endpoint.clone());
+            pool.observation_provider_id = "sub2api-usage".to_string();
+            pool.source = "usage_provider:sub2api_usage".to_string();
+            (pool.identity.key.clone(), pool.identity.revision)
+        };
+        snapshot.provider_balances.insert(
+            "input".to_string(),
+            vec![ProviderBalanceSnapshot {
+                observation_provider_id: "sub2api-usage".to_string(),
+                provider_endpoint: endpoint,
+                source: "usage_provider:sub2api_usage".to_string(),
+                quota_pool_key: Some(quota_pool_key),
+                quota_pool_revision: Some(quota_pool_revision),
+                status: BalanceSnapshotStatus::Ok,
+                usage_rate: Some(codex_helper_core::balance::ProviderUsageRateSnapshot {
+                    average_duration_ms: Some("842.7".to_string()),
+                    rpm: Some("0.7".to_string()),
+                    tpm: Some("85.3".to_string()),
+                }),
+                usage_windows: vec![codex_helper_core::balance::ProviderUsageWindow {
+                    period: "daily".to_string(),
+                    used_usd: Some("95".to_string()),
+                    limit_usd: Some("100".to_string()),
+                    remaining_usd: Some("5".to_string()),
+                    unlimited: Some(false),
+                }],
+                ..ProviderBalanceSnapshot::default()
+            }],
+        );
+
+        for (width, height, expected) in [
+            (
+                128,
+                30,
+                vec![
+                    "API rate RPM 0.7 / TPM 85.3",
+                    "842.7ms",
+                    "win daily $95/$100 left $5",
+                ],
+            ),
+            (
+                76,
+                26,
+                vec![
+                    "RPM 0.7",
+                    "842.7ms",
+                    "daily used $95.00 left $5.00 / $100.00",
+                ],
+            ),
+            (100, 19, vec!["API rate", "required", "ETA"]),
+            (100, 30, vec!["API rate", "API avg", "required", "ETA"]),
+            (48, 18, vec!["RPM 0.7", "daily $95/$100 left $5"]),
+        ] {
+            let mut ui = UiState {
+                page: crate::tui::types::Page::Stats,
+                stats_focus: StatsFocus::Pools,
+                ..UiState::default()
+            };
+            let text = render_text(width, height, &mut ui, &snapshot);
+
+            for expected in expected {
+                assert!(
+                    text.contains(expected),
+                    "missing {expected:?} at {width}x{height}:\n{text}"
+                );
+            }
+        }
+
+        let rate = snapshot
+            .provider_balances
+            .get_mut("input")
+            .and_then(|balances| balances.first_mut())
+            .and_then(|balance| balance.usage_rate.as_mut())
+            .expect("upstream usage rate");
+        rate.rpm = Some("9".repeat(64));
+        rate.tpm = Some("8".repeat(64));
+        rate.average_duration_ms = Some("7".repeat(64));
+
+        for (width, height, expected) in [
+            (100, 19, &["API rate", "required", "ETA"][..]),
+            (100, 30, &["API rate", "API avg", "required", "ETA"][..]),
+        ] {
+            let mut ui = UiState {
+                page: crate::tui::types::Page::Stats,
+                stats_focus: StatsFocus::Pools,
+                ..UiState::default()
+            };
+            let text = render_text(width, height, &mut ui, &snapshot);
+
+            for expected in expected {
+                assert!(
+                    text.contains(expected),
+                    "long rate value hid {expected:?} at {width}x{height}:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_usage_report_does_not_cross_service_boundaries() {
+        let mut snapshot = sample_snapshot();
+        let (quota_pool_key, quota_pool_revision) = {
+            let pool = snapshot
+                .quota_analytics
+                .pools
+                .first_mut()
+                .expect("sample quota pool");
+            pool.endpoint = Some(ProviderEndpointKey::new("codex", "input", "default"));
+            pool.observation_provider_id = "sub2api-usage".to_string();
+            pool.source = "usage_provider:sub2api_usage".to_string();
+            (pool.identity.key.clone(), pool.identity.revision)
+        };
+        snapshot.provider_balances.insert(
+            "input".to_string(),
+            vec![ProviderBalanceSnapshot {
+                observation_provider_id: "sub2api-usage".to_string(),
+                provider_endpoint: ProviderEndpointKey::new("responses", "input", "default"),
+                source: "usage_provider:sub2api_usage".to_string(),
+                quota_pool_key: Some(quota_pool_key),
+                quota_pool_revision: Some(quota_pool_revision),
+                status: BalanceSnapshotStatus::Ok,
+                usage_rate: Some(codex_helper_core::balance::ProviderUsageRateSnapshot {
+                    rpm: Some("999".to_string()),
+                    ..Default::default()
+                }),
+                ..ProviderBalanceSnapshot::default()
+            }],
+        );
+
+        let pool = snapshot
+            .quota_analytics
+            .pools
+            .first()
+            .expect("sample quota pool")
+            .clone();
+        assert!(provider_usage_snapshot_for_pool(&snapshot, &pool).is_none());
+    }
+
+    #[test]
+    fn provider_usage_report_requires_matching_pool_observer_and_source() {
+        let mut snapshot = sample_snapshot();
+        let endpoint = ProviderEndpointKey::new("codex", "input", "default");
+        let (quota_pool_key, quota_pool_revision) = {
+            let pool = snapshot
+                .quota_analytics
+                .pools
+                .first_mut()
+                .expect("sample quota pool");
+            pool.endpoint = Some(endpoint.clone());
+            pool.observation_provider_id = "observer-a".to_string();
+            pool.source = "usage_provider:sub2api_usage".to_string();
+            (pool.identity.key.clone(), pool.identity.revision)
+        };
+        snapshot.provider_balances.insert(
+            "input".to_string(),
+            vec![
+                ProviderBalanceSnapshot {
+                    observation_provider_id: "observer-b".to_string(),
+                    provider_endpoint: endpoint.clone(),
+                    source: "usage_provider:sub2api_usage".to_string(),
+                    quota_pool_key: Some(quota_pool_key.clone()),
+                    quota_pool_revision: Some(quota_pool_revision),
+                    status: BalanceSnapshotStatus::Ok,
+                    usage_rate: Some(codex_helper_core::balance::ProviderUsageRateSnapshot {
+                        rpm: Some("999".to_string()),
+                        ..Default::default()
+                    }),
+                    ..ProviderBalanceSnapshot::default()
+                },
+                ProviderBalanceSnapshot {
+                    observation_provider_id: "observer-a".to_string(),
+                    provider_endpoint: endpoint.clone(),
+                    source: "usage_provider:sub2api_usage".to_string(),
+                    quota_pool_key: Some("credential:sha256:old".to_string()),
+                    quota_pool_revision: Some(quota_pool_revision),
+                    status: BalanceSnapshotStatus::Ok,
+                    usage_rate: Some(codex_helper_core::balance::ProviderUsageRateSnapshot {
+                        rpm: Some("998".to_string()),
+                        ..Default::default()
+                    }),
+                    ..ProviderBalanceSnapshot::default()
+                },
+            ],
+        );
+
+        let pool = snapshot
+            .quota_analytics
+            .pools
+            .first()
+            .expect("sample quota pool")
+            .clone();
+        assert!(provider_usage_snapshot_for_pool(&snapshot, &pool).is_none());
+
+        snapshot
+            .provider_balances
+            .get_mut("input")
+            .expect("provider balances")
+            .push(ProviderBalanceSnapshot {
+                observation_provider_id: "observer-a".to_string(),
+                provider_endpoint: endpoint,
+                source: "usage_provider:sub2api_usage".to_string(),
+                quota_pool_key: Some(quota_pool_key),
+                quota_pool_revision: Some(quota_pool_revision),
+                status: BalanceSnapshotStatus::Ok,
+                usage_rate: Some(codex_helper_core::balance::ProviderUsageRateSnapshot {
+                    rpm: Some("0.7".to_string()),
+                    ..Default::default()
+                }),
+                ..ProviderBalanceSnapshot::default()
+            });
+
+        assert_eq!(
+            provider_usage_snapshot_for_pool(&snapshot, &pool)
+                .and_then(|balance| balance.usage_rate.as_ref())
+                .and_then(|rate| rate.rpm.as_deref()),
+            Some("0.7")
+        );
+    }
+
+    #[test]
+    fn provider_usage_report_rejects_retained_error_snapshot() {
+        let mut snapshot = sample_snapshot();
+        let endpoint = ProviderEndpointKey::new("codex", "input", "default");
+        let (quota_pool_key, quota_pool_revision) = {
+            let pool = snapshot
+                .quota_analytics
+                .pools
+                .first_mut()
+                .expect("sample quota pool");
+            pool.endpoint = Some(endpoint.clone());
+            pool.observation_provider_id = "observer-a".to_string();
+            pool.source = "usage_provider:sub2api_usage".to_string();
+            (pool.identity.key.clone(), pool.identity.revision)
+        };
+        snapshot.provider_balances.insert(
+            "input".to_string(),
+            vec![ProviderBalanceSnapshot {
+                observation_provider_id: "observer-a".to_string(),
+                provider_endpoint: endpoint,
+                source: "usage_provider:sub2api_usage".to_string(),
+                quota_pool_key: Some(quota_pool_key),
+                quota_pool_revision: Some(quota_pool_revision),
+                status: BalanceSnapshotStatus::Error,
+                usage_rate: Some(codex_helper_core::balance::ProviderUsageRateSnapshot {
+                    rpm: Some("0.7".to_string()),
+                    ..Default::default()
+                }),
+                ..ProviderBalanceSnapshot::default()
+            }],
+        );
+
+        let pool = snapshot
+            .quota_analytics
+            .pools
+            .first()
+            .expect("sample quota pool");
+        assert!(provider_usage_snapshot_for_pool(&snapshot, pool).is_none());
     }
 
     #[test]

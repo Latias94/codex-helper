@@ -2,7 +2,8 @@
 //!
 //! This module deliberately contains no credential-bearing state.  Credentials may be
 //! supplied to [`QuotaObservationContext`] while resolving a pool, but the resulting
-//! identity only contains an opaque, installation-local key.
+//! identity never retains credential material. External operator projections
+//! replace its key with an opaque token before crossing a process boundary.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -367,7 +368,7 @@ impl IdentityConfidence {
     }
 }
 
-/// A stable, secret-free identity for a quota pool.
+/// A stable identity for a quota pool that excludes credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(default)]
 pub struct PoolIdentity {
@@ -784,6 +785,8 @@ pub enum QuotaAdjustmentKind {
 pub struct QuotaObservation {
     pub pool: PoolIdentity,
     pub endpoint: Option<ProviderEndpointKey>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub observation_provider_id: String,
     pub observed_at_ms: u64,
     pub source: String,
     pub status: String,
@@ -1475,6 +1478,7 @@ fn observation_from_snapshot(
     Some(QuotaObservation {
         pool: identity.clone(),
         endpoint: Some(endpoint.clone()),
+        observation_provider_id: snapshot.observation_provider_id.clone(),
         observed_at_ms: snapshot.fetched_at_ms,
         source: snapshot.source.clone(),
         status: snapshot.status.as_str().to_string(),

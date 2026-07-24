@@ -11,6 +11,7 @@ use crate::quota_pool::{
     QuotaObservation, QuotaPoolState, QuotaQuantity, QuotaRegistryCheckpoint, QuotaUnit,
     QuotaWindowKind, QuotaWindowSemantics,
 };
+use crate::runtime_identity::ProviderEndpointKey;
 use crate::sessions::{ProjectIdentity, ProjectIdentityKind};
 use crate::state::{
     AttributionCoverage, AttributionPoolKey, AttributionQuery, AttributionQueryResult,
@@ -232,6 +233,10 @@ pub struct QuotaReconciliationView {
 #[serde(default)]
 pub struct PoolQuotaAnalytics {
     pub identity: PoolIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<ProviderEndpointKey>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub observation_provider_id: String,
     pub observed_at_ms: u64,
     pub last_success_at_ms: Option<u64>,
     pub last_attempt_at_ms: Option<u64>,
@@ -447,6 +452,8 @@ fn build_pool_analytics(
     };
     Some(PoolQuotaAnalytics {
         identity: pool.identity.clone(),
+        endpoint: latest.endpoint.clone(),
+        observation_provider_id: latest.observation_provider_id.clone(),
         observed_at_ms: latest.observed_at_ms,
         last_success_at_ms: pool.last_success_at_ms,
         last_attempt_at_ms: pool.last_attempt_at_ms,
@@ -1154,6 +1161,29 @@ mod tests {
             Some(QuotaQuantity::from_integer(60, QuotaUnit::Usd))
         );
         assert_eq!(pool.rate_15m.rate_per_hour, pool.rate_60m.rate_per_hour);
+    }
+
+    #[test]
+    fn analytics_preserves_latest_provider_endpoint_for_operator_matching() {
+        let now_ms = 60 * MINUTE_MS;
+        let endpoint = ProviderEndpointKey::new("codex", "provider-a", "endpoint-a");
+        let mut sample = used_sample(now_ms, 60, now_ms);
+        sample.endpoint = Some(endpoint.clone());
+        sample.observation_provider_id = "usage-provider-a".to_string();
+
+        let view = build_quota_analytics(&checkpoint_with_samples([sample]), now_ms, &[]);
+        let serialized = serde_json::to_value(&view.pools[0]).expect("serialize quota analytics");
+
+        assert_eq!(
+            serialized.get("endpoint"),
+            Some(&serde_json::to_value(endpoint).expect("serialize endpoint"))
+        );
+        assert_eq!(
+            serialized
+                .get("observation_provider_id")
+                .and_then(serde_json::Value::as_str),
+            Some("usage-provider-a")
+        );
     }
 
     #[test]

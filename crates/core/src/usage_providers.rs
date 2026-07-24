@@ -48,6 +48,9 @@ const USAGE_PROVIDER_RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
 const USAGE_PROVIDER_TEMPLATE_MAX_DEPTH: usize = 32;
 const USAGE_PROVIDER_TEMPLATE_MAX_SEGMENTS: usize = 4_096;
 const USAGE_PROVIDER_TEMPLATE_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const USAGE_PROVIDER_MODEL_STATS_MAX_ITEMS: usize = 32;
+const USAGE_PROVIDER_MODEL_STAT_LABEL_MAX_CHARS: usize = 96;
+const USAGE_PROVIDER_RATE_VALUE_MAX_CHARS: usize = 64;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -3413,14 +3416,23 @@ fn first_bool_from_paths(
         .find_map(|path| json_value_at_path(value, path).and_then(bool_from_json))
 }
 
-fn first_decimal_string_from_paths(
+fn usage_rate_value_from_json(value: &serde_json::Value) -> Option<String> {
+    let value = decimal_string_from_json(value)?;
+    if value.chars().count() > USAGE_PROVIDER_RATE_VALUE_MAX_CHARS || value.starts_with('-') {
+        return None;
+    }
+
+    QuotaQuantity::from_decimal(&value, QuotaUnit::Raw).map(|_| value)
+}
+
+fn first_usage_rate_value_from_paths(
     value: &serde_json::Value,
     default_paths: &[&str],
 ) -> Option<String> {
     default_paths
         .iter()
         .copied()
-        .find_map(|path| json_value_at_path(value, path).and_then(decimal_string_from_json))
+        .find_map(|path| json_value_at_path(value, path).and_then(usage_rate_value_from_json))
 }
 
 fn string_from_json(value: &serde_json::Value) -> Option<String> {
@@ -4109,7 +4121,7 @@ fn sub2api_daily_subscription_usage_is_lazy_stale(value: &serde_json::Value) -> 
 
 fn sub2api_usage_rate(value: &serde_json::Value) -> Option<ProviderUsageRateSnapshot> {
     let rate = ProviderUsageRateSnapshot {
-        average_duration_ms: first_decimal_string_from_paths(
+        average_duration_ms: first_usage_rate_value_from_paths(
             value,
             &[
                 "usage.average_duration_ms",
@@ -4118,8 +4130,8 @@ fn sub2api_usage_rate(value: &serde_json::Value) -> Option<ProviderUsageRateSnap
                 "data.average_duration_ms",
             ],
         ),
-        rpm: first_decimal_string_from_paths(value, &["usage.rpm", "data.usage.rpm", "rpm"]),
-        tpm: first_decimal_string_from_paths(value, &["usage.tpm", "data.usage.tpm", "tpm"]),
+        rpm: first_usage_rate_value_from_paths(value, &["usage.rpm", "data.usage.rpm", "rpm"]),
+        tpm: first_usage_rate_value_from_paths(value, &["usage.tpm", "data.usage.tpm", "tpm"]),
     };
     (!rate.is_empty()).then_some(rate)
 }
@@ -4216,14 +4228,26 @@ fn sub2api_model_stats(value: &serde_json::Value) -> Vec<ProviderUsageModelStat>
     .map(|items| {
         items
             .iter()
+            .take(USAGE_PROVIDER_MODEL_STATS_MAX_ITEMS)
             .filter_map(sub2api_model_stat_from_json)
             .collect::<Vec<_>>()
     })
     .unwrap_or_default()
 }
 
+fn safe_usage_model_stat_label(value: &str) -> Option<String> {
+    let label = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(USAGE_PROVIDER_MODEL_STAT_LABEL_MAX_CHARS)
+        .collect::<String>();
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_string())
+}
+
 fn sub2api_model_stat_from_json(value: &serde_json::Value) -> Option<ProviderUsageModelStat> {
-    let model = first_string_from_paths(value, &["model", "model_name", "name"])?;
+    let model = first_string_from_paths(value, &["model", "model_name", "name"])
+        .and_then(|model| safe_usage_model_stat_label(&model))?;
     let input_cost = first_amount_from_paths(value, &[], &["input_cost_usd", "input_cost"], None);
     let output_cost =
         first_amount_from_paths(value, &[], &["output_cost_usd", "output_cost"], None);
@@ -10539,6 +10563,79 @@ mod tests {
                 ProviderUsageAlertKind::SubscriptionExpired,
             ]
         );
+    }
+
+    #[test]
+    fn sub2api_usage_snapshot_bounds_terminal_display_fields() {
+        let mut model_stats = (0..USAGE_PROVIDER_MODEL_STATS_MAX_ITEMS.saturating_add(8))
+            .map(|index| serde_json::json!({ "model": format!("model-{index}") }))
+            .collect::<Vec<_>>();
+        model_stats[0] = serde_json::json!({
+            "model": format!("\u{1b}[2J{}", "m".repeat(USAGE_PROVIDER_MODEL_STAT_LABEL_MAX_CHARS))
+        });
+
+        let snapshot = sub2api_usage_snapshot_from_json(
+            &provider("sub2api", ProviderKind::Sub2ApiUsage),
+            &upstream(),
+            &serde_json::json!({
+                "isValid": true,
+                "mode": "unrestricted",
+                "model_stats": model_stats,
+            }),
+            100,
+            Some(1_000),
+        );
+
+        assert_eq!(
+            snapshot.usage_model_stats.len(),
+            USAGE_PROVIDER_MODEL_STATS_MAX_ITEMS
+        );
+        let first_model = &snapshot.usage_model_stats[0].model;
+        assert_eq!(
+            first_model.chars().count(),
+            USAGE_PROVIDER_MODEL_STAT_LABEL_MAX_CHARS
+        );
+        assert!(first_model.starts_with("[2J"));
+        assert!(!first_model.chars().any(char::is_control));
+        assert!(
+            sub2api_model_stat_from_json(&serde_json::json!({
+                "model": "\u{1b}\n\r"
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn sub2api_usage_snapshot_omits_invalid_terminal_rate_values() {
+        let invalid_values = [
+            "\u{1b}[2J1".to_string(),
+            "-1".to_string(),
+            "not-a-number".to_string(),
+            "9".repeat(USAGE_PROVIDER_RATE_VALUE_MAX_CHARS.saturating_add(1)),
+        ];
+
+        for field in ["rpm", "tpm", "average_duration_ms"] {
+            for value in &invalid_values {
+                let mut usage = serde_json::Map::new();
+                usage.insert(field.to_string(), serde_json::Value::String(value.clone()));
+                let snapshot = sub2api_usage_snapshot_from_json(
+                    &provider("sub2api", ProviderKind::Sub2ApiUsage),
+                    &upstream(),
+                    &serde_json::json!({
+                        "isValid": true,
+                        "mode": "unrestricted",
+                        "usage": usage,
+                    }),
+                    100,
+                    Some(1_000),
+                );
+
+                assert!(
+                    snapshot.usage_rate.is_none(),
+                    "{field} must reject {value:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -11,10 +11,10 @@ use crate::tui::i18n;
 use crate::tui::model::{
     Palette, Snapshot, balance_snapshot_status_style, basename, dashboard_request_filtered_indices,
     duration_short, format_age, format_observed_client_identity, format_tok_per_second, now_ms,
-    request_cache_hit_rate_label, session_control_posture_lang,
+    request_cache_hit_rate_label, session_control_posture_lang, session_cwd_detail_lang,
     session_observation_scope_label_lang, session_observed_provider_balance_brief_lang,
     session_observed_provider_balance_snapshot, session_transcript_host_status_lang, short_sid,
-    shorten, shorten_middle, status_style, tokens_short, usage_line_lang,
+    shorten, status_style, tokens_short, usage_line_lang,
 };
 use crate::tui::state::UiState;
 use crate::tui::types::{Focus, Overlay};
@@ -276,8 +276,7 @@ fn render_session_details(
         })
         .unwrap_or_else(|| "-".to_string());
     let cwd = selected
-        .and_then(|r| r.cwd.as_deref())
-        .map(|s| shorten_middle(s, 64))
+        .map(|row| session_cwd_detail_lang(row, lang, 64))
         .unwrap_or_else(|| "-".to_string());
     let identity = selected
         .map(|r| session_observation_scope_label_lang(r.observation_scope, lang).to_string())

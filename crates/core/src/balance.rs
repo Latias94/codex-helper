@@ -31,6 +31,14 @@ pub struct ProviderBalanceSnapshot {
     pub observation_provider_id: String,
     pub provider_endpoint: ProviderEndpointKey,
     pub source: String,
+    /// Canonical quota-pool identity assigned when this snapshot is recorded.
+    ///
+    /// This is process-local association data. Operator read-model projections
+    /// replace it with an opaque key before crossing the credential boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_pool_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_pool_revision: Option<u64>,
     pub fetched_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_after_ms: Option<u64>,
@@ -179,6 +187,8 @@ impl Default for ProviderBalanceSnapshot {
             observation_provider_id: String::new(),
             provider_endpoint: ProviderEndpointKey::new("", "", ""),
             source: String::new(),
+            quota_pool_key: None,
+            quota_pool_revision: None,
             fetched_at_ms: 0,
             stale_after_ms: None,
             stale: false,

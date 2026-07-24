@@ -6,6 +6,8 @@ use std::time::Instant;
 use ratatui::prelude::{Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use codex_helper_core::balance::{ProviderUsageAlertKind, ProviderUsageWindow};
+
 use crate::dashboard_core::{
     OperatorLocalSessionMetadata, OperatorProviderBalanceSummary, OperatorProviderEndpointSummary,
     OperatorProviderSummary, OperatorReadData, OperatorRequestSummary, OperatorRoutingSummary,
@@ -406,7 +408,7 @@ pub(in crate::tui) fn balance_snapshot_status_style(
     p: Palette,
     snapshot: &ProviderBalanceSnapshot,
 ) -> Style {
-    if snapshot.routing_ignored_exhaustion() {
+    if snapshot.stale_at(now_ms()) || snapshot.routing_ignored_exhaustion() {
         Style::default().fg(p.warn)
     } else {
         balance_status_style(p, snapshot.status)
@@ -803,17 +805,26 @@ fn balance_status_brief_lang(status: BalanceSnapshotStatus, lang: Language) -> &
         BalanceSnapshotStatus::Ok => i18n::label(lang, "ok"),
         BalanceSnapshotStatus::Exhausted => i18n::label(lang, "exh"),
         BalanceSnapshotStatus::Stale => i18n::label(lang, "stale"),
-        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => {
-            i18n::label(lang, "unknown")
-        }
+        BalanceSnapshotStatus::Error => i18n::label(lang, "error"),
+        BalanceSnapshotStatus::Unknown => i18n::label(lang, "unknown"),
     }
+}
+
+fn balance_snapshot_has_current_amount(snapshot: &ProviderBalanceSnapshot) -> bool {
+    !snapshot.stale_at(now_ms())
+        && matches!(
+            snapshot.status,
+            BalanceSnapshotStatus::Ok | BalanceSnapshotStatus::Exhausted
+        )
 }
 
 fn balance_snapshot_status_brief_lang(
     snapshot: &ProviderBalanceSnapshot,
     lang: Language,
 ) -> &'static str {
-    if snapshot.routing_ignored_exhaustion() {
+    if snapshot.stale_at(now_ms()) {
+        i18n::label(lang, "stale")
+    } else if snapshot.routing_ignored_exhaustion() {
         i18n::label(lang, "lazy")
     } else {
         balance_status_brief_lang(snapshot.status, lang)
@@ -829,9 +840,8 @@ pub(in crate::tui) fn balance_status_label_lang(
         BalanceSnapshotStatus::Ok => i18n::label(lang, "ok"),
         BalanceSnapshotStatus::Exhausted => i18n::label(lang, "exhausted"),
         BalanceSnapshotStatus::Stale => i18n::label(lang, "stale"),
-        BalanceSnapshotStatus::Error | BalanceSnapshotStatus::Unknown => {
-            i18n::label(lang, "unknown")
-        }
+        BalanceSnapshotStatus::Error => i18n::label(lang, "error"),
+        BalanceSnapshotStatus::Unknown => i18n::label(lang, "unknown"),
     }
 }
 
@@ -847,7 +857,9 @@ pub(in crate::tui) fn balance_snapshot_status_label_lang(
     snapshot: &ProviderBalanceSnapshot,
     lang: Language,
 ) -> &'static str {
-    if snapshot.routing_ignored_exhaustion() {
+    if snapshot.stale_at(now_ms()) {
+        i18n::label(lang, "stale")
+    } else if snapshot.routing_ignored_exhaustion() {
         i18n::label(lang, "lazy reset")
     } else {
         balance_status_label_lang(snapshot.status, lang)
@@ -867,6 +879,10 @@ pub(in crate::tui) fn provider_balance_compact_lang(
     max_width: usize,
     lang: Language,
 ) -> String {
+    if !balance_snapshot_has_current_amount(snapshot) {
+        return balance_atomic_fallback(snapshot, max_width, lang);
+    }
+
     let status = (snapshot.status != BalanceSnapshotStatus::Ok)
         .then(|| balance_snapshot_status_brief_lang(snapshot, lang).to_string());
     let plan = snapshot
@@ -930,6 +946,189 @@ pub(in crate::tui) fn provider_balance_compact_lang(
     balance_atomic_fallback(snapshot, max_width, lang)
 }
 
+pub(in crate::tui) fn provider_usage_source_label_lang(
+    source: &str,
+    lang: Language,
+) -> &'static str {
+    match source.trim() {
+        "usage_provider:sub2api_usage" => "Sub2API usage API",
+        "usage_provider:sub2api_auth_me" => "Sub2API account API",
+        "usage_provider:openai_balance_http_json" => "OpenAI balance API",
+        "usage_provider:openai_organization_costs" => "OpenAI organization costs API",
+        "usage_provider:new_api_token_usage" => "New API token usage API",
+        "usage_provider:new_api_user_self" => "New API user API",
+        "usage_provider:rightcode_account_summary" => "RightCode account API",
+        "usage_provider:budget_http_json" => match lang {
+            Language::Zh => "预算用量 API",
+            Language::En => "budget usage API",
+        },
+        "usage_provider:yescode_profile" => match lang {
+            Language::Zh => "YesCode 账户 API",
+            Language::En => "YesCode account API",
+        },
+        "usage_provider:auto_balance" => match lang {
+            Language::Zh => "自动余额探测",
+            Language::En => "automatic balance probe",
+        },
+        "" => match lang {
+            Language::Zh => "未提供来源",
+            Language::En => "source unavailable",
+        },
+        _ => match lang {
+            Language::Zh => "已标注用量适配器",
+            Language::En => "named usage adapter",
+        },
+    }
+}
+
+pub(in crate::tui) fn provider_usage_report_is_current(snapshot: &ProviderBalanceSnapshot) -> bool {
+    !snapshot.stale_at(now_ms())
+        && matches!(
+            snapshot.status,
+            BalanceSnapshotStatus::Ok | BalanceSnapshotStatus::Exhausted
+        )
+}
+
+pub(in crate::tui) fn has_current_upstream_usage_report(
+    snapshot: &ProviderBalanceSnapshot,
+) -> bool {
+    provider_usage_report_is_current(snapshot)
+        && (!snapshot.source.trim().is_empty()
+            || snapshot.usage_rate.is_some()
+            || !snapshot.usage_windows.is_empty()
+            || !snapshot.usage_model_stats.is_empty()
+            || !snapshot.usage_alerts.is_empty())
+}
+
+pub(in crate::tui) fn provider_usage_rate_summary_lang(
+    snapshot: &ProviderBalanceSnapshot,
+    lang: Language,
+) -> Option<String> {
+    let rate = snapshot.usage_rate.as_ref()?;
+    let mut parts = Vec::new();
+    if let Some(rpm) = rate.rpm.as_deref().and_then(non_empty) {
+        parts.push(format!("RPM {rpm}"));
+    }
+    if let Some(tpm) = rate.tpm.as_deref().and_then(non_empty) {
+        parts.push(format!("TPM {tpm}"));
+    }
+    if let Some(duration_ms) = rate.average_duration_ms.as_deref().and_then(non_empty) {
+        parts.push(match lang {
+            Language::Zh => format!("平均 {duration_ms}ms"),
+            Language::En => format!("avg {duration_ms}ms"),
+        });
+    }
+    (!parts.is_empty()).then(|| parts.join("  "))
+}
+
+pub(in crate::tui) fn provider_usage_window_summary_lang(
+    window: &ProviderUsageWindow,
+    lang: Language,
+) -> String {
+    let period = match (window.period.as_str(), lang) {
+        ("daily", Language::Zh) => "每日",
+        ("weekly", Language::Zh) => "每周",
+        ("monthly", Language::Zh) => "每月",
+        (period, _) => period,
+    };
+    let used = window
+        .used_usd
+        .as_deref()
+        .and_then(non_empty)
+        .map(usd_brief)
+        .unwrap_or_else(|| "-".to_string());
+    if window.unlimited == Some(true) {
+        return match lang {
+            Language::Zh => format!("{period} 已用 {used} / 不限额度"),
+            Language::En => format!("{period} used {used} / unlimited"),
+        };
+    }
+    let remaining = window
+        .remaining_usd
+        .as_deref()
+        .and_then(non_empty)
+        .map(usd_brief)
+        .unwrap_or_else(|| "-".to_string());
+    let limit = window
+        .limit_usd
+        .as_deref()
+        .and_then(non_empty)
+        .map(usd_brief)
+        .unwrap_or_else(|| "-".to_string());
+    match lang {
+        Language::Zh => format!("{period} 已用 {used} 剩余 {remaining} / {limit}"),
+        Language::En => format!("{period} used {used} left {remaining} / {limit}"),
+    }
+}
+
+fn usage_usd_brief(raw: &str) -> String {
+    let amount = usd_brief(raw);
+    amount
+        .strip_suffix(".00")
+        .unwrap_or(amount.as_str())
+        .to_string()
+}
+
+pub(in crate::tui) fn provider_usage_window_brief_lang(
+    window: &ProviderUsageWindow,
+    lang: Language,
+) -> String {
+    let period = match (window.period.as_str(), lang) {
+        ("daily", Language::Zh) => "每日",
+        ("weekly", Language::Zh) => "每周",
+        ("monthly", Language::Zh) => "每月",
+        (period, _) => period,
+    };
+    let used = window
+        .used_usd
+        .as_deref()
+        .and_then(non_empty)
+        .map(usage_usd_brief)
+        .unwrap_or_else(|| "-".to_string());
+    if window.unlimited == Some(true) {
+        return match lang {
+            Language::Zh => format!("{period} {used} / 不限"),
+            Language::En => format!("{period} {used} / unlimited"),
+        };
+    }
+    let remaining = window
+        .remaining_usd
+        .as_deref()
+        .and_then(non_empty)
+        .map(usage_usd_brief)
+        .unwrap_or_else(|| "-".to_string());
+    let limit = window
+        .limit_usd
+        .as_deref()
+        .and_then(non_empty)
+        .map(usage_usd_brief)
+        .unwrap_or_else(|| "-".to_string());
+    match lang {
+        Language::Zh => format!("{period} {used}/{limit} 余 {remaining}"),
+        Language::En => format!("{period} {used}/{limit} left {remaining}"),
+    }
+}
+
+pub(in crate::tui) fn provider_usage_alert_label_lang(
+    alert: ProviderUsageAlertKind,
+    lang: Language,
+) -> &'static str {
+    match (alert, lang) {
+        (ProviderUsageAlertKind::DailyUsage80, Language::Zh) => "日额度已用 80%",
+        (ProviderUsageAlertKind::DailyUsage80, Language::En) => "daily quota at 80%",
+        (ProviderUsageAlertKind::DailyUsage95, Language::Zh) => "日额度已用 95%",
+        (ProviderUsageAlertKind::DailyUsage95, Language::En) => "daily quota at 95%",
+        (ProviderUsageAlertKind::LowBalance, Language::Zh) => "余额偏低",
+        (ProviderUsageAlertKind::LowBalance, Language::En) => "low balance",
+        (ProviderUsageAlertKind::SubscriptionExpiringSoon, Language::Zh) => "订阅即将到期",
+        (ProviderUsageAlertKind::SubscriptionExpiringSoon, Language::En) => {
+            "subscription expiring soon"
+        }
+        (ProviderUsageAlertKind::SubscriptionExpired, Language::Zh) => "订阅已到期",
+        (ProviderUsageAlertKind::SubscriptionExpired, Language::En) => "subscription expired",
+    }
+}
+
 fn push_balance_candidate(candidates: &mut Vec<String>, candidate: String) {
     if !candidate.is_empty() && !candidates.iter().any(|existing| existing == &candidate) {
         candidates.push(candidate);
@@ -966,6 +1165,47 @@ pub(in crate::tui) fn provider_endpoint_balance_snapshot<'a>(
         })
 }
 
+/// Returns the one coherent current upstream report for an endpoint.
+///
+/// A balance row may be selected for ordinary routing status even when several
+/// observers report it. Usage telemetry is more specific: present it only when
+/// every current report agrees on its observer, source, and canonical pool.
+pub(in crate::tui) fn provider_endpoint_current_usage_report_snapshot<'a>(
+    provider_balances: &'a HashMap<String, Vec<ProviderBalanceSnapshot>>,
+    provider_id: &str,
+    endpoint_id: &str,
+) -> Option<&'a ProviderBalanceSnapshot> {
+    let mut reports = provider_balances
+        .get(provider_id)?
+        .iter()
+        .filter(|snapshot| {
+            snapshot.provider_endpoint.provider_id == provider_id
+                && snapshot.provider_endpoint.endpoint_id == endpoint_id
+                && has_current_upstream_usage_report(snapshot)
+        });
+    let first = reports.next()?;
+    let observation_provider_id = first.observation_provider_id.as_str();
+    let source = first.source.as_str();
+    let quota_pool_key = first.quota_pool_key.as_deref();
+    let quota_pool_revision = first.quota_pool_revision;
+    let mut selected = first;
+
+    for report in reports {
+        if report.observation_provider_id != observation_provider_id
+            || report.source != source
+            || report.quota_pool_key.as_deref() != quota_pool_key
+            || report.quota_pool_revision != quota_pool_revision
+        {
+            return None;
+        }
+        if report.fetched_at_ms > selected.fetched_at_ms {
+            selected = report;
+        }
+    }
+    Some(selected)
+}
+
+#[cfg(test)]
 fn primary_balance_snapshot(
     balances: &[ProviderBalanceSnapshot],
 ) -> Option<&ProviderBalanceSnapshot> {
@@ -1012,24 +1252,34 @@ pub(in crate::tui) fn provider_balance_brief_lang(
     }
 
     let total = balances.len();
+    let observed_now = now_ms();
     let ok = balances
         .iter()
-        .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Ok)
+        .filter(|snapshot| {
+            snapshot.status == BalanceSnapshotStatus::Ok && !snapshot.stale_at(observed_now)
+        })
         .count();
     let stale = balances
         .iter()
-        .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Stale)
+        .filter(|snapshot| {
+            snapshot.status != BalanceSnapshotStatus::Error
+                && (snapshot.status == BalanceSnapshotStatus::Stale
+                    || snapshot.stale_at(observed_now))
+        })
         .count();
     let exhausted = balances
         .iter()
         .filter(|snapshot| {
             snapshot.status == BalanceSnapshotStatus::Exhausted
+                && !snapshot.stale_at(observed_now)
                 && !snapshot.routing_ignored_exhaustion()
         })
         .count();
     let lazy_exhausted = balances
         .iter()
-        .filter(|snapshot| snapshot.routing_ignored_exhaustion())
+        .filter(|snapshot| {
+            snapshot.routing_ignored_exhaustion() && !snapshot.stale_at(observed_now)
+        })
         .count();
     let error = balances
         .iter()
@@ -1039,9 +1289,27 @@ pub(in crate::tui) fn provider_balance_brief_lang(
         .iter()
         .filter(|snapshot| snapshot.status == BalanceSnapshotStatus::Unknown)
         .count();
-    let displayed_unknown = unknown + error;
-
-    let primary = primary_balance_snapshot(balances);
+    let primary = balances.iter().filter(|snapshot| {
+        !snapshot.stale_at(observed_now)
+            && matches!(
+                snapshot.status,
+                BalanceSnapshotStatus::Ok | BalanceSnapshotStatus::Exhausted
+            )
+    });
+    let primary = primary.min_by(|left, right| {
+        balance_snapshot_rank(left)
+            .cmp(&balance_snapshot_rank(right))
+            .then_with(|| {
+                left.provider_endpoint
+                    .endpoint_id
+                    .cmp(&right.provider_endpoint.endpoint_id)
+            })
+            .then_with(|| {
+                left.observation_provider_id
+                    .cmp(&right.observation_provider_id)
+            })
+            .then_with(|| right.fetched_at_ms.cmp(&left.fetched_at_ms))
+    });
     let primary_amount = primary.and_then(|snapshot| balance_amount_brief_lang(snapshot, lang));
     let primary_terse_amount =
         primary.and_then(|snapshot| balance_amount_terse_lang(snapshot, lang));
@@ -1054,10 +1322,14 @@ pub(in crate::tui) fn provider_balance_brief_lang(
             parts.push(format!("{} {ok}/{total}", i18n::label(lang, "ok")));
         } else if stale > 0 {
             parts.push(format!("{} {stale}/{total}", i18n::label(lang, "stale")));
-        } else if displayed_unknown > 0 {
+        } else if error > 0 && unknown == 0 {
+            parts.push(format!("{} {error}/{total}", i18n::label(lang, "error")));
+        } else if unknown + error > 0 {
             parts.push(format!(
-                "{} {displayed_unknown}/{total}",
-                i18n::label(lang, "unknown")
+                "{} {}/{}",
+                i18n::label(lang, "unknown"),
+                unknown + error,
+                total
             ));
         } else if lazy_exhausted > 0 {
             parts.push(format!(
@@ -1080,7 +1352,7 @@ pub(in crate::tui) fn provider_balance_brief_lang(
         parts.push(format!("{} {lazy_exhausted}", i18n::label(lang, "lazy")));
     }
     if error > 0 && (ok > 0 || stale > 0 || unknown > 0 || exhausted > 0 || lazy_exhausted > 0) {
-        parts.push(format!("{} {error}", i18n::label(lang, "unknown")));
+        parts.push(format!("{} {error}", i18n::label(lang, "error")));
     }
 
     if parts.is_empty() {
@@ -1090,10 +1362,14 @@ pub(in crate::tui) fn provider_balance_brief_lang(
             i18n::label(lang, "ok").to_string()
         } else if stale > 0 {
             format!("{} {stale}/{total}", i18n::label(lang, "stale"))
-        } else if displayed_unknown > 0 {
+        } else if error > 0 && unknown == 0 {
+            format!("{} {error}/{total}", i18n::label(lang, "error"))
+        } else if unknown + error > 0 {
             format!(
-                "{} {displayed_unknown}/{total}",
-                i18n::label(lang, "unknown")
+                "{} {}/{}",
+                i18n::label(lang, "unknown"),
+                unknown + error,
+                total
             )
         } else if lazy_exhausted > 0 {
             format!("{} {lazy_exhausted}/{total}", i18n::label(lang, "lazy"))
@@ -1437,6 +1713,27 @@ pub(in crate::tui) fn session_observation_scope_label_lang(
     }
 }
 
+pub(in crate::tui) fn session_cwd_detail_lang(
+    row: &SessionRow,
+    lang: Language,
+    max_width: usize,
+) -> String {
+    if let Some(cwd) = row.cwd.as_deref().and_then(non_empty) {
+        return shorten_middle(cwd, max_width);
+    }
+    match (row.observation_scope, lang) {
+        (SessionObservationScope::ObservedOnly, Language::Zh) => "不可用（仅代理观测）",
+        (SessionObservationScope::ObservedOnly, Language::En) => {
+            "unavailable (proxy-observed only)"
+        }
+        (SessionObservationScope::HostLocalEnriched, Language::Zh) => "本机元数据未记录",
+        (SessionObservationScope::HostLocalEnriched, Language::En) => {
+            "not recorded in host-local metadata"
+        }
+    }
+    .to_string()
+}
+
 pub(in crate::tui) fn session_transcript_host_status_lang(
     row: &SessionRow,
     lang: Language,
@@ -1669,7 +1966,9 @@ fn operator_provider_balances(
                     &balance.provider_id,
                     &balance.endpoint_id,
                 ),
-                source: "operator_read_model".to_string(),
+                source: balance.source.clone(),
+                quota_pool_key: balance.quota_pool_key.clone(),
+                quota_pool_revision: balance.quota_pool_revision,
                 fetched_at_ms: balance.fetched_at_ms,
                 stale_after_ms: balance.stale_after_ms,
                 stale: balance.stale,
@@ -1884,6 +2183,9 @@ mod tests {
             "provider_id": provider_id,
             "endpoint_id": endpoint_id,
             "provider_endpoint_key": provider_endpoint_key,
+            "source": "usage_provider:sub2api_usage",
+            "quota_pool_key": "credential:sha256:test",
+            "quota_pool_revision": 4,
             "fetched_at_ms": 100,
             "stale": false,
             "status": "ok",
@@ -1909,6 +2211,12 @@ mod tests {
             .and_then(|balances| balances.first())
             .expect("canonical provider balance");
         assert_eq!(snapshot.observation_provider_id, "quota-observer");
+        assert_eq!(snapshot.source, "usage_provider:sub2api_usage");
+        assert_eq!(
+            snapshot.quota_pool_key.as_deref(),
+            Some("credential:sha256:test")
+        );
+        assert_eq!(snapshot.quota_pool_revision, Some(4));
         assert_eq!(
             snapshot.provider_endpoint,
             ProviderEndpointKey::new("codex", "input", "responses")
@@ -1928,6 +2236,29 @@ mod tests {
             .expect("provider balance");
 
         assert_eq!(snapshot.error.as_deref(), Some("authentication failed"));
+    }
+
+    #[test]
+    fn operator_provider_balances_preserve_unknown_source_for_legacy_operator_payloads() {
+        let balance = serde_json::from_value::<OperatorProviderBalanceSummary>(serde_json::json!({
+            "observation_provider_id": "quota-observer",
+            "provider_id": "input",
+            "endpoint_id": "responses",
+            "provider_endpoint_key": "opaque:key",
+            "fetched_at_ms": 100,
+            "stale": false,
+            "status": "ok",
+            "exhaustion_affects_routing": true
+        }))
+        .expect("legacy operator balance summary");
+
+        let grouped = operator_provider_balances("codex", &[balance]);
+        let snapshot = grouped
+            .get("input")
+            .and_then(|balances| balances.first())
+            .expect("provider balance");
+
+        assert!(snapshot.source.is_empty());
     }
 
     #[test]
@@ -2411,6 +2742,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_balance_compact_hides_amounts_when_the_snapshot_is_not_current() {
+        for (status, label) in [
+            (BalanceSnapshotStatus::Error, "error"),
+            (BalanceSnapshotStatus::Stale, "stale"),
+        ] {
+            let snapshot = ProviderBalanceSnapshot {
+                status,
+                quota_period: Some("daily".to_string()),
+                quota_remaining_usd: Some("5".to_string()),
+                quota_limit_usd: Some("100".to_string()),
+                ..ProviderBalanceSnapshot::default()
+            };
+
+            for width in [9, 80] {
+                let value = provider_balance_compact(&snapshot, width);
+                assert_eq!(value, label, "status={status:?}, width={width}");
+                assert!(!value.contains('$'), "{value}");
+            }
+        }
+
+        let stale_exhausted = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Exhausted,
+            exhausted: Some(true),
+            stale_after_ms: Some(0),
+            quota_remaining_usd: Some("0".to_string()),
+            quota_limit_usd: Some("100".to_string()),
+            ..ProviderBalanceSnapshot::default()
+        };
+        assert_eq!(provider_balance_compact(&stale_exhausted, 80), "stale");
+    }
+
+    #[test]
+    fn provider_balance_brief_hides_carried_amounts_when_all_observers_failed() {
+        let failed = ProviderBalanceSnapshot {
+            status: BalanceSnapshotStatus::Error,
+            quota_period: Some("daily".to_string()),
+            quota_remaining_usd: Some("5".to_string()),
+            quota_limit_usd: Some("100".to_string()),
+            ..balance_identity("observer-a", "input", "default")
+        };
+        let mut second = failed.clone();
+        second.observation_provider_id = "observer-b".to_string();
+        let balances = HashMap::from([("input".to_string(), vec![failed, second])]);
+
+        let value = provider_balance_brief(&balances, "input", 80);
+        assert_eq!(value, "error 2/2");
+        assert!(!value.contains('$'), "{value}");
+    }
+
+    #[test]
     fn provider_balance_compact_marks_ignored_exhaustion_as_lazy() {
         let snapshot = ProviderBalanceSnapshot {
             status: BalanceSnapshotStatus::Exhausted,
@@ -2478,6 +2859,49 @@ mod tests {
         assert_eq!(
             provider_balance_brief(&balances, "input", 80),
             "lazy daily left $0 / $100.00"
+        );
+    }
+
+    #[test]
+    fn endpoint_usage_report_requires_a_coherent_current_observation() {
+        let observed_at = now_ms();
+        let base = ProviderBalanceSnapshot {
+            observation_provider_id: "observer-a".to_string(),
+            provider_endpoint: ProviderEndpointKey::new("codex", "input", "default"),
+            source: "usage_provider:sub2api_usage".to_string(),
+            quota_pool_key: Some("quota-pool:sha256:one".to_string()),
+            quota_pool_revision: Some(4),
+            fetched_at_ms: observed_at,
+            stale_after_ms: observed_at.checked_add(60_000),
+            status: BalanceSnapshotStatus::Ok,
+            ..ProviderBalanceSnapshot::default()
+        };
+        let mut conflicting = base.clone();
+        conflicting.observation_provider_id = "observer-b".to_string();
+        conflicting.fetched_at_ms = observed_at.saturating_add(1);
+        let mut balances = HashMap::from([("input".to_string(), vec![base.clone(), conflicting])]);
+
+        assert!(
+            provider_endpoint_current_usage_report_snapshot(&balances, "input", "default")
+                .is_none()
+        );
+
+        {
+            let reports = balances.get_mut("input").expect("input reports");
+            reports[1].observation_provider_id = "observer-a".to_string();
+            reports[1].source = "usage_provider:new_api_token_usage".to_string();
+        }
+        assert!(
+            provider_endpoint_current_usage_report_snapshot(&balances, "input", "default")
+                .is_none()
+        );
+
+        balances.get_mut("input").expect("input reports")[1].source =
+            "usage_provider:sub2api_usage".to_string();
+        assert_eq!(
+            provider_endpoint_current_usage_report_snapshot(&balances, "input", "default")
+                .map(|snapshot| snapshot.fetched_at_ms),
+            Some(observed_at.saturating_add(1))
         );
     }
 

@@ -113,13 +113,20 @@ pub(super) async fn mutate_operator_routing(
             provider_id,
             endpoint_id,
         } => {
+            if request.expected_policy_revision != provider_policy.policy_revision {
+                return Ok(OperatorRoutingMutationResponse {
+                    status: OperatorRoutingMutationStatus::Conflict,
+                    routing: current,
+                });
+            }
             let target = candidate_key(proxy.service_name, &template, provider_id, endpoint_id)?;
             proxy
                 .state
-                .compare_and_set_new_session_preference(
+                .compare_and_set_new_session_preference_for_policy(
                     proxy.service_name,
                     route_graph_key,
                     request.expected_control_revision,
+                    request.expected_policy_revision,
                     Some(target),
                 )
                 .await
@@ -423,6 +430,41 @@ mod tests {
             .await
             .expect("stale policy conflict");
         assert_eq!(stale.status, OperatorRoutingMutationStatus::Conflict);
+    }
+
+    #[tokio::test]
+    async fn new_session_preference_rejects_stale_provider_policy() {
+        let (proxy, routing) = proxy_and_routing().await;
+        let drained = mutate_operator_routing(
+            &proxy,
+            request(
+                &routing,
+                OperatorRoutingCommand::SetEndpointMode {
+                    provider_id: "input".to_string(),
+                    endpoint_id: "fast".to_string(),
+                    mode: OperatorEndpointMode::Draining,
+                },
+            ),
+        )
+        .await
+        .expect("drain endpoint");
+        assert_eq!(drained.status, OperatorRoutingMutationStatus::Applied);
+
+        let stale = mutate_operator_routing(
+            &proxy,
+            request(
+                &routing,
+                OperatorRoutingCommand::SetNewSessionPreference {
+                    provider_id: "input".to_string(),
+                    endpoint_id: "fast".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("stale preference response");
+
+        assert_eq!(stale.status, OperatorRoutingMutationStatus::Conflict);
+        assert!(stale.routing.new_session_preference.is_none());
     }
 
     #[tokio::test]

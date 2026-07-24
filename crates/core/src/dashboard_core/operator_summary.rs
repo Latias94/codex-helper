@@ -753,6 +753,12 @@ pub struct OperatorProviderBalanceSummary {
     pub provider_id: String,
     pub endpoint_id: String,
     pub provider_endpoint_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_pool_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_pool_revision: Option<u64>,
     pub fetched_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_after_ms: Option<u64>,
@@ -821,6 +827,12 @@ impl From<&ProviderBalanceSnapshot> for OperatorProviderBalanceSummary {
                 "endpoint",
                 snapshot.provider_endpoint.stable_key().as_str(),
             ),
+            source: snapshot.source.clone(),
+            quota_pool_key: snapshot
+                .quota_pool_key
+                .as_deref()
+                .map(|key| opaque_operator_key("quota-pool", key)),
+            quota_pool_revision: snapshot.quota_pool_revision,
             fetched_at_ms: snapshot.fetched_at_ms,
             stale_after_ms: snapshot.stale_after_ms,
             stale: snapshot.stale,
@@ -1104,6 +1116,7 @@ pub fn redact_operator_usage_summaries(
 
 pub fn redact_operator_quota_analytics(mut analytics: QuotaAnalyticsView) -> QuotaAnalyticsView {
     for pool in &mut analytics.pools {
+        pool.identity.key = opaque_operator_key("quota-pool", &pool.identity.key);
         for row in &mut pool.reconciliation.projects {
             row.project.path = row
                 .project
@@ -1556,6 +1569,70 @@ mod tests {
         assert!(!format!("{projected:?}").contains(CANARY));
     }
 
+    #[test]
+    fn provider_balance_projection_preserves_usage_provider_source() {
+        const RAW_POOL_KEY: &str = "explicit:https://relay.example:account:operator-pool-secret";
+        let snapshot = ProviderBalanceSnapshot {
+            source: "usage_provider:sub2api_usage".to_string(),
+            quota_pool_key: Some(RAW_POOL_KEY.to_string()),
+            quota_pool_revision: Some(4),
+            ..ProviderBalanceSnapshot::default()
+        };
+
+        let projected = OperatorProviderBalanceSummary::from(&snapshot);
+        let serialized = serde_json::to_value(projected).expect("serialize balance projection");
+
+        assert_eq!(
+            serialized.get("source").and_then(serde_json::Value::as_str),
+            Some("usage_provider:sub2api_usage")
+        );
+        let pool_key = serialized
+            .get("quota_pool_key")
+            .and_then(serde_json::Value::as_str)
+            .expect("opaque quota-pool key");
+        assert!(pool_key.starts_with("quota-pool:sha256:"));
+        assert_ne!(pool_key, RAW_POOL_KEY);
+        assert!(!pool_key.contains("operator-pool-secret"));
+        assert_eq!(
+            serialized
+                .get("quota_pool_revision")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn operator_balance_and_quota_projections_share_an_opaque_pool_key() {
+        const RAW_POOL_KEY: &str = "explicit:https://relay.example:account:operator-pool-secret";
+        let balance = OperatorProviderBalanceSummary::from(&ProviderBalanceSnapshot {
+            quota_pool_key: Some(RAW_POOL_KEY.to_string()),
+            quota_pool_revision: Some(4),
+            ..ProviderBalanceSnapshot::default()
+        });
+        let mut analytics = QuotaAnalyticsView::default();
+        analytics
+            .pools
+            .push(crate::quota_analytics::PoolQuotaAnalytics {
+                identity: crate::quota_pool::PoolIdentity {
+                    key: RAW_POOL_KEY.to_string(),
+                    revision: 4,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        let analytics = redact_operator_quota_analytics(analytics);
+
+        assert_eq!(
+            balance.quota_pool_key.as_deref(),
+            Some(analytics.pools[0].identity.key.as_str())
+        );
+        assert_eq!(
+            balance.quota_pool_revision,
+            Some(analytics.pools[0].identity.revision)
+        );
+    }
+
     fn ready_operator_model() -> OperatorReadModel {
         OperatorReadModel::ready(
             "codex",
@@ -1661,6 +1738,8 @@ mod tests {
     fn operator_quota_analytics_redacts_project_paths() {
         let mut analytics = QuotaAnalyticsView::default();
         let mut pool = crate::quota_analytics::PoolQuotaAnalytics::default();
+        pool.identity.key =
+            "explicit:https://relay.example:account:operator-pool-secret".to_string();
         pool.reconciliation.projects = vec![crate::quota_analytics::QuotaProjectRow {
             project: crate::sessions::ProjectIdentity {
                 kind: crate::sessions::ProjectIdentityKind::GitRoot,
@@ -1672,6 +1751,19 @@ mod tests {
 
         let redacted = redact_operator_quota_analytics(analytics);
         let project = &redacted.pools[0].reconciliation.projects[0].project;
+
+        assert!(
+            redacted.pools[0]
+                .identity
+                .key
+                .starts_with("quota-pool:sha256:")
+        );
+        assert!(
+            !redacted.pools[0]
+                .identity
+                .key
+                .contains("operator-pool-secret")
+        );
 
         assert_eq!(project.kind, crate::sessions::ProjectIdentityKind::GitRoot);
         assert!(

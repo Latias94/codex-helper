@@ -4,14 +4,88 @@ use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
+use crate::state::ProviderBalanceSnapshot;
 use crate::tui::ProviderOption;
 use crate::tui::i18n;
 use crate::tui::model::{
-    Palette, Snapshot, provider_balance_brief_lang, provider_balance_compact_lang,
-    provider_endpoint_balance_snapshot, shorten_middle,
+    Palette, Snapshot, format_age, has_current_upstream_usage_report, now_ms,
+    provider_balance_brief_lang, provider_balance_compact_lang, provider_endpoint_balance_snapshot,
+    provider_endpoint_current_usage_report_snapshot, provider_usage_alert_label_lang,
+    provider_usage_rate_summary_lang, provider_usage_source_label_lang,
+    provider_usage_window_summary_lang, shorten_middle,
 };
 use crate::tui::state::UiState;
 use crate::tui::view::widgets::{centered_rect, max_wrapped_vertical_scroll};
+
+fn push_upstream_usage_report_lines(
+    lines: &mut Vec<Line<'static>>,
+    p: Palette,
+    lang: crate::tui::Language,
+    balance: &ProviderBalanceSnapshot,
+) {
+    if !has_current_upstream_usage_report(balance) {
+        return;
+    }
+
+    let label = |zh: &'static str, en: &'static str| match lang {
+        crate::tui::Language::Zh => zh,
+        crate::tui::Language::En => en,
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        label("上游用量报告", "Upstream usage report"),
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(format!(
+        "  source={}  age={}",
+        provider_usage_source_label_lang(&balance.source, lang),
+        format_age(now_ms(), Some(balance.fetched_at_ms))
+    )));
+    if let Some(rate) = provider_usage_rate_summary_lang(balance, lang) {
+        lines.push(Line::from(format!(
+            "  {}={rate}",
+            label("接口遥测", "telemetry")
+        )));
+    }
+    for window in balance.usage_windows.iter().take(3) {
+        lines.push(Line::from(format!(
+            "  {}",
+            provider_usage_window_summary_lang(window, lang)
+        )));
+    }
+    if !balance.usage_alerts.is_empty() {
+        let alerts = balance
+            .usage_alerts
+            .iter()
+            .map(|alert| provider_usage_alert_label_lang(alert.kind, lang))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(Span::styled(
+            format!("  {}={alerts}", label("告警", "alerts")),
+            Style::default().fg(p.warn),
+        )));
+    }
+    for model in balance.usage_model_stats.iter().take(4) {
+        let mut fields = Vec::new();
+        if let Some(requests) = model.request_count {
+            fields.push(format!("req={requests}"));
+        }
+        if let Some(tokens) = model.total_tokens {
+            fields.push(format!("tokens={tokens}"));
+        }
+        if let Some(cost) = model.total_cost_usd.as_deref() {
+            fields.push(format!("cost=${cost}"));
+        }
+        if !fields.is_empty() {
+            lines.push(Line::from(format!(
+                "  {} {} {}",
+                label("模型", "model"),
+                model.model,
+                fields.join(" ")
+            )));
+        }
+    }
+}
 
 pub(in crate::tui::view) fn render_provider_info_modal(
     f: &mut Frame<'_>,
@@ -132,6 +206,11 @@ pub(in crate::tui::view) fn render_provider_info_modal(
                 provider.name.as_str(),
                 endpoint_id,
             );
+            let usage_report = provider_endpoint_current_usage_report_snapshot(
+                &snapshot.provider_balances,
+                provider.name.as_str(),
+                endpoint_id,
+            );
             let capacity = match (endpoint.capacity.active, endpoint.capacity.limit) {
                 (Some(active), Some(limit)) => format!("{active}/{limit}"),
                 (None, Some(limit)) => format!("-/{limit}"),
@@ -222,6 +301,9 @@ pub(in crate::tui::view) fn render_provider_info_modal(
                     .map(|balance| provider_balance_compact_lang(balance, 84, ui.language))
                     .unwrap_or_else(|| "-".to_string())
             )));
+            if let Some(balance) = usage_report {
+                push_upstream_usage_report_lines(&mut lines, p, ui.language, balance);
+            }
             lines.push(Line::from(format!(
                 "  route path: {}",
                 candidate
