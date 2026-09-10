@@ -196,6 +196,48 @@ async fn send_responses_json(
         .expect("request json")
 }
 
+#[tokio::test]
+async fn responses_preserves_codex_user_agent_for_client_validation() {
+    use harness::{spawn_test_proxy, spawn_test_upstream};
+
+    const USER_AGENT: &str = "codex_exec/0.153.4 (Windows 10.0.26100; x86_64)";
+    let upstream = spawn_test_upstream(axum::Router::new().route(
+        "/v1/responses",
+        post(|headers: HeaderMap| async move {
+            if headers.get("user-agent") != Some(&HeaderValue::from_static(USER_AGENT))
+                || headers.get("originator") != Some(&HeaderValue::from_static("codex_exec"))
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": {"message": "Standard Codex client required"}
+                    })),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": "resp_client_validation", "status": "completed", "output": []
+                })),
+            )
+        }),
+    ));
+    let proxy = spawn_test_proxy(make_proxy_config(
+        vec![upstream.upstream_config()],
+        RetryConfig::default(),
+    ));
+    let response = Client::new()
+        .post(proxy.responses_url())
+        .header("user-agent", USER_AGENT)
+        .header("originator", "codex_exec")
+        .json(&serde_json::json!({"model": "gpt-6-astra", "input": "Reply OK."}))
+        .send()
+        .await
+        .expect("send Codex request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 mod api_admin;
 mod failover;
 mod harness;

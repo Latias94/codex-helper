@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 中文
+
+- 修复 Codex 对话请求的 `User-Agent` 被全局删除，导致 chili 等校验客户端身份的中转返回 403。普通 HTTP 和 WebSocket 转发现在保留原始 `User-Agent`，图片接口继续使用原有的兼容处理。
+
+### English summary
+
+- Preserve the original client `User-Agent` when forwarding HTTP and WebSocket requests, fixing 403 client-validation failures on relays such as chili. Keep user-agent stripping scoped to the Images endpoints.
+
 ## [0.20.3] - 2026-07-09
 
 ### 中文

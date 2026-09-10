@@ -117,8 +117,10 @@ struct ImageGenerationResult {
 
 pub(super) async fn handle_openai_images_generations(
     proxy: ProxyService,
-    req: Request<Body>,
+    mut req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    // Keep image-client compatibility separate from native Codex forwarding.
+    req.headers_mut().remove(header::USER_AGENT);
     let (parts, body) = req.into_parts();
     let body_bytes = to_bytes(body, MAX_IMAGES_GENERATION_REQUEST_BYTES)
         .await
@@ -146,8 +148,9 @@ pub(super) async fn handle_openai_images_generations(
 
 pub(super) async fn handle_openai_images_edits(
     proxy: ProxyService,
-    req: Request<Body>,
+    mut req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    req.headers_mut().remove(header::USER_AGENT);
     if !request_content_type_is_json(req.headers()) {
         return handle_proxy(proxy, req).await;
     }

@@ -407,33 +407,42 @@ async fn openai_images_edits_endpoint_translates_json_references_and_response() 
     let seen_body_for_route = seen_body.clone();
     let upstream = axum::Router::new().route(
         "/v1/responses",
-        post(move |Json(body): Json<serde_json::Value>| {
-            let seen_body_for_route = seen_body_for_route.clone();
-            async move {
-                *seen_body_for_route.lock().expect("lock") = Some(body);
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "id": "resp_image_edit",
-                        "created": 43,
-                        "output": [
-                            {
-                                "type": "image_generation_call",
-                                "id": "ig_1",
-                                "status": "completed",
-                                "result": "YmFy",
-                                "revised_prompt": "A revised reference edit"
-                            }
-                        ]
-                    })),
-                )
-            }
-        }),
+        post(
+            move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                let seen_body_for_route = seen_body_for_route.clone();
+                async move {
+                    assert_ne!(
+                        headers.get("user-agent"),
+                        Some(&HeaderValue::from_static("Python-urllib/3.13"))
+                    );
+                    *seen_body_for_route.lock().expect("lock") = Some(body);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": "resp_image_edit",
+                            "created": 43,
+                            "output": [
+                                {
+                                    "type": "image_generation_call",
+                                    "id": "ig_1",
+                                    "status": "completed",
+                                    "result": "YmFy",
+                                    "revised_prompt": "A revised reference edit"
+                                }
+                            ]
+                        })),
+                    )
+                }
+            },
+        ),
     );
     let upstream = spawn_test_upstream(upstream);
     let cfg = make_proxy_config(vec![upstream.upstream_config()], RetryConfig::default());
     let proxy = spawn_test_proxy(cfg);
-    let client = Client::new();
+    let client = Client::builder()
+        .user_agent("Python-urllib/3.13")
+        .build()
+        .expect("client");
 
     let response = post_images_edits_json(
         &client,
@@ -542,6 +551,10 @@ async fn openai_images_edits_endpoint_passes_non_json_requests_through() {
             let seen_content_type_for_route = seen_content_type_for_route.clone();
             let seen_body_for_route = seen_body_for_route.clone();
             async move {
+                assert_ne!(
+                    headers.get("user-agent"),
+                    Some(&HeaderValue::from_static("Python-urllib/3.13"))
+                );
                 *seen_path_for_route.lock().expect("lock") = Some(request.uri().path().to_string());
                 *seen_content_type_for_route.lock().expect("lock") = headers
                     .get(axum::http::header::CONTENT_TYPE)
@@ -571,6 +584,7 @@ async fn openai_images_edits_endpoint_passes_non_json_requests_through() {
 
     let response = client
         .post(proxy.images_edits_url())
+        .header("user-agent", "Python-urllib/3.13")
         .header(
             "content-type",
             "multipart/form-data; boundary=codex-helper-test",

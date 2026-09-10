@@ -83,9 +83,12 @@ supports_websockets = true
     let app = crate::proxy::router(proxy);
     let (proxy_addr, proxy_handle) = spawn_axum_server(app);
 
-    let request = format!("ws://{proxy_addr}/v1/responses")
+    let mut request = format!("ws://{proxy_addr}/v1/responses")
         .into_client_request()
         .expect("ws request");
+    request
+        .headers_mut()
+        .insert("user-agent", HeaderValue::from_static("codex_exec/0.153.4"));
     let (mut socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("connect proxy websocket");
@@ -114,6 +117,10 @@ supports_websockets = true
     assert_eq!(
         headers.get("authorization"),
         Some(&HeaderValue::from_static("Bearer server-token"))
+    );
+    assert_eq!(
+        headers.get("user-agent"),
+        Some(&HeaderValue::from_static("codex_exec/0.153.4"))
     );
     assert_eq!(
         headers.get("openai-beta"),
