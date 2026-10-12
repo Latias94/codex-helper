@@ -401,6 +401,19 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             let mut runtime =
                 route_graph_runtime_for_request(ctx.proxy, template, ctx.session_id).await;
             let mut route_state = RoutePlanAttemptState::default();
+            if ctx.proxy.service_name == "codex" {
+                ctx.proxy.model_catalog.exclude_unsupported(
+                    template,
+                    &mut route_state,
+                    super::model_catalog::CatalogRouteRequest {
+                        headers: ctx.client_headers,
+                        uri: ctx.uri,
+                        patch: ctx.request_flavor.codex_client_patch_mode,
+                        model: ctx.request_model,
+                        effort: ctx.effective_effort,
+                    },
+                );
+            }
             let provider_chain_policy = ProviderChainAttemptPolicy::route_graph(
                 ctx.request_flavor,
                 Some(template.affinity_policy),
@@ -494,6 +507,19 @@ pub(super) async fn execute_provider_chain_with_route_executor(
             )
             .await;
             let mut route_state = RoutePlanAttemptState::default();
+            if ctx.proxy.service_name == "codex" {
+                ctx.proxy.model_catalog.exclude_unsupported(
+                    &legacy_template,
+                    &mut route_state,
+                    super::model_catalog::CatalogRouteRequest {
+                        headers: ctx.client_headers,
+                        uri: ctx.uri,
+                        patch: ctx.request_flavor.codex_client_patch_mode,
+                        model: ctx.request_model,
+                        effort: ctx.effective_effort,
+                    },
+                );
+            }
             let mut upstream_chain: Vec<String> = Vec::new();
             let mut route_attempts: Vec<RouteAttemptLog> = Vec::new();
             let strict_multi_config = lbs.len() > 1;

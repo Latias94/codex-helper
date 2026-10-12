@@ -379,14 +379,15 @@ async fn prepare_responses_websocket(
     .await
     {
         Ok(prepared) => prepared,
-        Err(CommonRequestPreparationError::NoRoutableStation {
-            request_id,
-            session_id,
-            session_identity_source,
-            cwd,
-            effective_effort,
-            service_tier,
-        }) => {
+        Err(error) => {
+            let CommonRequestPreparationError::NoRoutableStation {
+                request_id,
+                session_id,
+                session_identity_source,
+                cwd,
+                effective_effort,
+                service_tier,
+            } = *error;
             let message = "no upstreams available".to_string();
             let _ = finish_failed_proxy_request(FailedProxyRequestParams {
                 proxy,
@@ -446,6 +447,17 @@ async fn select_responses_websocket_target(
                 route_graph_runtime_for_request(proxy, template, prepared.session_id.as_deref())
                     .await;
             let mut route_state = RoutePlanAttemptState::default();
+            proxy.model_catalog.exclude_unsupported(
+                template,
+                &mut route_state,
+                super::model_catalog::CatalogRouteRequest {
+                    headers: &prepared.client_headers,
+                    uri: &prepared.uri,
+                    patch: prepared.codex_patch_mode,
+                    model: prepared.request_model.as_deref(),
+                    effort: prepared.effective_effort.as_deref(),
+                },
+            );
             let continuity_contract =
                 websocket_continuity_contract(prepared, template.affinity_policy);
 
@@ -529,6 +541,17 @@ async fn select_responses_websocket_target(
             )
             .await;
             let mut route_state = RoutePlanAttemptState::default();
+            proxy.model_catalog.exclude_unsupported(
+                &legacy_template,
+                &mut route_state,
+                super::model_catalog::CatalogRouteRequest {
+                    headers: &prepared.client_headers,
+                    uri: &prepared.uri,
+                    patch: prepared.codex_patch_mode,
+                    model: prepared.request_model.as_deref(),
+                    effort: prepared.effective_effort.as_deref(),
+                },
+            );
             let continuity_contract =
                 websocket_continuity_contract(prepared, RoutingAffinityPolicyV5::Hard);
 

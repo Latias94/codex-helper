@@ -167,11 +167,8 @@ fn editable_item_from_toml_value(value: &Value) -> Result<EditableTomlItem> {
     match value {
         Value::Table(table) => {
             let body = toml::to_string(table)?;
-            let doc = format!("[codex_proxy]\n{body}").parse::<EditableTomlDocument>()?;
-            doc.as_table()
-                .get("codex_proxy")
-                .cloned()
-                .ok_or_else(|| anyhow!("failed to parse stored codex_proxy state"))
+            let doc = body.parse::<EditableTomlDocument>()?;
+            Ok(EditableTomlItem::Table(doc.as_table().clone()))
         }
         _ => Err(anyhow!("stored codex_proxy state must be a TOML table")),
     }
@@ -497,6 +494,12 @@ fn switch_on_codex_toml_with_base_url_and_plan(
     plan: CodexPatchPlan,
     hosted_image_generation: CodexHostedImageGenerationMode,
 ) -> Result<String> {
+    let mut model_catalog_url =
+        reqwest::Url::parse(base_url).context("parse Codex proxy base URL for model catalog")?;
+    let catalog_path = format!("{}/models", model_catalog_url.path().trim_end_matches('/'));
+    model_catalog_url.set_path(&catalog_path);
+    model_catalog_url.set_fragment(None);
+
     let mut doc = if text.trim().is_empty() {
         EditableTomlDocument::new()
     } else {
@@ -529,6 +532,7 @@ fn switch_on_codex_toml_with_base_url_and_plan(
     let provider = plan.provider();
     set_toml_string(proxy_table, "name", provider.provider_name());
     set_toml_string(proxy_table, "base_url", base_url);
+    set_toml_string(proxy_table, "model_catalog_url", model_catalog_url.as_str());
     set_toml_string(proxy_table, "wire_api", "responses");
     if !proxy_table.contains_key("request_max_retries") {
         proxy_table.insert("request_max_retries", editable_toml_value(0));
@@ -2032,8 +2036,12 @@ fn switch_on_with_base_url_and_hosted_image_generation(
     options: CodexSwitchOptions,
     hosted_image_generation: CodexHostedImageGenerationMode,
 ) -> Result<()> {
-    let base_url = crate::control_plane_client::normalize_base_url(base_url)
-        .ok_or_else(|| anyhow!("Codex proxy base URL must start with http:// or https://"))?;
+    let base_url = base_url.trim();
+    if !reqwest::Url::parse(base_url).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+        return Err(anyhow!(
+            "Codex proxy base URL must start with http:// or https://"
+        ));
+    }
     let plan = CodexPatchPlan::for_switch_on(mode, options)?;
     if plan.requires_bridge_runtime_ready() {
         ensure_bridge_runtime_ready(plan.mode())?;
@@ -2065,7 +2073,7 @@ fn switch_on_with_base_url_and_hosted_image_generation(
     let auth_edit = auth_edit_for_switch_on_plan(plan, &mut state)?;
     let new_text = switch_on_codex_toml_with_base_url_and_plan(
         &text,
-        &base_url,
+        base_url,
         plan,
         hosted_image_generation,
     )?;
@@ -2757,6 +2765,9 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
+
+    #[path = "model_catalog.rs"]
+    mod model_catalog;
 
     struct ScopedEnv {
         saved: Vec<(String, Option<String>)>,

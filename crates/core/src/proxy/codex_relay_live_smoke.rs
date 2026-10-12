@@ -1273,7 +1273,6 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request};
     use axum::routing::post;
-    use futures_util::{SinkExt, StreamExt as _};
     use serde_json::json;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
     use tokio_tungstenite::tungstenite::handshake::server::{

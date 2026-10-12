@@ -90,6 +90,7 @@ impl ProxyService {
             state,
             shutdown_tx,
             host_local_session_history_mode: crate::host_local::HostLocalSessionHistoryMode::Auto,
+            model_catalog: Arc::new(super::model_catalog::ModelCatalogCache::default()),
         }
     }
 

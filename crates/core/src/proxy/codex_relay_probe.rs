@@ -429,6 +429,43 @@ impl CodexRelayProbeClient {
             headers.insert("x-api-key", value);
         }
 
+        if spec.kind == CodexRelayProbeKind::Models {
+            let uri = match spec.path.parse() {
+                Ok(uri) => uri,
+                Err(_) => {
+                    return transport_observation(
+                        spec.kind,
+                        None,
+                        "invalid model catalog path".to_string(),
+                    );
+                }
+            };
+            return match super::model_catalog::fetch_catalog_response(
+                &self.client,
+                &upstream.base_url,
+                &uri,
+                headers,
+            )
+            .await
+            {
+                Ok(response) => {
+                    let result = classify_codex_relay_probe_response(
+                        spec,
+                        response.status,
+                        &response.headers,
+                        &response.body,
+                    );
+                    CodexRelayProbeObservation {
+                        result,
+                        status: Some(response.status),
+                        headers: response.headers,
+                        body: response.body,
+                    }
+                }
+                Err(error) => transport_observation(spec.kind, None, error),
+            };
+        }
+
         let mut request = self
             .client
             .request(spec.method(), url)
@@ -486,27 +523,14 @@ fn transport_observation(
 }
 
 fn build_probe_url(base_url: &str, path: &str) -> Result<reqwest::Url, String> {
-    let base = base_url.trim_end_matches('/');
-    let base_url =
-        reqwest::Url::parse(base).map_err(|error| format!("invalid upstream base_url: {error}"))?;
-    let base_path = base_url.path().trim_end_matches('/');
-    let mut path = path.to_string();
-    if !base_path.is_empty()
-        && base_path != "/"
-        && (path == base_path || path.starts_with(&format!("{base_path}/")))
-    {
-        let rest = &path[base_path.len()..];
-        path = if rest.is_empty() {
-            "/".to_string()
-        } else {
-            rest.to_string()
-        };
-    }
-    if !path.starts_with('/') {
-        path = format!("/{path}");
-    }
-    let full = format!("{base}{path}");
-    reqwest::Url::parse(&full).map_err(|error| format!("invalid probe url: {error}"))
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    let uri = path.parse().map_err(|_| "invalid probe path".to_string())?;
+    super::target_builder::upstream_request_url(base_url, &uri)
+        .map_err(|_| "invalid upstream probe URL".to_string())
 }
 
 async fn read_limited_body(response: reqwest::Response, max_bytes: usize) -> Result<Bytes, String> {

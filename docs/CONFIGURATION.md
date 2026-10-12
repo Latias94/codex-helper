@@ -110,18 +110,15 @@ compaction = "auto"
 
 Legacy `mode = "..."` config is still accepted for existing users, but codex-helper rewrites saved/generated config as `preset = "..."`.
 
-Model catalog translation is disabled by default (`translate_models = false`). An upstream `/v1/models` response containing only an OpenAI-style `{"data":[{"id":"..."}]}` list does not provide Codex's native model metadata, so Codex falls back to its built-in metadata. A model missing from that built-in catalog, such as `gpt-6.1-sol` in an older client, may appear in `/model` with only its current ID and no reasoning effort choices.
+Codex model discovery is automatic. The helper's `/models` endpoint queries the enabled providers and endpoints reachable from the current route, accepts both native `{"models":[...]}` catalogs and OpenAI `{"data":[{"id":"..."}]}` lists, and returns one native Codex catalog. It preserves `client_version`, supplying the client version from the User-Agent or the bundled catalog version when a manual query omits it. Provider URLs may end in `/v1`, `/backend-api/codex`, another path, or the site root; the helper appends `/models` to the configured base without vendor-specific path rewriting.
 
-To have codex-helper translate that list into a native Codex model catalog, explicitly enable the following setting in the helper's existing `[codex.client_patch]` table:
+Only upstream-advertised models and configured model aliases enter the catalog. Known models use complete metadata from a pinned official Codex catalog. Model IDs and recognized reasoning efforts are deduplicated and unioned across upstreams; unknown native models retain the first native description in route order. Context limits, tool support, model instructions, and other fields are not independently maximized across sources. For `gpt-6.1-sol`, the official baseline supplies the name `GPT-6.1-Sol`, default effort `low`, and the six efforts `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
 
-```toml
-[codex.client_patch]
-translate_models = true
-```
+Discovery uses bounded concurrent requests and a five-minute cache separated by endpoint, credentials, and catalog query. Failed discovery is cached briefly and does not penalize inference health. Cached source metadata keeps newly advertised models routable and avoids endpoints that explicitly lack the requested reasoning effort. A failed or unobserved catalog does not establish an inference restriction. Cached information expires automatically; restarting an existing Codex TUI may be necessary to refresh its menu.
 
-Known GPT-6 models retain complete official Codex metadata templates, including `model_messages`, `use_responses_lite`, and multi-agent fields. For known IDs `gpt-6.1-sol` and `openai.gpt-6.1-sol`, translation supplies the display name `GPT-6.1-Sol`, defaults reasoning effort to `low`, and exposes `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. A complete native `{"models":[...]}` catalog from the upstream is passed through unchanged even when translation is enabled: if the provider declares only two reasoning efforts, those two remain authoritative.
+Configured model mappings use the target model's metadata, including when an exact alias overrides a wildcard. Conditional routes expose only reachable model members and reasoning efforts, and adjust the default effort when its branch is unreachable. Both HTTP and WebSocket branches are included.
 
-The current Codex TUI may need a restart or model catalog refresh before updated metadata appears. Translation supplies client metadata; it does not guarantee that a remote provider supports every listed reasoning effort or other model capability.
+`switch on` writes a separate `model_catalog_url` pointing to the helper's `/models` endpoint for Codex versions supporting that setting. The old `codex.client_patch.translate_models` option is accepted for configuration compatibility but no longer controls discovery. No translation switch is required.
 
 You can also switch the client preset temporarily from the CLI:
 
@@ -269,14 +266,7 @@ Recommendation rules are intentionally conservative:
 | `/responses/compact` is unknown | avoid official relay presets until compact is proven |
 | `/responses` is unavailable | `default`; no preset can compensate for a missing Responses endpoint |
 
-For sub2api-style relays, discovery from a raw OpenAI `/models` response (`data: [...]`)
-requires codex-helper translation into the Codex `models: [...]` catalog. With translation
-disabled, Codex can still use its bundled metadata, but it cannot discover unbundled models
-from that ID list. The
-diagnostic response reports this as `observed.models.translation_required = true`. For non-sub2api
-relays, the same rules apply: the relay can either return Codex-shaped model metadata directly or
-return an OpenAI model list that codex-helper can translate. If the selected model is absent or its
-metadata does not prove image input, the recommendation will not assume hosted image generation.
+For sub2api-style relays, the models probe uses the same versioned model request as discovery. A provider may return a native Codex catalog for `/models?client_version=...` even when an unversioned query returns an OpenAI ID list. If an ID list is returned, `observed.models.translation_required = true` describes the source response shape; helper normalization is automatic and does not itself indicate a configuration mismatch. Non-sub2api relays follow the same rules. The selected model must be present, and hosted image generation recommendations still require metadata establishing image input support.
 
 Hosted `image_generation` is not actively probed by this diagnostic endpoint because that can spend
 quota or create image artifacts. Responses WebSocket support is opt-in through

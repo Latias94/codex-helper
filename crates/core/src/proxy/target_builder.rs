@@ -17,11 +17,15 @@ impl ProxyService {
 }
 
 fn build_target_impl(upstream: &UpstreamConfig, uri: &Uri) -> Result<(reqwest::Url, HeaderMap)> {
-    let base = upstream.base_url.trim_end_matches('/').to_string();
+    Ok((
+        upstream_request_url(&upstream.base_url, uri)?,
+        HeaderMap::new(),
+    ))
+}
 
-    let base_url =
-        reqwest::Url::parse(&base).map_err(|e| anyhow!("invalid upstream base_url {base}: {e}"))?;
-    let base_path = base_url.path().trim_end_matches('/').to_string();
+pub(super) fn upstream_request_url(base: &str, uri: &Uri) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base).map_err(|_| anyhow!("invalid upstream base URL"))?;
+    let base_path = url.path().trim_end_matches('/').to_string();
 
     let mut path = uri.path().to_string();
     if !base_path.is_empty()
@@ -40,19 +44,15 @@ fn build_target_impl(upstream: &UpstreamConfig, uri: &Uri) -> Result<(reqwest::U
             path = format!("/{path}");
         }
     }
-    let path_and_query = if let Some(q) = uri.query() {
-        format!("{path}?{q}")
-    } else {
-        path
+    url.set_path(&format!("{base_path}{path}"));
+    let query = match (url.query(), uri.query()) {
+        (Some(base_query), Some(query)) => Some(format!("{base_query}&{query}")),
+        (Some(query), None) | (None, Some(query)) => Some(query.to_string()),
+        (None, None) => None,
     };
-
-    let full = format!("{base}{path_and_query}");
-    let url =
-        reqwest::Url::parse(&full).map_err(|e| anyhow!("invalid upstream url {full}: {e}"))?;
-
-    // ensure query preserved (Url::parse already includes it)
-    let headers = HeaderMap::new();
-    Ok((url, headers))
+    url.set_query(query.as_deref());
+    url.set_fragment(None);
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -105,5 +105,17 @@ mod tests {
         let (url, _) = build_target_impl(&upstream, &uri).expect("target");
 
         assert_eq!(url.as_str(), "https://api.example.com/v1/v12/responses");
+    }
+
+    #[test]
+    fn build_target_joins_base_and_request_queries_without_using_fragment() {
+        let upstream =
+            upstream("https://api.example.com/backend-api/codex/?tenant=fixture#ignored");
+        let uri: Uri = "/models?client_version=0.162.1".parse().expect("uri");
+        let (url, _) = build_target_impl(&upstream, &uri).expect("target");
+        assert_eq!(
+            url.as_str(),
+            "https://api.example.com/backend-api/codex/models?tenant=fixture&client_version=0.162.1"
+        );
     }
 }

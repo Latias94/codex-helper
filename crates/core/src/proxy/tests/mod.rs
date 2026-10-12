@@ -241,5 +241,6 @@ async fn responses_preserves_codex_user_agent_for_client_validation() {
 mod api_admin;
 mod failover;
 mod harness;
+mod model_catalog;
 mod openai_images_generation;
 mod routing_profiles;

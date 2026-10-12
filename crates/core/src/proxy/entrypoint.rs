@@ -19,6 +19,9 @@ pub async fn handle_proxy(
     proxy: ProxyService,
     req: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    if super::model_catalog::is_model_catalog_request(proxy.service_name, req.method(), req.uri()) {
+        return super::model_catalog::handle_model_catalog(&proxy, req).await;
+    }
     let start = Instant::now();
     let started_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

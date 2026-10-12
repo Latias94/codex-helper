@@ -196,7 +196,7 @@ pub(super) async fn load_request_config_context(proxy: &ProxyService) -> Request
 
 pub(super) async fn prepare_common_request(
     params: CommonRequestPreparationParams<'_>,
-) -> Result<CommonPreparedRequest, CommonRequestPreparationError> {
+) -> Result<CommonPreparedRequest, Box<CommonRequestPreparationError>> {
     let CommonRequestPreparationParams {
         proxy,
         config,
@@ -343,14 +343,14 @@ pub(super) async fn prepare_common_request(
         )
         .await;
     if route_selection.is_empty() {
-        return Err(CommonRequestPreparationError::NoRoutableStation {
+        return Err(Box::new(CommonRequestPreparationError::NoRoutableStation {
             request_id,
             session_id,
             session_identity_source,
             cwd,
             effective_effort,
             service_tier: base_service_tier,
-        });
+        }));
     }
 
     Ok(CommonPreparedRequest {

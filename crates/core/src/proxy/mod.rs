@@ -35,6 +35,7 @@ mod failure_summary;
 mod headers;
 mod healthcheck_api;
 mod http_debug;
+mod model_catalog;
 mod models_compat;
 mod openai_images;
 mod passive_health;
@@ -148,6 +149,7 @@ pub struct ProxyService {
     state: Arc<ProxyState>,
     shutdown_tx: Option<watch::Sender<bool>>,
     host_local_session_history_mode: HostLocalSessionHistoryMode,
+    model_catalog: Arc<model_catalog::ModelCatalogCache>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -1233,7 +1233,7 @@ async fn codex_capabilities_api_reports_expected_observed_and_mismatches() {
     );
     assert_eq!(
         diagnostics["expected"]["hosted_image_generation"]["support"].as_str(),
-        Some("unknown")
+        Some("supported")
     );
     assert_eq!(
         diagnostics["observed"]["responses"]["support"].as_str(),
@@ -1249,7 +1249,7 @@ async fn codex_capabilities_api_reports_expected_observed_and_mismatches() {
     );
     assert_eq!(
         diagnostics["recommendation"]["recommended_patch_mode"].as_str(),
-        Some("default")
+        Some("imagegen-bridge")
     );
     assert_eq!(
         diagnostics["recommendation"]["changes_current_mode"].as_bool(),
@@ -1269,15 +1269,9 @@ async fn codex_capabilities_api_reports_expected_observed_and_mismatches() {
         })
     }));
     assert!(diagnostics["mismatches"].as_array().is_some_and(|items| {
-        items.iter().any(|item| {
-            item.get("capability").and_then(|v| v.as_str()) == Some("model_catalog")
-                && item
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|value| {
-                        value.contains("helper model translation is disabled by default")
-                    })
-        })
+        items
+            .iter()
+            .all(|item| item.get("capability").and_then(|v| v.as_str()) != Some("model_catalog"))
     }));
 
     proxy_handle.abort();

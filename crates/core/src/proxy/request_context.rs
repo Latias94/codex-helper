@@ -174,14 +174,15 @@ pub(super) async fn prepare_proxy_request(
     .await
     {
         Ok(prepared) => prepared,
-        Err(CommonRequestPreparationError::NoRoutableStation {
-            request_id,
-            session_id,
-            session_identity_source,
-            cwd,
-            effective_effort,
-            service_tier,
-        }) => {
+        Err(error) => {
+            let CommonRequestPreparationError::NoRoutableStation {
+                request_id,
+                session_id,
+                session_identity_source,
+                cwd,
+                effective_effort,
+                service_tier,
+            } = *error;
             let dur = start.elapsed().as_millis() as u64;
             return Err(finish_failed_proxy_request(FailedProxyRequestParams {
                 proxy,

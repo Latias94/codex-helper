@@ -94,7 +94,7 @@ async fn proxy_decodes_unlabeled_gzip_models_response_before_forwarding() {
             .contains_key(axum::http::header::CONTENT_ENCODING)
     );
     let body = resp.bytes().await.expect("body");
-    assert_openai_models_response(body.as_ref(), "gpt-5.5");
+    assert_codex_models_response(body.as_ref(), "gpt-5.5", true);
     assert_eq!(
         upstream_accept_encoding.lock().expect("lock").as_deref(),
         Some("identity")
@@ -168,7 +168,7 @@ async fn proxy_decodes_brotli_models_response_before_forwarding() {
             .contains_key(axum::http::header::CONTENT_ENCODING)
     );
     let body = resp.bytes().await.expect("body");
-    assert_openai_models_response(body.as_ref(), "gpt-5.5");
+    assert_codex_models_response(body.as_ref(), "gpt-5.5", true);
     assert_eq!(
         upstream_accept_encoding.lock().expect("lock").as_deref(),
         Some("identity")
@@ -176,7 +176,7 @@ async fn proxy_decodes_brotli_models_response_before_forwarding() {
 }
 
 #[tokio::test]
-async fn proxy_does_not_translate_openai_models_list_by_default() {
+async fn proxy_normalizes_openai_models_list_by_default() {
     let _env_guard = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -211,11 +211,11 @@ async fn proxy_does_not_translate_openai_models_list_by_default() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.bytes().await.expect("body");
-    assert_openai_models_response(body.as_ref(), "gpt-5.5");
+    assert_codex_models_response(body.as_ref(), "gpt-5.5", true);
 }
 
 #[tokio::test]
-async fn proxy_translates_openai_models_list_to_codex_models_response_when_enabled() {
+async fn proxy_accepts_legacy_translation_setting_without_changing_default_catalog() {
     let _env_guard = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
@@ -272,20 +272,13 @@ translate_models = true
 }
 
 #[tokio::test]
-async fn proxy_translates_gpt_6_1_sol_models_list_when_enabled() {
+async fn proxy_normalizes_gpt_6_1_sol_models_list_by_default() {
     let _env_guard = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
     unsafe {
         scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
     }
-    write_text_file(
-        &temp_dir.join("config.toml"),
-        r#"
-[codex.client_patch]
-translate_models = true
-"#,
-    );
 
     let upstream = axum::Router::new().route(
         "/v1/models",
@@ -343,25 +336,18 @@ translate_models = true
 }
 
 #[tokio::test]
-async fn proxy_preserves_native_gpt_6_1_sol_models_catalog_when_translation_enabled() {
+async fn proxy_preserves_unknown_native_model_metadata_in_merged_catalog() {
     let _env_guard = env_lock().await;
     let temp_dir = make_temp_test_dir();
     let mut scoped = ScopedEnv::default();
     unsafe {
         scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
     }
-    write_text_file(
-        &temp_dir.join("config.toml"),
-        r#"
-[codex.client_patch]
-translate_models = true
-"#,
-    );
 
     const NATIVE_MODELS_JSON: &str = r#"
 {
   "models": [{
-    "slug": "gpt-6.1-sol",
+    "slug": "relay-sol-custom",
     "display_name": "Provider Sol",
     "description": "Provider-managed capabilities",
     "default_reasoning_level": "medium",
@@ -427,11 +413,10 @@ translate_models = true
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.bytes().await.expect("body");
-    assert_eq!(body.as_ref(), NATIVE_MODELS_JSON.as_bytes());
     let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
     let expected: serde_json::Value =
         serde_json::from_str(NATIVE_MODELS_JSON).expect("native catalog");
-    assert_eq!(value, expected);
+    assert_eq!(value["models"], expected["models"]);
     let efforts = value["models"][0]["supported_reasoning_levels"]
         .as_array()
         .expect("supported reasoning levels")
@@ -463,16 +448,6 @@ fn assert_codex_models_response(
             .any(|modality| modality.as_str() == Some("image")),
         expect_image_modality
     );
-    value
-}
-
-fn assert_openai_models_response(body: &[u8], expected_slug: &str) -> serde_json::Value {
-    let value: serde_json::Value = serde_json::from_slice(body).expect("json body");
-    assert!(value.get("models").is_none());
-    let data = value["data"].as_array().expect("data array");
-    data.iter()
-        .find(|model| model["id"].as_str() == Some(expected_slug))
-        .expect("expected model");
     value
 }
 

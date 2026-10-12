@@ -30,7 +30,6 @@ fn config_toml_backup_path() -> PathBuf {
 pub struct CodexClientPatchConfig {
     pub preset: crate::codex_integration::CodexPatchMode,
     pub options: crate::codex_integration::CodexSwitchOptions,
-    pub translate_models: bool,
     pub hosted_image_generation: crate::codex_integration::CodexHostedImageGenerationMode,
 }
 
@@ -39,7 +38,6 @@ impl Default for CodexClientPatchConfig {
         Self {
             preset: crate::codex_integration::CodexPatchMode::Default,
             options: crate::codex_integration::CodexSwitchOptions::default(),
-            translate_models: false,
             hosted_image_generation: crate::codex_integration::CodexHostedImageGenerationMode::Auto,
         }
     }
@@ -161,10 +159,6 @@ fn codex_client_patch_config_from_toml_value(value: &TomlValue) -> Result<CodexC
         .map(parse_codex_compaction_strategy)
         .transpose()?
         .unwrap_or_default();
-    let translate_models = patch
-        .and_then(|patch| patch.get("translate_models"))
-        .and_then(TomlValue::as_bool)
-        .unwrap_or(false);
     let hosted_image_generation = patch
         .and_then(|patch| patch.get("hosted_image_generation"))
         .and_then(TomlValue::as_str)
@@ -178,7 +172,6 @@ fn codex_client_patch_config_from_toml_value(value: &TomlValue) -> Result<CodexC
             responses_websocket,
             compaction,
         },
-        translate_models,
         hosted_image_generation,
     })
 }
@@ -483,10 +476,8 @@ version = 5
 #             更偏向本地压缩，official-relay / official-imagegen 默认让 Codex
 #             走远程压缩路径；local 强制本地压缩；remote-v1 强制 /responses/compact；
 #             remote-v2 强制 remote_compaction_v2，并依赖 helper 的 v2->v1 降级兜底。
-# translate_models：默认 false。false 时 helper 只解码 /models 响应压缩体，
-#                   不把 OpenAI data 列表翻译成 Codex models catalog，让 Codex 使用
-#                   自带 models.json / fallback 元数据；true 仅用于确实需要 helper
-#                   合成模型目录的中转，因为 Codex 会把合成后的字段当成权威。
+# 模型目录默认聚合当前路由中的上游，使用官方 metadata 基准，并合并新模型与推理档位。
+# 旧 translate_models 配置不再控制目录行为，可删除。
 # hosted_image_generation：默认 auto。disabled 会在 switch on 时写入
 #                          [features].image_generation = false，并在 helper
 #                          转发 Codex /responses 请求时移除 image_generation
@@ -506,7 +497,6 @@ version = 5
 # preset = "official-imagegen"
 # responses_websocket = false
 # compaction = "auto"
-# translate_models = false
 # hosted_image_generation = "auto"
 
 # --- Relay targets（可选，本机客户端入口） ---

@@ -402,14 +402,6 @@ fn build_mismatches(
         &expected.remote_compaction_v1,
         &observed.responses_compact,
     );
-    if observed.models.translation_required {
-        out.push(CodexRelayCapabilityMismatch {
-            capability: "model_catalog".to_string(),
-            expected: "codex_models".to_string(),
-            observed: "openai_data_list".to_string(),
-            reason: "relay returned an OpenAI models list; helper model translation is disabled by default so Codex can keep using its bundled model metadata. Enable codex.client_patch.translate_models only if you intentionally want helper-synthesized model metadata.".to_string(),
-        });
-    }
     out
 }
 

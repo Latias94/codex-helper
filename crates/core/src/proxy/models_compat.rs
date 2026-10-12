@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::LazyLock;
 
@@ -10,6 +11,138 @@ use crate::basellm_metadata::BasellmOpenAiModelMetadata;
 
 const MAX_DECODED_MODELS_BYTES: usize = 8 * 1024 * 1024;
 
+pub(super) fn merge_model_catalogs(catalogs: &[Value]) -> Option<Value> {
+    let basellm_cache = crate::basellm_metadata::load_cached_basellm_metadata_cache();
+    merge_model_catalogs_with_basellm_cache(catalogs, basellm_cache.as_ref())
+}
+
+fn merge_model_catalogs_with_basellm_cache(
+    catalogs: &[Value],
+    basellm_cache: Option<&crate::basellm_metadata::BasellmMetadataCache>,
+) -> Option<Value> {
+    struct CatalogModel<'a> {
+        slug: String,
+        first: &'a Value,
+        native: Option<&'a Value>,
+        reasoning_levels: Vec<&'a Value>,
+    }
+
+    let mut indices = HashMap::<String, usize>::new();
+    let mut entries = Vec::<CatalogModel<'_>>::new();
+    let mut has_catalog = false;
+    for catalog in catalogs {
+        for (key, is_native) in [("models", true), ("data", false)] {
+            let Some(models) = catalog.get(key).and_then(Value::as_array) else {
+                continue;
+            };
+            has_catalog = true;
+            for model in models {
+                // Restrictions apply to this source only; another upstream may expose it.
+                if model.get("supported_in_api").and_then(Value::as_bool) == Some(false)
+                    || model.get("visibility").and_then(Value::as_str) == Some("hide")
+                {
+                    continue;
+                }
+                let slug = catalog_model_id(model, is_native);
+                let Some(slug) = slug else {
+                    continue;
+                };
+                let next_index = entries.len();
+                let index = *indices
+                    .entry(slug.to_ascii_lowercase())
+                    .or_insert(next_index);
+                if index == next_index {
+                    entries.push(CatalogModel {
+                        slug,
+                        first: model,
+                        native: None,
+                        reasoning_levels: Vec::new(),
+                    });
+                }
+                let entry = &mut entries[index];
+                if is_native && entry.native.is_none() {
+                    entry.native = Some(model);
+                }
+                if let Some(levels) = model
+                    .get("supported_reasoning_levels")
+                    .and_then(Value::as_array)
+                {
+                    entry.reasoning_levels.extend(levels);
+                }
+            }
+        }
+    }
+    if !has_catalog {
+        return None;
+    }
+
+    let models = entries
+        .into_iter()
+        .enumerate()
+        .map(|(priority, entry)| {
+            let official = official_codex_model_info_json(&entry.slug);
+            let is_official = official.is_some();
+            let mut model = official.unwrap_or_else(|| {
+                let metadata = basellm_cache
+                    .and_then(|cache| cache.openai_models.get(&entry.slug.to_ascii_lowercase()));
+                let display_name = openai_model_display_name(entry.first)
+                    .unwrap_or_else(|| display_name(&entry.slug));
+                let mut model =
+                    codex_model_info_json(&entry.slug, &display_name, priority, metadata);
+                if let Some(native) = entry.native.and_then(Value::as_object) {
+                    // Fill missing ModelInfo fields without inventing native reasoning support.
+                    model["supported_reasoning_levels"] = serde_json::json!([]);
+                    model["default_reasoning_level"] = Value::Null;
+                    if let Some(fields) = model.as_object_mut() {
+                        fields.extend(
+                            native
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value.clone())),
+                        );
+                    }
+                }
+                model
+            });
+            model["slug"] = Value::String(entry.slug);
+            let baseline_levels = model
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array);
+            let levels = [
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+            ]
+            .into_iter()
+            .filter_map(|effort| {
+                let mut level = baseline_levels
+                    .into_iter()
+                    .flatten()
+                    .chain(entry.reasoning_levels.iter().copied())
+                    .find(|level| level.get("effort").and_then(Value::as_str) == Some(effort))?
+                    .clone();
+                if level.get("description").and_then(Value::as_str).is_none() {
+                    level["description"] = Value::String(format!("{effort} reasoning"));
+                }
+                Some(level)
+            })
+            .collect::<Vec<_>>();
+            if !is_official
+                && !levels.iter().any(|level| {
+                    level.get("effort").and_then(Value::as_str)
+                        == model.get("default_reasoning_level").and_then(Value::as_str)
+                })
+            {
+                model["default_reasoning_level"] = levels
+                    .first()
+                    .and_then(|level| level.get("effort"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            model["supported_reasoning_levels"] = Value::Array(levels);
+            model
+        })
+        .collect::<Vec<_>>();
+    Some(serde_json::json!({ "models": models }))
+}
+
 pub(super) fn maybe_decode_models_response_body(
     service_name: &str,
     path: &str,
@@ -20,35 +153,14 @@ pub(super) fn maybe_decode_models_response_body(
         return body;
     }
 
-    maybe_decode_models_response_body_with_translation(
-        service_name,
-        path,
-        headers,
-        body,
-        codex_models_translation_enabled(),
-    )
-}
-
-fn codex_models_translation_enabled() -> bool {
-    crate::config::codex_client_patch_config_from_config_file()
-        .map(|cfg| cfg.translate_models)
-        .unwrap_or(false)
-}
-
-fn maybe_decode_models_response_body_with_translation(
-    service_name: &str,
-    path: &str,
-    headers: &HeaderMap,
-    body: Bytes,
-    translate_openai_models: bool,
-) -> Bytes {
     let body =
         maybe_decode_models_response_body_without_translation(service_name, path, headers, body);
-    if translate_openai_models {
-        maybe_translate_openai_models_list(body.as_ref()).unwrap_or(body)
-    } else {
-        body
-    }
+    serde_json::from_slice::<Value>(body.as_ref())
+        .ok()
+        .and_then(|catalog| merge_model_catalogs(&[catalog]))
+        .and_then(|catalog| serde_json::to_vec(&catalog).ok())
+        .map(Bytes::from)
+        .unwrap_or(body)
 }
 
 pub(super) fn maybe_decode_models_response_body_without_translation(
@@ -158,48 +270,31 @@ fn looks_like_json(bytes: &[u8]) -> bool {
     matches!(first, b'{' | b'[')
 }
 
+#[cfg(test)]
 fn maybe_translate_openai_models_list(body: &[u8]) -> Option<Bytes> {
     let basellm_cache = crate::basellm_metadata::load_cached_basellm_metadata_cache();
     translate_openai_models_list_with_basellm_cache(body, basellm_cache.as_ref())
 }
 
+#[cfg(test)]
 fn translate_openai_models_list_with_basellm_cache(
     body: &[u8],
     basellm_cache: Option<&crate::basellm_metadata::BasellmMetadataCache>,
 ) -> Option<Bytes> {
     let value = serde_json::from_slice::<Value>(body).ok()?;
-    if value.get("models").is_some() {
-        return None;
-    }
-
-    let data = value.get("data")?.as_array()?;
-    let mut seen = std::collections::HashSet::new();
-    let mut models = Vec::new();
-    for item in data {
-        let Some(slug) = openai_model_id(item) else {
-            continue;
-        };
-        if !seen.insert(slug.to_ascii_lowercase()) {
-            continue;
-        }
-        let display_name = openai_model_display_name(item).unwrap_or_else(|| display_name(&slug));
-        let basellm_metadata = basellm_cache
-            .as_ref()
-            .and_then(|cache| cache.openai_models.get(&slug.to_ascii_lowercase()));
-        models.push(codex_model_info_json(
-            &slug,
-            display_name.as_str(),
-            models.len(),
-            basellm_metadata,
-        ));
-    }
-
-    serde_json::to_vec(&serde_json::json!({ "models": models }))
-        .ok()
-        .map(Bytes::from)
+    let catalog = merge_model_catalogs_with_basellm_cache(&[value], basellm_cache)?;
+    serde_json::to_vec(&catalog).ok().map(Bytes::from)
 }
 
-fn openai_model_id(item: &Value) -> Option<String> {
+pub(super) fn catalog_model_id(item: &Value, native: bool) -> Option<String> {
+    if native {
+        return item
+            .get("slug")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|slug| !slug.is_empty())
+            .map(ToOwned::to_owned);
+    }
     item.get("id")
         .or_else(|| item.get("name"))
         .and_then(Value::as_str)
@@ -876,32 +971,260 @@ mod tests {
     use axum::http::HeaderValue;
 
     #[test]
-    fn decode_models_response_does_not_translate_openai_list_when_disabled() {
-        let body = Bytes::from_static(
-            br#"{
-            "object": "list",
-            "data": [
-                { "id": "gpt-5.5", "object": "model", "display_name": "GPT-5.5" }
-            ]
-        }"#,
+    fn merged_catalog_combines_upstream_efforts_without_maximizing_other_fields() {
+        let mut first = codex_model_info_json("custom-model", "First upstream", 0, None);
+        first["context_window"] = serde_json::json!(32_000);
+        first["max_context_window"] = serde_json::json!(64_000);
+        first["default_reasoning_level"] = serde_json::json!("high");
+        first["upstream_extension"] = serde_json::json!({ "source": "first" });
+        first["supported_reasoning_levels"] = serde_json::json!([
+            { "effort": "high", "description": "First high" },
+            { "effort": "none", "description": "No reasoning" },
+            { "effort": "high", "description": "Duplicate high" },
+            { "effort": "future-effort", "description": "Unsupported effort" }
+        ]);
+        let mut second = first.clone();
+        second["display_name"] = serde_json::json!("Second upstream");
+        second["context_window"] = serde_json::json!(1_000_000);
+        second["max_context_window"] = serde_json::json!(2_000_000);
+        second["supports_parallel_tool_calls"] = serde_json::json!(true);
+        second["input_modalities"] = serde_json::json!(["text", "image"]);
+        second["supported_reasoning_levels"] = serde_json::json!([
+            { "effort": "ultra", "description": "Ultra" },
+            { "effort": "medium", "description": "Medium" },
+            { "effort": "minimal", "description": "Minimal" },
+            { "effort": "max", "description": "Max" },
+            { "effort": "xhigh", "description": "Extra high" },
+            { "effort": "low", "description": "Low" },
+            { "effort": "high", "description": "Second high" },
+            { "effort": "future-effort", "description": "Unsupported effort" },
+            null,
+            { "effort": 42 }
+        ]);
+        let merged = merge_model_catalogs(&[
+            serde_json::json!({ "models": [first.clone()] }),
+            serde_json::json!({ "models": [second] }),
+        ])
+        .expect("valid catalogs should merge");
+        assert_eq!(merged["models"].as_array().unwrap().len(), 1);
+        let model = model_by_slug(&merged, "custom-model");
+        assert_reasoning_efforts(
+            model,
+            &[
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+            ],
         );
-
-        let decoded = maybe_decode_models_response_body_with_translation(
-            "codex",
-            "/models",
-            &HeaderMap::new(),
-            body.clone(),
-            false,
+        assert_eq!(
+            model["supported_reasoning_levels"][4]["description"],
+            "First high"
         );
-        let value: Value = serde_json::from_slice(decoded.as_ref()).expect("decoded JSON");
-
-        assert_eq!(decoded, body);
-        assert!(value.get("models").is_none());
-        assert!(value.get("data").and_then(Value::as_array).is_some());
+        first["supported_reasoning_levels"] = model["supported_reasoning_levels"].clone();
+        assert_eq!(model, &first);
     }
 
     #[test]
-    fn decode_models_response_translates_openai_list_when_enabled() {
+    fn merged_catalog_prefers_unknown_native_record_over_raw_id_in_either_order() {
+        let mut native = codex_model_info_json("gpt-7-custom", "Native custom", 0, None);
+        native["default_reasoning_level"] = serde_json::json!("none");
+        native["supported_reasoning_levels"] = serde_json::json!([
+            { "effort": "none", "description": "Native no reasoning" }
+        ]);
+        native["context_window"] = serde_json::json!(16_000);
+        native["max_context_window"] = serde_json::json!(16_000);
+        native["supports_parallel_tool_calls"] = serde_json::json!(false);
+        native["input_modalities"] = serde_json::json!(["text"]);
+        native["native_extension"] = serde_json::json!({ "retain": true });
+        let raw_catalog = serde_json::json!({ "data": [{ "id": "gpt-7-custom" }] });
+        let native_catalog = serde_json::json!({ "models": [native.clone()] });
+        for catalogs in [
+            [raw_catalog.clone(), native_catalog.clone()],
+            [native_catalog, raw_catalog],
+        ] {
+            let merged = merge_model_catalogs(&catalogs).expect("valid catalogs should merge");
+            assert_eq!(merged, serde_json::json!({ "models": [native.clone()] }));
+        }
+    }
+
+    #[test]
+    fn merged_catalog_preserves_official_gpt_6_1_record_and_unions_reported_efforts() {
+        let mut reported = codex_model_info_json("Gpt-6.1-Sol", "Upstream override", 0, None);
+        reported["default_reasoning_level"] = serde_json::json!("high");
+        reported["context_window"] = serde_json::json!(12_000);
+        reported["supports_parallel_tool_calls"] = serde_json::json!(false);
+        reported["supported_reasoning_levels"] = serde_json::json!([
+            { "effort": "minimal", "description": "Upstream minimal" },
+            { "effort": "high", "description": "Upstream high" },
+            { "effort": "unsupported", "description": "Unsupported effort" }
+        ]);
+        let merged = merge_model_catalogs(&[
+            serde_json::json!({ "models": [reported] }),
+            serde_json::json!({ "data": [{ "id": "gpt-6.1-sol" }] }),
+        ])
+        .expect("valid catalogs should merge");
+        let model = model_by_slug(&merged, "Gpt-6.1-Sol");
+        assert_reasoning_efforts(
+            model,
+            &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+        );
+        assert_eq!(model["default_reasoning_level"], "low");
+        let mut official = official_codex_model_info_json("Gpt-6.1-Sol").unwrap();
+        assert_eq!(
+            model["supported_reasoning_levels"][3],
+            official["supported_reasoning_levels"][2]
+        );
+        official["supported_reasoning_levels"] = model["supported_reasoning_levels"].clone();
+        assert_eq!(model, &official);
+        assert_eq!(merged["models"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merged_catalog_members_come_only_from_valid_visible_sources() {
+        let filtered = serde_json::json!({ "models": [
+            { "slug": "gpt-6-sol", "supported_in_api": false },
+            { "slug": "gpt-6-luna", "visibility": "hide" },
+            { "slug": "gpt-6.1-sol", "visibility": "hide" },
+            { "slug": 42 }, null, { "slug": " " }
+        ] });
+        let raw = serde_json::json!({ "data": [
+            { "id": "Gpt-6.1-Sol" },
+            { "id": "gpt-image-1" },
+            { "id": "gpt-6-astra", "supported_in_api": false },
+            { "id": "gpt-5.5", "visibility": "hide" },
+            { "id": "" }, { "id": 7 }, null
+        ] });
+        let merged = merge_model_catalogs(&[
+            Value::Null,
+            serde_json::json!({ "models": "broken", "data": {} }),
+            filtered,
+            raw,
+        ])
+        .expect("valid members should survive invalid catalogs and records");
+        let models = merged["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["slug"], "Gpt-6.1-Sol");
+        assert_eq!(models[1]["slug"], "gpt-image-1");
+        assert_eq!(models[1]["supported_in_api"], false);
+        assert_eq!(models[1]["visibility"], "hide");
+    }
+
+    #[test]
+    fn merged_catalog_completes_unknown_partial_native_without_inventing_efforts() {
+        let merged = merge_model_catalogs(&[serde_json::json!({ "models": [
+            { "slug": "gpt-7-partial", "supported_reasoning_levels": [
+                { "effort": "minimal" }, { "effort": "provider-specific" }
+            ], "default_reasoning_level": "provider-specific", "context_window": 12_345 },
+            { "slug": "gpt-7-no-efforts", "default_reasoning_level": "high" }
+        ] })])
+        .expect("partial native models should merge");
+        let model = model_by_slug(&merged, "gpt-7-partial");
+        assert_eq!(model["context_window"], 12_345);
+        assert_eq!(model["display_name"], "GPT 7 Partial");
+        assert_eq!(model["shell_type"], "shell_command");
+        assert_eq!(
+            model["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert!(model["base_instructions"].is_string());
+        assert_reasoning_efforts(model, &["minimal"]);
+        assert!(model["supported_reasoning_levels"][0]["description"].is_string());
+        assert_eq!(model["default_reasoning_level"], "minimal");
+        let no_efforts = model_by_slug(&merged, "gpt-7-no-efforts");
+        assert_reasoning_efforts(no_efforts, &[]);
+        assert_eq!(no_efforts["default_reasoning_level"], Value::Null);
+    }
+
+    #[test]
+    fn merged_catalog_repairs_unknown_default_after_union_and_preserves_valid_default() {
+        let first = serde_json::json!({ "models": [{ "slug": "custom-model", "default_reasoning_level": "ultra",
+            "supported_reasoning_levels": [{ "effort": "none", "description": "None" }] }] });
+        let second = serde_json::json!({ "models": [{ "slug": "custom-model", "supported_reasoning_levels": [
+            { "effort": "minimal", "description": "Minimal" }
+        ] }] });
+        let merged =
+            merge_model_catalogs(&[first.clone(), second]).expect("valid catalogs should merge");
+        let model = model_by_slug(&merged, "custom-model");
+        assert_reasoning_efforts(model, &["none", "minimal"]);
+        assert_eq!(model["default_reasoning_level"], "none");
+
+        let ultra_source = serde_json::json!({ "models": [{ "slug": "custom-model", "supported_reasoning_levels": [
+            { "effort": "ultra", "description": "Ultra" }
+        ] }] });
+        let merged =
+            merge_model_catalogs(&[first, ultra_source]).expect("valid catalogs should merge");
+        let model = model_by_slug(&merged, "custom-model");
+        assert_reasoning_efforts(model, &["none", "ultra"]);
+        assert_eq!(model["default_reasoning_level"], "ultra");
+    }
+
+    #[test]
+    fn merged_catalog_distinguishes_empty_catalogs_from_invalid_responses() {
+        assert_eq!(merge_model_catalogs(&[]), None);
+        assert_eq!(
+            merge_model_catalogs(&[serde_json::json!({ "error": "unavailable" })]),
+            None
+        );
+        assert_eq!(
+            merge_model_catalogs(&[serde_json::json!({ "models": [] })]),
+            Some(serde_json::json!({ "models": [] }))
+        );
+        assert_eq!(
+            merge_model_catalogs(&[serde_json::json!({ "data": [] })]),
+            Some(serde_json::json!({ "models": [] }))
+        );
+    }
+
+    #[test]
+    fn merged_catalog_preserves_bedrock_aliases_with_default_service_tier() {
+        let merged = merge_model_catalogs(&[serde_json::json!({ "data": [
+            { "id": "openai.gpt-6.1-sol" },
+            { "id": "OpenAI.gpt-5.6-sol" },
+            { "id": "gpt-6.1-sol" }
+        ] })])
+        .expect("valid catalog should merge");
+        assert_eq!(merged["models"].as_array().unwrap().len(), 3);
+        for slug in ["openai.gpt-6.1-sol", "OpenAI.gpt-5.6-sol"] {
+            let model = model_by_slug(&merged, slug);
+            assert_eq!(model["default_service_tier"], Value::Null);
+            assert!(!model_has_fast_service_tier(model));
+            assert!(!model_has_legacy_fast_speed_tier(model));
+            assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh", "max", "ultra"]);
+            assert_eq!(model["default_reasoning_level"], "low");
+        }
+        assert!(model_has_fast_service_tier(model_by_slug(
+            &merged,
+            "gpt-6.1-sol"
+        )));
+    }
+
+    #[test]
+    fn bundled_catalog_contains_all_eleven_complete_official_records() {
+        let catalog: Value =
+            serde_json::from_str(include_str!("model_catalogs/openai-codex-0.162.1.json")).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 11);
+        for model in models {
+            let slug = model["slug"].as_str().unwrap();
+            assert_eq!(official_codex_model_info_json(slug), Some(model.clone()));
+            let raw = serde_json::json!({ "data": [{ "id": slug }] });
+            let merged = merge_model_catalogs(&[raw]).expect("valid catalog should merge");
+            assert_eq!(model_by_slug(&merged, slug), model);
+        }
+        assert_eq!(
+            model_by_slug(&catalog, "gpt-5.6-terra")["multi_agent_version"],
+            "v2"
+        );
+        assert_eq!(
+            model_by_slug(&catalog, "gpt-daybreak-red-latest")["context_window"],
+            372_000
+        );
+        assert_reasoning_efforts(
+            model_by_slug(&catalog, "codex-auto-review"),
+            &["low", "medium", "high", "xhigh", "max"],
+        );
+    }
+
+    #[test]
+    fn decode_models_response_normalizes_openai_list_by_default() {
         let body = Bytes::from_static(
             br#"{
             "object": "list",
@@ -911,13 +1234,8 @@ mod tests {
         }"#,
         );
 
-        let decoded = maybe_decode_models_response_body_with_translation(
-            "codex",
-            "/models",
-            &HeaderMap::new(),
-            body,
-            true,
-        );
+        let decoded =
+            maybe_decode_models_response_body("codex", "/models", &HeaderMap::new(), body);
         let value: Value = serde_json::from_slice(decoded.as_ref()).expect("decoded JSON");
 
         assert!(value.get("data").is_none());
@@ -930,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_models_response_still_decodes_compression_when_translation_disabled() {
+    fn decode_models_response_without_translation_preserves_compressed_raw_catalog() {
         let raw = br#"{"object":"list","data":[{"id":"gpt-5.5"}]}"#;
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut encoder, raw).expect("write gzip body");
@@ -938,18 +1256,71 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
 
-        let decoded = maybe_decode_models_response_body_with_translation(
+        let decoded = maybe_decode_models_response_body_without_translation(
             "codex",
             "/models",
             &headers,
             Bytes::from(compressed),
-            false,
         );
         let value: Value = serde_json::from_slice(decoded.as_ref()).expect("decoded JSON");
 
         assert_eq!(decoded.as_ref(), raw);
         assert!(value.get("models").is_none());
         assert!(value.get("data").and_then(Value::as_array).is_some());
+    }
+
+    #[test]
+    fn decode_models_response_normalizes_compressed_native_catalog_by_default() {
+        let raw = br#"{"models":[{"slug":"gpt-6.1-sol","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"minimal","description":"Minimal"}]}]}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, raw).expect("write gzip body");
+        let compressed = encoder.finish().expect("finish gzip body");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let decoded = maybe_decode_models_response_body(
+            "codex",
+            "/models",
+            &headers,
+            Bytes::from(compressed),
+        );
+        let catalog: Value = serde_json::from_slice(decoded.as_ref()).expect("normalized JSON");
+        let model = model_by_slug(&catalog, "gpt-6.1-sol");
+        assert_eq!(model["default_reasoning_level"], "low");
+        assert_reasoning_efforts(
+            model,
+            &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+        );
+    }
+
+    #[test]
+    fn decode_models_response_preserves_unrelated_and_invalid_bodies() {
+        let raw = Bytes::from_static(br#"{"data":[{"id":"gpt-6.1-sol"}]}"#);
+        for (service_name, path) in [("claude", "/models"), ("codex", "/responses")] {
+            assert_eq!(
+                maybe_decode_models_response_body(
+                    service_name,
+                    path,
+                    &HeaderMap::new(),
+                    raw.clone()
+                ),
+                raw
+            );
+        }
+        for raw in [
+            Bytes::from_static(b"{broken JSON"),
+            Bytes::from_static(br#"{"error":"unavailable"}"#),
+        ] {
+            assert_eq!(
+                maybe_decode_models_response_body(
+                    "codex",
+                    "/models",
+                    &HeaderMap::new(),
+                    raw.clone()
+                ),
+                raw
+            );
+        }
     }
 
     #[test]
@@ -1180,10 +1551,10 @@ mod tests {
             "openai.gpt-5.6-luna",
         ]);
 
-        for (slug, display_name, priority) in [
-            ("openai.gpt-5.6-sol", "Sol", 2),
-            ("openai.gpt-5.6-terra", "Terra", 3),
-            ("openai.gpt-5.6-luna", "Luna", 4),
+        for (slug, display_name, priority, default_effort, supports_ultra) in [
+            ("openai.gpt-5.6-sol", "GPT-5.6-Sol", 5, "low", true),
+            ("openai.gpt-5.6-terra", "GPT-5.6-Terra", 8, "medium", true),
+            ("openai.gpt-5.6-luna", "GPT-5.6-Luna", 9, "medium", false),
         ] {
             let model = model_by_slug(&value, slug);
             assert_eq!(
@@ -1200,9 +1571,14 @@ mod tests {
             );
             assert_eq!(
                 model.get("max_context_window").and_then(Value::as_i64),
-                Some(272_000)
+                Some(872_000)
             );
-            assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh", "max"]);
+            assert_eq!(model["default_reasoning_level"], default_effort);
+            let mut efforts = vec!["low", "medium", "high", "xhigh", "max"];
+            if supports_ultra {
+                efforts.push("ultra");
+            }
+            assert_reasoning_efforts(model, &efforts);
             assert_input_modalities(model, &["text", "image"]);
             assert!(!model_has_fast_service_tier(model));
             assert!(!model_has_legacy_fast_speed_tier(model));
@@ -1213,7 +1589,7 @@ mod tests {
     fn translated_openai_models_list_keeps_bedrock_gpt_5_4_and_5_5_on_default_tier() {
         let value = translated_models_value(&["openai.gpt-5.5", "openai.gpt-5.4"]);
 
-        for (slug, priority) in [("openai.gpt-5.5", 0), ("openai.gpt-5.4", 1)] {
+        for (slug, priority) in [("openai.gpt-5.5", 13), ("openai.gpt-5.4", 1)] {
             let model = model_by_slug(&value, slug);
             assert_eq!(
                 model.get("priority").and_then(Value::as_i64),
@@ -1235,17 +1611,17 @@ mod tests {
     }
 
     #[test]
-    fn translated_openai_models_list_handles_stripped_bedrock_gpt_5_6_slug() {
+    fn translated_openai_models_list_uses_official_tiers_for_canonical_gpt_5_6_slug() {
         let value = translated_models_value(&["gpt-5.6-sol"]);
         let model = model_by_slug(&value, "gpt-5.6-sol");
 
         assert_eq!(
             model.get("display_name").and_then(Value::as_str),
-            Some("Sol")
+            Some("GPT-5.6-Sol")
         );
-        assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh", "max"]);
-        assert!(!model_has_fast_service_tier(model));
-        assert!(!model_has_legacy_fast_speed_tier(model));
+        assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh", "max", "ultra"]);
+        assert!(model_has_fast_service_tier(model));
+        assert!(model_has_legacy_fast_speed_tier(model));
     }
 
     #[test]

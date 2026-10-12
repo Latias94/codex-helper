@@ -1435,11 +1435,10 @@ compaction = "local"
         cfg.options.compaction,
         crate::codex_integration::CodexCompactionStrategy::Local
     );
-    assert!(!cfg.translate_models);
 }
 
 #[test]
-fn codex_client_patch_config_parses_models_translation_option() {
+fn codex_client_patch_config_accepts_obsolete_models_translation_option() {
     let _env = setup_temp_codex_home();
     let dir = super::proxy_home_dir();
     let toml_path = dir.join("config.toml");
@@ -1465,7 +1464,6 @@ translate_models = true
         cfg.options.compaction,
         crate::codex_integration::CodexCompactionStrategy::Auto
     );
-    assert!(cfg.translate_models);
 }
 
 #[test]
