@@ -110,7 +110,20 @@ compaction = "auto"
 
 兼容性：旧配置里的 `mode = "..."` 仍会被读取；但 codex-helper 保存/生成配置时统一写 `preset = "..."`。
 
-也可以临时用 CLI 切换：
+模型目录翻译默认关闭（`translate_models = false`）。如果上游 `/v1/models` 只返回 OpenAI 风格的 `{"data":[{"id":"..."}]}` 列表，就没有提供 Codex 原生模型 metadata，Codex 会回退到内置 metadata。对于内置目录尚未包含的模型，例如旧客户端中的 `gpt-6.1-sol`，`/model` 可能只显示当前模型 ID，且没有推理强度选项。
+
+需要 codex-helper 将这种列表翻译为 Codex 原生模型目录时，请在 helper 配置已有的 `[codex.client_patch]` 表中显式启用：
+
+```toml
+[codex.client_patch]
+translate_models = true
+```
+
+已知 GPT-6 模型保留完整官方 Codex metadata 模板，包括 `model_messages`、`use_responses_lite` 和多代理字段。对于已知 ID `gpt-6.1-sol` 和 `openai.gpt-6.1-sol`，翻译会提供展示名 `GPT-6.1-Sol`，将默认推理强度设为 `low`，并提供 `low`、`medium`、`high`、`xhigh`、`max`、`ultra` 六档。上游已经返回完整原生 `{"models":[...]}` 目录时，即使启用了翻译，也会原样保留：上游只声明两档推理强度，就仍以这两档为准。
+
+当前 Codex TUI 可能需要重启或刷新模型目录后才会显示更新的 metadata。翻译只补充客户端 metadata，不能保证远端 provider 支持所有列出的推理强度或其他模型能力。
+
+也可以通过 CLI 临时切换客户端预设：
 
 ```bash
 codex-helper switch on --preset chatgpt-bridge
@@ -245,7 +258,7 @@ curl -s http://127.0.0.1:4211/__codex_helper/api/v1/codex/relay-capabilities \
 | `/responses/compact` 状态未知 | 暂时不要推荐 official relay 预设，先证明 compact |
 | `/responses` 不可用 | `default`；缺少 Responses 端点时任何 preset 都补不了 |
 
-对 sub2api 风格中转来说，原始 OpenAI `/models` 响应（`data: [...]`）本身可以接受，但前提是 codex-helper 在 Codex 看到之前把它翻译成 Codex 的 `models: [...]` catalog。诊断响应会把这类情况标成 `observed.models.translation_required = true`。非 sub2api 中转也按同一套规则处理：它可以直接返回 Codex 形态的模型 metadata，也可以返回 helper 能翻译的 OpenAI model list。如果选中模型缺失，或 metadata 无法证明 image input，推荐器不会假设 hosted image generation 可用。
+对 sub2api 风格中转来说，要从原始 OpenAI `/models` 响应（`data: [...]`）发现模型，需要 codex-helper 将它翻译成 Codex 的 `models: [...]` catalog。关闭翻译时，Codex 仍可使用内置 metadata，但无法从这份 ID 列表发现尚未内置的模型。诊断响应会把这类情况标成 `observed.models.translation_required = true`。非 sub2api 中转也按同一套规则处理：它可以直接返回 Codex 形态的模型 metadata，也可以返回 helper 能翻译的 OpenAI model list。如果选中模型缺失，或 metadata 无法证明 image input，推荐器不会假设 hosted image generation 可用。
 
 该诊断端点不会主动探测 hosted `image_generation`，因为这可能消耗额度或生成实际图片。Responses WebSocket 通过 `responses_websocket = true` / `--responses-websocket` 显式启用；bridge 预设默认仍保持关闭。Remote compaction v2 默认不启用；只有显式设置 `compaction = "remote-v2"` 或手工启用 `[features].remote_compaction_v2 = true` 时，helper 才会看到 `compaction_trigger` 请求形态，并用于日志和 route-continuity 保护；上游 relay 仍必须真正支持 v2 compaction response item，或者依赖 helper 的 v2 到 v1 降级兜底。
 

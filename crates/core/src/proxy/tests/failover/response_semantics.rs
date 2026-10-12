@@ -271,6 +271,176 @@ translate_models = true
     assert_eq!(gpt_image["visibility"].as_str(), Some("hide"));
 }
 
+#[tokio::test]
+async fn proxy_translates_gpt_6_1_sol_models_list_when_enabled() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+    write_text_file(
+        &temp_dir.join("config.toml"),
+        r#"
+[codex.client_patch]
+translate_models = true
+"#,
+    );
+
+    let upstream = axum::Router::new().route(
+        "/v1/models",
+        get(|| async move {
+            Json(serde_json::json!({
+                "object": "list",
+                "data": [{ "id": "gpt-6.1-sol", "object": "model" }]
+            }))
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let proxy = spawn_test_proxy(cfg);
+
+    let resp = Client::new()
+        .get(proxy.url("/models"))
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.bytes().await.expect("body");
+    let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
+    assert!(value.get("data").is_none());
+    let models = value["models"].as_array().expect("models array");
+    assert_eq!(models.len(), 1);
+    let model = &models[0];
+    assert_eq!(model["slug"].as_str(), Some("gpt-6.1-sol"));
+    assert_eq!(model["display_name"].as_str(), Some("GPT-6.1-Sol"));
+    assert_eq!(model["visibility"].as_str(), Some("list"));
+    assert_eq!(model["supported_in_api"].as_bool(), Some(true));
+    assert_eq!(model["default_reasoning_level"].as_str(), Some("low"));
+    let reasoning_levels = model["supported_reasoning_levels"]
+        .as_array()
+        .expect("supported reasoning levels");
+    let efforts = reasoning_levels
+        .iter()
+        .map(|level| level["effort"].as_str().expect("reasoning effort"))
+        .collect::<Vec<_>>();
+    assert_eq!(efforts, ["low", "medium", "high", "xhigh", "max", "ultra"]);
+    assert!(reasoning_levels.iter().all(|level| {
+        level["description"]
+            .as_str()
+            .is_some_and(|description| !description.is_empty())
+    }));
+    assert_eq!(model["context_window"].as_u64(), Some(272_000));
+    assert_eq!(model["max_context_window"].as_u64(), Some(872_000));
+    assert_eq!(model["use_responses_lite"].as_bool(), Some(true));
+    assert_eq!(model["multi_agent_version"].as_str(), Some("v2"));
+    assert_eq!(
+        model["multi_agent_reasoning_effort"].as_str(),
+        Some("xhigh")
+    );
+}
+
+#[tokio::test]
+async fn proxy_preserves_native_gpt_6_1_sol_models_catalog_when_translation_enabled() {
+    let _env_guard = env_lock().await;
+    let temp_dir = make_temp_test_dir();
+    let mut scoped = ScopedEnv::default();
+    unsafe {
+        scoped.set_path("CODEX_HELPER_HOME", temp_dir.as_path());
+    }
+    write_text_file(
+        &temp_dir.join("config.toml"),
+        r#"
+[codex.client_patch]
+translate_models = true
+"#,
+    );
+
+    const NATIVE_MODELS_JSON: &str = r#"
+{
+  "models": [{
+    "slug": "gpt-6.1-sol",
+    "display_name": "Provider Sol",
+    "description": "Provider-managed capabilities",
+    "default_reasoning_level": "medium",
+    "supported_reasoning_levels": [
+      { "effort": "medium", "description": "Provider medium" },
+      { "effort": "high", "description": "Provider high" }
+    ],
+    "shell_type": "shell_command",
+    "visibility": "list",
+    "supported_in_api": true,
+    "priority": 42,
+    "additional_speed_tiers": [],
+    "service_tiers": [],
+    "availability_nux": null,
+    "upgrade": null,
+    "base_instructions": "Provider instructions",
+    "model_messages": null,
+    "use_responses_lite": false,
+    "multi_agent_version": "v1",
+    "multi_agent_reasoning_effort": "medium",
+    "supports_reasoning_summaries": true,
+    "default_reasoning_summary": "auto",
+    "support_verbosity": true,
+    "default_verbosity": "medium",
+    "apply_patch_tool_type": "freeform",
+    "web_search_tool_type": "text",
+    "truncation_policy": { "mode": "tokens", "limit": 10000 },
+    "supports_parallel_tool_calls": false,
+    "supports_image_detail_original": false,
+    "context_window": 131072,
+    "max_context_window": 262144,
+    "auto_compact_token_limit": 120000,
+    "effective_context_window_percent": 90,
+    "experimental_supported_tools": [],
+    "input_modalities": ["text"],
+    "supports_search_tool": false,
+    "provider_extension": { "catalog_revision": "sol-limited" }
+  }],
+  "provider_catalog_revision": 7
+}
+"#;
+    let upstream = axum::Router::new().route(
+        "/v1/models",
+        get(|| async move {
+            let mut response = Response::new(Body::from(NATIVE_MODELS_JSON));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        }),
+    );
+    let upstream = spawn_test_upstream(upstream);
+    let retry = retry_config(1, "502", Vec::new(), RetryStrategy::Failover);
+    let cfg = make_proxy_config(vec![upstream.upstream_config()], retry);
+    let proxy = spawn_test_proxy(cfg);
+
+    let resp = Client::new()
+        .get(proxy.url("/models"))
+        .send()
+        .await
+        .expect("send");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.bytes().await.expect("body");
+    assert_eq!(body.as_ref(), NATIVE_MODELS_JSON.as_bytes());
+    let value: serde_json::Value = serde_json::from_slice(body.as_ref()).expect("json body");
+    let expected: serde_json::Value =
+        serde_json::from_str(NATIVE_MODELS_JSON).expect("native catalog");
+    assert_eq!(value, expected);
+    let efforts = value["models"][0]["supported_reasoning_levels"]
+        .as_array()
+        .expect("supported reasoning levels")
+        .iter()
+        .map(|level| level["effort"].as_str().expect("reasoning effort"))
+        .collect::<Vec<_>>();
+    assert_eq!(efforts, ["medium", "high"]);
+}
+
 fn assert_codex_models_response(
     body: &[u8],
     expected_slug: &str,

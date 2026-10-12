@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::sync::LazyLock;
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, header};
@@ -216,12 +217,43 @@ fn openai_model_display_name(item: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn official_codex_model_info_json(slug: &str) -> Option<Value> {
+    static CATALOG: LazyLock<Value> = LazyLock::new(|| {
+        serde_json::from_str(include_str!("model_catalogs/openai-codex-0.162.1.json"))
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "Failed to parse bundled Codex model metadata");
+                Value::Null
+            })
+    });
+
+    let normalized = slug.trim().to_ascii_lowercase();
+    let bedrock_alias = normalized.starts_with("openai.");
+    let canonical_slug = normalized.strip_prefix("openai.").unwrap_or(&normalized);
+    let mut model = CATALOG
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|model| model.get("slug").and_then(Value::as_str) == Some(canonical_slug))?
+        .clone();
+    model["slug"] = Value::String(slug.to_string());
+    if bedrock_alias {
+        model["service_tiers"] = serde_json::json!([]);
+        model["additional_speed_tiers"] = serde_json::json!([]);
+        model["default_service_tier"] = Value::Null;
+    }
+    Some(model)
+}
+
 fn codex_model_info_json(
     slug: &str,
     display_name: &str,
     fallback_priority: usize,
     basellm_metadata: Option<&BasellmOpenAiModelMetadata>,
 ) -> Value {
+    if let Some(model) = official_codex_model_info_json(slug) {
+        return model;
+    }
+
     let known = known_codex_model(slug, basellm_metadata);
     let caps = known.capabilities;
     let priority = known
@@ -1214,6 +1246,56 @@ mod tests {
         assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh", "max"]);
         assert!(!model_has_fast_service_tier(model));
         assert!(!model_has_legacy_fast_speed_tier(model));
+    }
+
+    #[test]
+    fn translated_openai_models_list_preserves_gpt_6_1_sol_reasoning_capabilities() {
+        for slug in ["gpt-6.1-sol", "openai.gpt-6.1-sol", "Gpt-6.1-Sol"] {
+            let value = translated_models_value(&[slug]);
+            let model = model_by_slug(&value, slug);
+
+            assert_eq!(model["display_name"], "GPT-6.1-Sol");
+            assert_eq!(model["default_reasoning_level"], "low");
+            assert_reasoning_efforts(model, &["low", "medium", "high", "xhigh", "max", "ultra"]);
+            assert_eq!(model["visibility"], "list");
+            assert_eq!(model["supported_in_api"], true);
+            assert_eq!(model["context_window"], 272_000);
+            assert_eq!(model["max_context_window"], 872_000);
+            assert_eq!(model["use_responses_lite"], true);
+            assert_eq!(model["multi_agent_version"], "v2");
+            assert_eq!(model["multi_agent_reasoning_effort"], "xhigh");
+            assert_eq!(
+                model_has_fast_service_tier(model),
+                !slug.starts_with("openai.")
+            );
+        }
+    }
+
+    #[test]
+    fn translated_openai_models_list_retains_gpt_6_peer_reasoning_limits() {
+        let value = translated_models_value(&["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]);
+        for (slug, name, default_effort, supports_ultra) in [
+            ("gpt-6-astra", "GPT-6-Astra", "low", true),
+            ("gpt-6-sol", "GPT-6-Sol", "medium", true),
+            ("gpt-6-luna", "GPT-6-Luna", "medium", false),
+        ] {
+            let model = model_by_slug(&value, slug);
+            assert_eq!(model["display_name"], name);
+            assert_eq!(model["default_reasoning_level"], default_effort);
+            let mut efforts = vec!["low", "medium", "high", "xhigh", "max"];
+            if supports_ultra {
+                efforts.push("ultra");
+            }
+            assert_reasoning_efforts(model, &efforts);
+
+            let alias = format!("openai.{slug}");
+            let alias_value = translated_models_value(&[alias.as_str()]);
+            let alias_model = model_by_slug(&alias_value, &alias);
+            assert_reasoning_efforts(alias_model, &efforts);
+            assert_eq!(alias_model["default_service_tier"], Value::Null);
+            assert!(!model_has_fast_service_tier(alias_model));
+            assert!(!model_has_legacy_fast_speed_tier(alias_model));
+        }
     }
 
     #[test]

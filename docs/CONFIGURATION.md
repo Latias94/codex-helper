@@ -110,7 +110,20 @@ compaction = "auto"
 
 Legacy `mode = "..."` config is still accepted for existing users, but codex-helper rewrites saved/generated config as `preset = "..."`.
 
-You can also switch it temporarily from the CLI:
+Model catalog translation is disabled by default (`translate_models = false`). An upstream `/v1/models` response containing only an OpenAI-style `{"data":[{"id":"..."}]}` list does not provide Codex's native model metadata, so Codex falls back to its built-in metadata. A model missing from that built-in catalog, such as `gpt-6.1-sol` in an older client, may appear in `/model` with only its current ID and no reasoning effort choices.
+
+To have codex-helper translate that list into a native Codex model catalog, explicitly enable the following setting in the helper's existing `[codex.client_patch]` table:
+
+```toml
+[codex.client_patch]
+translate_models = true
+```
+
+Known GPT-6 models retain complete official Codex metadata templates, including `model_messages`, `use_responses_lite`, and multi-agent fields. For known IDs `gpt-6.1-sol` and `openai.gpt-6.1-sol`, translation supplies the display name `GPT-6.1-Sol`, defaults reasoning effort to `low`, and exposes `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. A complete native `{"models":[...]}` catalog from the upstream is passed through unchanged even when translation is enabled: if the provider declares only two reasoning efforts, those two remain authoritative.
+
+The current Codex TUI may need a restart or model catalog refresh before updated metadata appears. Translation supplies client metadata; it does not guarantee that a remote provider supports every listed reasoning effort or other model capability.
+
+You can also switch the client preset temporarily from the CLI:
 
 ```bash
 codex-helper switch on --preset chatgpt-bridge
@@ -256,8 +269,10 @@ Recommendation rules are intentionally conservative:
 | `/responses/compact` is unknown | avoid official relay presets until compact is proven |
 | `/responses` is unavailable | `default`; no preset can compensate for a missing Responses endpoint |
 
-For sub2api-style relays, a raw OpenAI `/models` response (`data: [...]`) is fine only if
-codex-helper translates it into the Codex `models: [...]` catalog before Codex sees it. The
+For sub2api-style relays, discovery from a raw OpenAI `/models` response (`data: [...]`)
+requires codex-helper translation into the Codex `models: [...]` catalog. With translation
+disabled, Codex can still use its bundled metadata, but it cannot discover unbundled models
+from that ID list. The
 diagnostic response reports this as `observed.models.translation_required = true`. For non-sub2api
 relays, the same rules apply: the relay can either return Codex-shaped model metadata directly or
 return an OpenAI model list that codex-helper can translate. If the selected model is absent or its
