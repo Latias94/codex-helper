@@ -1,6 +1,6 @@
 [package]
 name = "codex-helper"
-version = "0.20.3"
+version = "0.20.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Mingzhen Zhuang <superfrankie621@gmail.com>"]
@@ -37,28 +37,27 @@ name = "ch"
 path = "src/bin/ch.rs"
 
 [dependencies]
-codex-helper-core = { path = "crates/core", version = "0.20.3" }
-codex-helper-tui = { path = "crates/tui", version = "0.20.3" }
-anyhow = "1.0.103"
-base64 = "0.22.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-toml = "1.1"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "fs", "process"] }
+codex-helper-core = { path = "crates/core", version = "0.20.4" }
+codex-helper-tui = { path = "crates/tui", version = "0.20.4" }
+anyhow = "1.0.104"
+base64 = "0.23.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "signal", "fs", "process"] }
 axum = { version = "0.8.9", features = ["http2", "macros", "ws"] }
-hyper = { version = "1.10.1", features = ["full"] }
-reqwest = { version = "0.13.4", features = ["json", "stream", "gzip", "brotli", "zstd", "deflate"] }
+hyper = { version = "1.12.0", features = ["full"] }
+reqwest = { version = "0.13.5", features = ["json", "stream", "gzip", "brotli", "zstd", "deflate"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-thiserror = "2.0.18"
-dirs = "6.0.0"
-uuid = { version = "1.23.4", features = ["v4"] }
-futures-util = "0.3.32"
-clap = { version = "4.6.1", features = ["derive"] }
-regex = "1.12.4"
-atty = "0.2.14"
-owo-colors = "4.3.0"
+thiserror = "2.0.21"
+dirs = "7.0.0"
+uuid = { version = "1.28.0", features = ["v4"] }
+futures-util = "0.3.34"
+clap = { version = "4.6.7", features = ["derive"] }
+regex = "1.13.1"
+owo-colors = "4.4.0"
 humantime = "2.4.0"
 
 [target.'cfg(windows)'.dependencies]

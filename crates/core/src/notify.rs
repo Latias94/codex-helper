@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -87,7 +87,7 @@ fn read_payload(notification_json: Option<String>) -> std::io::Result<Option<Str
         return Ok(Some(s));
     }
 
-    if atty::is(atty::Stream::Stdin) {
+    if std::io::stdin().is_terminal() {
         return Ok(None);
     }
 

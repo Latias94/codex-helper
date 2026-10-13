@@ -19,6 +19,10 @@ const checks = [
     version: packageVersionFromCargoToml(path.join(repoRoot, "crates", "tui", "Cargo.toml")),
   },
   {
+    label: "server crate",
+    version: packageVersionFromCargoToml(path.join(repoRoot, "crates", "server", "Cargo.toml")),
+  },
+  {
     label: "desktop crate",
     version: packageVersionFromCargoToml(path.join(desktopRoot, "src-tauri", "Cargo.toml")),
   },

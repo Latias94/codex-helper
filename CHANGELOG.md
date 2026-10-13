@@ -5,13 +5,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-10-13
+
 ### 中文
 
+- Codex 模型列表默认合并当前路由可达上游的模型，并优先使用官方模型元数据。GPT-6.1-Sol 等模型现在保留正式显示名称、默认思考强度和完整强度选项；上游新增模型与强度也会合并，无需开启 `translate_models`，旧配置仍兼容读取。
+- HTTP 和 WebSocket 请求会根据已获取的模型目录避开不支持所选模型或思考强度的上游，目录不可用时仍允许尝试转发。模型目录接口支持根路径、`/v1` 和自定义路径前缀，启动切换时会为 Codex 配置独立的 `model_catalog_url`。
 - 修复 Codex 对话请求的 `User-Agent` 被全局删除，导致 chili 等校验客户端身份的中转返回 403。普通 HTTP 和 WebSocket 转发现在保留原始 `User-Agent`，图片接口继续使用原有的兼容处理。
+- 升级 CLI、服务端和桌面端依赖，包括压缩与 WebSocket 库、Tauri 2.12、TypeScript 7、Vitest 5 和 TanStack Table 9，并完成表格 API 迁移。构建桌面端源码需要 Node.js 24.15+ 或 26+；终端检测改用 Rust 标准库，移除已停止维护的 `atty`。
 
 ### English summary
 
+- Codex model discovery now merges models from reachable upstreams by default, preferring official model metadata. Models such as GPT-6.1-Sol retain their display names, default reasoning effort, and complete effort choices; new upstream models and efforts are merged without enabling `translate_models`. The legacy setting remains readable for compatibility.
+- HTTP and WebSocket requests use fetched model catalogs to skip upstreams that do not support the selected model or reasoning effort, while still allowing forwarding when discovery is unavailable. Discovery supports root, `/v1`, and custom base paths; switching Codex to the helper configures a separate `model_catalog_url`.
 - Preserve the original client `User-Agent` when forwarding HTTP and WebSocket requests, fixing 403 client-validation failures on relays such as chili. Keep user-agent stripping scoped to the Images endpoints.
+- Upgrade CLI, server, and desktop dependencies, including compression and WebSocket libraries, Tauri 2.12, TypeScript 7, Vitest 5, and TanStack Table 9 with its table API migration. Desktop source builds require Node.js 24.15+ or 26+. Replace the unmaintained `atty` dependency with Rust's standard terminal detection.
 
 ## [0.20.3] - 2026-07-09
 

@@ -1,4 +1,4 @@
-import { createColumnHelper, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
+import { createColumnHelper, flexRender, tableFeatures, useTable } from "@tanstack/react-table";
 import { useState } from "react";
 import { GitBranch, Info, Search } from "lucide-react";
 
@@ -10,9 +10,10 @@ import type { ApiRequestChainExport, ApiRequestChainRequest } from "@/lib/api/ad
 
 type UsageRow = UsageRowView;
 
-const columnHelper = createColumnHelper<UsageRow>();
+const features = tableFeatures({});
+const columnHelper = createColumnHelper<typeof features, UsageRow>();
 
-const baseColumns = [
+const baseColumns = columnHelper.columns([
   columnHelper.accessor("key", {
     header: "API Key",
     cell: (info) => <span className="font-mono text-xs">{info.getValue()}</span>,
@@ -65,7 +66,7 @@ const baseColumns = [
   columnHelper.accessor("firstToken", { header: "First Token" }),
   columnHelper.accessor("duration", { header: "Duration" }),
   columnHelper.accessor("time", { header: "Time" }),
-];
+]);
 
 type ChainState =
   | { status: "idle" }
@@ -83,7 +84,7 @@ export function UsageTable({
   onRefresh?: () => void;
 }) {
   const [chainState, setChainState] = useState<ChainState>({ status: "idle" });
-  const tableColumns = [
+  const tableColumns = columnHelper.columns([
     ...baseColumns,
     columnHelper.display({
       id: "chain",
@@ -105,12 +106,12 @@ export function UsageTable({
         );
       },
     }),
-  ];
+  ]);
 
-  const table = useReactTable({
+  const table = useTable({
+    features,
     data: rows,
     columns: tableColumns,
-    getCoreRowModel: getCoreRowModel(),
   });
 
   async function loadRequestChain(row: UsageRow) {
@@ -181,7 +182,7 @@ export function UsageTable({
               </tr>
             ) : table.getRowModel().rows.map((row) => (
               <tr key={row.id} className="hover:bg-mint-50/70">
-                {row.getVisibleCells().map((cell) => (
+                {row.getAllCells().map((cell) => (
                   <td key={cell.id} className="border-b border-slate-100 px-3 py-3 text-slate-700">
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </td>

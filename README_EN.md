@@ -6,7 +6,7 @@ Some Codex features do not appear just because `/responses` can be forwarded. Ch
 
 codex-helper keeps that compatibility layer local. Codex talks to the helper proxy, and the helper picks OpenAI or one of your relays through provider/routing config. It also handles model-list translation, client presets, capability diagnostics, balance visibility, and fallback policy.
 
-Current release: `v0.20.2`
+Current release: `v0.20.3`
 
 中文说明: [README.md](README.md)
 
@@ -50,13 +50,13 @@ Recommended: install prebuilt binaries with the release installer scripts. Rust 
 macOS / Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/download/v0.20.2/codex-helper-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/download/v0.20.3/codex-helper-installer.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.20.2/codex-helper-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.20.3/codex-helper-installer.ps1 | iex"
 ```
 
 This installs `codex-helper` and the short alias `ch`. The old egui GUI entrypoint `codex-helper-gui` has been removed. The Tauri desktop client remains a source-tree preview and is not uploaded as a public release artifact; local validation can still build it from `apps/desktop` with `pnpm tauri:build`.

@@ -37,7 +37,7 @@ use codex_helper_core::local_log_store::{LogRetention, RotatingLogWriter, repair
 use owo_colors::OwoColorize;
 use reqwest::Client;
 use serde_json::Value as JsonValue;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, IsTerminal};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -206,18 +206,18 @@ fn init_tracing(cli: &Cli) -> Option<WorkerGuard> {
                 && !*supervisor_managed
                 && !*desktop_managed
                 && !*no_tui
-                && atty::is(atty::Stream::Stdin)
-                && atty::is(atty::Stream::Stdout)
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
         }
         Some(Command::Tui { .. }) => {
-            atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout)
+            std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
         }
         Some(Command::Relay { cmd }) => {
             relay_command_opens_tui(cmd)
-                && atty::is(atty::Stream::Stdin)
-                && atty::is(atty::Stream::Stdout)
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
         }
-        None => atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout),
+        None => std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         _ => false,
     };
 
@@ -1077,8 +1077,10 @@ async fn run_server(
         None
     };
     let resident = resident || supervisor_managed || desktop_managed;
-    let interactive =
-        !resident && enable_tui && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
+    let interactive = !resident
+        && enable_tui
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
 
     struct AutoRestoreGuard {
         service_name: &'static str,

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::client_config::{
@@ -2623,7 +2623,7 @@ pub fn guard_codex_config_before_switch_on_interactive() -> Result<()> {
         return Ok(());
     }
 
-    let is_tty = atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
+    let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !is_tty {
         eprintln!(
             "Notice: Codex currently points to local codex-helper ({base_url}) and switch state {:?} exists; run `codex-helper switch off` to disable the local proxy patch while preserving other config edits.",
@@ -5526,7 +5526,7 @@ pub fn guard_claude_settings_before_switch_on_interactive() -> Result<()> {
         return Ok(());
     }
 
-    let is_tty = atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout);
+    let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !is_tty {
         eprintln!(
             "Notice: Claude settings {:?} already points to the local proxy ({base_url}), and backup {:?} exists; run `codex-helper switch off --claude` if you want to restore the original config.",
