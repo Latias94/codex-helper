@@ -6,7 +6,7 @@ Codex CLI 的本地中转代理与控制台，重点解决两个问题：多中�
 
 codex-helper 把这些差异收在本地：Codex 连接本机代理，helper 再按 provider / routing 选择 OpenAI 官方或你的中转站，并补上模型列表翻译、client preset、能力诊断、余额观测和 fallback 策略。
 
-当前发布版本：`v0.20.3`
+当前发布版本：`v0.20.4`
 
 English: [README_EN.md](README_EN.md)
 
@@ -62,13 +62,13 @@ English: [README_EN.md](README_EN.md)
 macOS / Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/download/v0.20.3/codex-helper-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Latias94/codex-helper/releases/download/v0.20.4/codex-helper-installer.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.20.3/codex-helper-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Latias94/codex-helper/releases/download/v0.20.4/codex-helper-installer.ps1 | iex"
 ```
 
 安装后会得到两个命令：`codex-helper` 和短别名 `ch`。旧 egui GUI 入口 `codex-helper-gui` 已移除；Tauri 桌面端当前仍是源码内预览路径，公开 release 暂不发布桌面安装包；需要本地验证时可从 `apps/desktop` 运行 `pnpm tauri:build`。
